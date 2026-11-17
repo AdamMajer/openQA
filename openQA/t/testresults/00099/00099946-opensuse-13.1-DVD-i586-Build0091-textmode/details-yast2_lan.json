@@ -1,0 +1,95 @@
+[
+   {
+      "result" : "unk",
+      "screenshot" : "yast2_lan-1.png",
+      "tags" : [
+         "sudo-passwordprompt",
+         "ENV-VIDEOMODE-text",
+         "ENV-DESKTOP-textmode",
+         "ENV-DISTRI-opensuse",
+         "ENV-INSTLANG-en_US",
+         "ENV-FLAVOR-DVD"
+      ],
+      "needles" : [
+         {
+            "error" : 0.228645558501967,
+            "area" : [
+               {
+                  "y" : "660",
+                  "result" : "fail",
+                  "w" : 137,
+                  "x" : "872",
+                  "similarity" : 52,
+                  "h" : 29
+               },
+               {
+                  "y" : "660",
+                  "w" : 137,
+                  "result" : "fail",
+                  "x" : "872",
+                  "similarity" : 0,
+                  "h" : 29
+               }
+            ],
+            "name" : "sudo-passwordprompt",
+            "json" : "tests/opensuse/needles/sudo-passwordprompt.json"
+         },
+         {
+            "area" : [
+               {
+                  "result" : "fail",
+                  "y" : "575",
+                  "w" : 224,
+                  "x" : "197",
+                  "similarity" : 62,
+                  "diff" : "yast2_lan-1-sudo-passwordprompt-lxde-diff0.png",
+                  "h" : 33
+               }
+            ],
+            "name" : "sudo-passwordprompt-lxde",
+            "error" : 0.139486480876258
+         }
+      ]
+   },
+   {
+      "result" : "unk",
+      "screenshot" : "yast2_lan-2.png"
+   },
+   {
+      "tags" : [
+         "test-yast2_lan-1"
+      ],
+      "screenshot" : "yast2_lan-3.png",
+      "result" : "ok",
+      "needle" : "yast2_lan-1370608095",
+      "area" : [
+         {
+            "h" : 131,
+            "similarity" : 100,
+            "x" : "7",
+            "y" : "29",
+            "result" : "ok",
+            "w" : 999
+         }
+      ]
+   },
+   {
+      "tags" : [
+         "test-yast2_lan-2"
+      ],
+      "screenshot" : "yast2_lan-4.png",
+      "result" : "ok",
+      "needle" : "yast2_lan-2-1-good-diff",
+      "area" : [
+         {
+            "h" : 71,
+            "similarity" : 99,
+            "diff" : "yast2_lan-4-yast2_lan-2-1-good-diff-diff0.png",
+            "x" : "0",
+            "result" : "ok",
+            "w" : 64,
+            "y" : "2"
+         }
+      ]
+   }
+]

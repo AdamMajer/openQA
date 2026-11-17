@@ -1,0 +1,119 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Mojo::Base -signatures;
+use Test::Warnings;
+use OpenQA::Test::TimeLimit '60';
+use OpenQA::SeleniumTest;
+use OpenQA::Test::ObsRsync 'setup_obs_rsync_test';
+
+driver_missing unless check_driver_modules;
+my ($t, $tempdir) = setup_obs_rsync_test(fixtures_glob => '01-jobs.pl 03-users.pl');
+my $driver = call_driver();
+$driver->find_element_by_class('navbar-brand')->click;
+$driver->find_element_by_link_text('Login')->click;
+
+my %params = (
+    'Proj1' => ['190703_143010', 'standard', '', '470.1', 99937, 'passed'],
+    'Proj2::appliances' => ['no data', 'appliances', '', ''],
+    'BatchedProj' => ['191216_150610', 'containers', '', '4704, 4703, 470.2, 469.1'],
+    'Batch1' => ['191216_150610', 'containers', 'BatchedProj', '470.2, 469.1'],
+);
+
+foreach my $proj (sort keys %params) {
+    my $ident = $proj;
+    $ident =~ s/\W//g;    # remove special characters to refer UI, the same way as in template
+
+    my ($dt, $repo, $parent, $builds_text, $test_id, $test_result) = @{$params{$proj}};
+    my $projfull = $parent ? "$parent|$proj" : $proj;
+
+    # navigate to page and mock AJAX requests
+    $driver->get("/admin/obs_rsync/$parent");
+    $driver->title_like(qr/openQA: OBS synchronization folders( of .*)?/, "on folders page ($parent)");
+    $driver->execute_script('
+        window.skipObsRsyncDelay = true;
+        window.ajaxRequests = [];
+        window.fetch = function(url, options) {
+            options ??= {};
+            delete options?.headers?.["X-CSRF-TOKEN"];
+            if (Object.keys(options.headers ?? {}).length === 0) delete options.headers;
+            options.url = url; window.ajaxRequests.push(options);
+            return new Promise((resolve, reject) => {
+                resolve(new Response(\'{"message": "fake response"}\'));
+            });
+        };
+    ');
+
+    # check whether table row for folder is present at all (to debug poo#198530)
+    my @folder_row = $driver->find_elements("tr#folder_$ident");
+    is @folder_row, 1, "one row for folder $ident present" or always_explain 'page source:', $driver->get_page_source;
+
+    # check project name and other fields are displayed properly
+    is $driver->find_element("tr#folder_$ident .project")->get_text, $projfull, "$proj name";
+    like $driver->find_element("tr#folder_$ident .lastsync")->get_text, qr/$dt/, "$proj last sync";
+    like $driver->find_element("tr#folder_$ident .testlink")->get_text, qr/$test_result/, "$proj last test result"
+      if $test_result;
+    is $driver->find_element("tr#folder_$ident .lastsyncbuilds")->get_text, $builds_text, "$proj sync builds";
+
+    # at start no project fetches builds from obs
+    is $driver->find_element("tr#folder_$ident .obsbuilds")->get_text, '', "$proj obs builds empty";
+    my $status = $driver->find_element("tr#folder_$ident .dirtystatuscol .dirtystatus")->get_text;
+    like $status, qr/dirty/, "$proj dirty status";
+    like $status, qr/$repo/, "$proj repo in dirty status ($status)";
+    like $status, qr/$repo/, "$proj dirty has repo";
+
+    if ($proj eq 'Batch1') {
+        # click on the various buttons within the table
+        $driver->find_element("tr#folder_$ident .obsbuildsupdate")->click;
+        wait_until(sub { $driver->find_element("tr#folder_$ident .obsbuilds")->get_text eq 'fake response' },
+            'builds update response shown');
+
+        $driver->find_element("tr#folder_$ident .lastsyncforget")->click;
+        $driver->accept_alert;
+        wait_until(sub { $driver->find_element("tr#folder_$ident .lastsync")->get_text eq 'fake response' },
+            'forget response shown');
+
+        $driver->find_element("tr#folder_$ident .dirtystatusupdate")->click;
+        wait_until(
+            sub {
+                my $text = $driver->find_element("tr#folder_$ident .dirtystatuscol .dirtystatus")->get_text;
+                return $text eq 'fake response' || $text =~ qr/dirty on \d{4}-\d{2}-\d{2}/;
+            },
+            'dirty status update response shown'
+        );
+
+        my @expected_requests = (
+            {method => 'POST', url => '/admin/obs_rsync/BatchedProj%7CBatch1/obs_builds_text'},
+            {url => '/admin/obs_rsync/BatchedProj%7CBatch1/obs_builds_text'},
+            {method => 'POST', url => '/admin/obs_rsync/BatchedProj%7CBatch1/run_last'},
+            {url => '/admin/obs_rsync/BatchedProj%7CBatch1/run_last'},
+            {method => 'POST', url => '/admin/obs_rsync/BatchedProj/dirty_status'},
+            {url => '/admin/obs_rsync/BatchedProj/dirty_status'},
+        );
+        wait_until(sub { scalar @{$driver->execute_script('return window.ajaxRequests;')} == @expected_requests },
+            'all ajax requests recorded');
+        my $actual_requests = $driver->execute_script('return window.ajaxRequests;');
+        is_deeply $actual_requests, \@expected_requests, 'ajax requests done as expected'
+          or always_explain $actual_requests;
+    }
+    elsif ($proj eq 'Proj1') {
+        # follow link to project page and click the sync button
+        $driver->find_element_by_link_text($proj)->click;
+        my $sync_button = $driver->find_element_by_class('btn-warning');
+        is $sync_button->get_attribute('data-posturl'), '/admin/obs_rsync/Proj1/runs', 'post URL for sync as expected';
+        $sync_button->click;
+        wait_until(
+            sub {
+                return ($driver->get_title eq 'openQA: OBS synchronization jobs');
+            },
+            'redirection target loaded'
+        );
+        is $driver->get_title, 'openQA: OBS synchronization jobs', 'redirected to obs gru jobs page';
+    }
+}
+
+done_testing();

@@ -1,0 +1,66 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Mojo::Base -signatures;
+use Test::Mojo;
+use OpenQA::Test::TimeLimit '8';
+use OpenQA::Test::ObsRsync 'setup_obs_rsync_test';
+use OpenQA::WebAPI::Plugin::ObsRsync::Task;
+use Test::MockObject;
+
+my ($t, $tempdir, $home, $params) = setup_obs_rsync_test;
+my $app = $t->app;
+my $minion = $app->minion;
+
+package FakeMinionJob {
+    use Mojo::Base -base, -signatures;
+    has id => 0;
+    has app => sub { $app };
+    has retries => 200;
+    sub finish ($self, $result) { $self->{state} = 'finished'; $self->{result} = $result }
+    sub note ($self, @args) { }
+}    # uncoverable statement
+
+$t->post_ok('/admin/obs_rsync/Proj1/runs' => $params)->status_is(201, 'trigger rsync');
+$t->get_ok('/admin/obs_rsync/queue')->status_is(200, 'jobs list')->content_like(qr/Proj1/, 'get project queue');
+
+$t->get_ok('/admin/obs_rsync/Proj1/dirty_status')->status_is(200, 'get dirty status')->content_like(qr/dirty on/);
+$t->post_ok('/admin/obs_rsync/Proj1/dirty_status' => $params)->status_is(200, 'dirty status update enqueued')
+  ->content_like(qr/started/);
+is $minion->jobs({tasks => [qw(obs_rsync_update_dirty_status)]})->total, 1,
+  'obs_rsync_update_dirty_status job enqueued';
+
+$t->get_ok('/admin/obs_rsync/Proj1/obs_builds_text')->status_is(200, 'get builds text')->content_like(qr/No data/);
+$t->post_ok('/admin/obs_rsync/Proj1/obs_builds_text' => $params)->status_is(200, 'builds text update enqueued')
+  ->content_like(qr/started/);
+is $minion->jobs({tasks => [qw(obs_rsync_update_builds_text)]})->total, 1, 'obs_rsync_update_builds_text job enqueued';
+
+subtest 'process minion jobs' => sub {
+    my $minion_jobs = $minion->jobs;
+    while (my $info = $minion_jobs->next) {
+        my ($task, $job) = ($info->{task}, FakeMinionJob->new(app => $app));
+        $minion->tasks->{$task}->($job, @{$info->{args}});
+        $minion->job($info->{id})->remove;
+        is $job->{state}, 'finished', "$task has been finished";
+    }
+    is $home->child('Proj1/files_iso.lst')->slurp, "openSUSE-Leap-15.1-DVD-x86_64-Build470.1-Media.iso\n",
+      'files_iso.lst has been created';
+};
+
+subtest 'retrying' => sub {
+    my $obs_rsync
+      = Test::MockObject->new->set_always(home => 'home')->set_true('unlock')
+      ->set_always(guard => Test::MockObject->new)->set_always(retry_interval => 120)
+      ->set_always(retry_max_count => 200);
+    $obs_rsync->mock(is_status_dirty => sub { die "is_status_dirty failed\n" });
+    my $job = FakeMinionJob->new(app => Test::MockObject->new->set_always(obs_rsync => $obs_rsync));
+    OpenQA::WebAPI::Plugin::ObsRsync::Task::run($job, {project => 'foo'});
+    is $job->{state}, 'finished', 'job finished after retires exceeded';
+    like $job->{result}->{message}, qr/exceeded retry count/i, 'result about retrying assigned';
+};
+
+done_testing();

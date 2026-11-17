@@ -1,0 +1,9 @@
+% layout 'bootstrap';
+% my $maybe_title = stash('title') // '';
+% title $maybe_title;
+
+%= include 'layouts/info'
+% if ($maybe_title) {
+<h2><%= $maybe_title %></h2>
+% }
+<p><%= $error_message %></p>

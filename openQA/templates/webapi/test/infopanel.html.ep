@@ -1,0 +1,211 @@
+% use OpenQA::Jobs::Constants;
+            <div class="card-header">
+                Results for
+                % if (current_route 'latest') {
+                    <%= link_to $job->id => url_for ('test', testid => $job->id) %>:
+                % }
+                <i><a class="copy-jobid" href="#" data-jobid="<%= $job->id %>">#<%= $job->id %></a></i>
+                %= $job->name
+                % if ($job->archived) {
+                    <span id="job-archived-badge" class="badge rounded-pill text-bg-secondary" title="Job has been archived">
+                        <i class="fa-regular fa-file-zipper"></i>
+                    </span>
+                % }
+            </div>
+            <div id="info-box-content" class="card-body row"
+                % if ($additional_data) {
+                    data-favicon-url-16="<%= favicon_url '-16.png' %>" data-favicon-url-svg="<%= favicon_url '.svg' %>"
+                % }
+            >
+                <div class="col-xl">
+                    <div class="d-flex align-items-center gap-1 modules-badge-container">
+                        %= badge_markdown_copy_button($job->id, '[![' . $job->name . ' test result](' . url_for('test_result_badge', testid => $job->id)->to_abs . ')](' . url_for('test', testid => $job->id)->to_abs . ')')
+                        % if ($job->state eq DONE) {
+                            <div class="badge rounded-pill text-bg-light modules-badge">
+                                %= $job->passed_module_count
+                                <i class='fa-solid module_passed fa-star' title='modules passed'></i>
+                                % if ($job->softfailed_module_count) {
+                                    %= $job->softfailed_module_count
+                                    <i class='fa-solid module_softfailed fa-star-half-stroke' title='modules with warnings'></i>
+                                % }
+                                % if ($job->failed_module_count) {
+                                    %= $job->failed_module_count
+                                    <i class='fa-solid module_failed fa-star' title='modules failed'></i>
+                                % }
+                                % if ($job->skipped_module_count) {
+                                    %= $job->skipped_module_count
+                                    <i class='fa-solid module_none fa-ban' title='modules skipped'></i>
+                                % }
+                                % if ($job->externally_skipped_module_count) {
+                                    %= $job->externally_skipped_module_count
+                                    <i class='fa-solid module_skipped fa-angles-right' title='modules externally skipped'></i>
+                                % }
+                            </div>
+                        % }
+                    </div>
+                <div>
+                    % if ($job->state eq DONE) {
+                        Result: <b><%= $job->result %></b>\
+                    % }
+                    % else {
+                        % my $state_detail = '';
+                        % if (@$gru_dependencies) {
+                            % $state_detail = join(';', map {
+                            %   $_->{href} ? link_to($_->{label} => $_->{href}) : $_->{label}
+                            % } @$gru_dependencies);
+                            % $state_detail = qq{, waiting for background tasks ($state_detail)};
+                        % }
+                        State: <b><%= $job->state %></b><%== $state_detail %>\
+                    % }
+                    % if ($job->t_finished) {
+                        <%= ', finished' =%>
+                        <abbr class="timeago" title="<%= $job->t_finished->datetime() %>Z"><%= format_time($job->t_finished) %></abbr>
+                        % if (my $t_started = $job->t_started) {
+                            (<span>ran for </span><%= format_time_duration($job->t_finished - $t_started) =%>)
+                        % }
+                    % }
+                    % elsif ($job->t_started) {
+                        <%= ', started' =%>
+                        <abbr class="timeago" title="<%= $job->t_started->datetime() %>Z"><%= format_time($job->t_started) %></abbr>
+                    % }
+                    % else {
+                        <%= ', created' =%>
+                        <abbr class="timeago" title="<%= $job->t_created->datetime() %>Z"><%= format_time($job->t_created) %></abbr>
+                    % }
+                    % if (my $reason = $job->reason) {
+                        <br><%= $job->state eq SCHEDULED ? 'Scheduling info' : 'Reason' %>: <%= $reason %>
+                    % }
+                </div>
+                % if (my $developer_session = $job->developer_session) {
+                    <div id="developer-global-session-info">
+                        % if ($job->t_finished) {
+                            Developer session was opened during testrun by
+                        % }
+                        % else {
+                            Developer session has been opened by
+                        % }
+                        %= $developer_session->user->name
+                    </div>
+                % } else {
+                     <div id="developer-global-session-info" style="display: none;"></div>
+                % }
+                <div id="clones">
+                    % if ($clone_of) {
+                        Clone of
+                        %= link_to $clone_of->id => url_for ('test', testid => $clone_of->id)
+                        (restarted already <%= $ancestors >= $ancestors_limit ? 'more than ' : '' %><%= $ancestors %> time<%= $ancestors != 1 ? 's' : '' %>)
+                    % }
+                    % if (my $clone_id = $job->clone_id) {
+                        Cloned as
+                        %= link_to $clone_id => url_for ('test', testid => $clone_id)
+                    % }
+                </div>
+                <div id="scheduled-product-info">
+                    Scheduled product:\
+                    % if (my $scheduled_product = $job->scheduled_product) {
+                        % my $sp_id = $scheduled_product->id;
+                        %= link_to $scheduled_product->to_string, url_for('admin_product_log')->query(id => $sp_id)
+                    % } else {
+                        job has not been created by posting an ISO
+                        % if ($clone_of) {
+                            (but possibly the <%= link_to 'original job' => url_for ('test', testid => $clone_of->id) %>)
+                        % }
+                    % }
+                </div>
+                % if ($job->state eq SCHEDULED) {
+                    <div>
+                        Priority:
+                        % if (is_operator) {
+                            <a class="prio-down" data-method="post" href="javascript:void(0);" onclick="decreaseJobPrio(<%= $job->id %>, this);">
+                                <i class="fa-regular fa-square-minus"></i>
+                            </a>
+                            % if (my $prio_explanation = $job->settings_hash->{_PRIORITY_EXPLANATION}) {
+                                <span class="prio-value" data-bs-toggle="tooltip" title="<%= $prio_explanation %>"><%= $job->priority %></span>
+                            % } else {
+                                <span class="prio-value"><%= $job->priority %></span>
+                            % }
+                            <a class="prio-up" data-method="post" href="javascript:void(0);" onclick="increaseJobPrio(<%= $job->id %>, this);">
+                                <i class="fa-regular fa-square-plus"></i>
+                            </a>
+                        % } else {
+                            % if (my $prio_explanation = $job->settings_hash->{_PRIORITY_EXPLANATION}) {
+                                <span class="prio-value" data-bs-toggle="tooltip" title="<%= $prio_explanation %>"><%= $job->priority %></span>
+                            % } else {
+                                <span class="prio-value"><%= $job->priority %></span>
+                            % }
+                        % }
+                        &nbsp;<a href="https://open.qa/docs/#job-groups-1" target="_blank"><i class="fa-regular fa-circle-question" data-bs-toggle="tooltip" data-bs-title="Jobs with lower priority values are scheduled earlier (default: 50)"></i></a>
+                    </div>
+                % }
+                % if ($worker) {
+                    <div id="assigned-worker">
+                        Assigned worker:
+                        <span title="VNC display number: <%= 90 + $worker->instance %>">
+                            %= link_to $worker->name => url_for('admin_worker_show', worker_id => $worker->id)
+                        </span>
+                    </div>
+                % }
+                % if (my $scenario_description = $job->rendered_scenario_description) {
+                    <div id="scenario-description">
+                            %= $scenario_description
+                    </div>
+                % }
+                </div>
+                % if (is_operator) {
+                <div class="info-panel-actions col-xl-auto">
+                    <strong>Actions:</strong><br>
+                    % if (!$job->is_pristine) {
+                      <div class="btn-group btn-group-sm dropstart">
+                        % my $has_dependencies = $job->has_dependencies;
+                        % my $ok_results_explanation = join '/', OK_RESULTS;
+                        % my $restart_text = $has_dependencies ? 'Restart this and dependent jobs' : 'Restart job';
+                        % my $class = 'btn btn-secondary restart-result';
+                        % if ($has_dependencies) {
+                            %= include 'test/restart_options', jobid => $testid, btn_type => 'btn-secondary', btn_style => '';
+                        % }
+                        % $class .= ' disabled' if defined $job->clone_id;
+                        %= link_post url_for('apiv1_restart', jobid => $testid) => (class => $class, 'data-remote' => 'true', id => 'restart-result', 'data-jobid' => $testid) => begin
+                            <i class="fa-solid fa-2 fa-rotate-left"></i><span><%= $restart_text %></span>
+                        %= end
+                        % my $disabled_note = defined $job->clone_id ? '<p><strong>This job cannot be restarted because it has already been restarted.</strong></p><hr>' : '';
+                        <%= help_popover('Restart job' => "$disabled_note
+                            <p>Restarts the job and certain dependent jobs.</p>
+                            <p>Rules for restarting dependencies:</p>
+                            <ul>
+                                <li>If the job is part of a parallel cluster, all jobs within that cluster are restarted.</li>
+                                <li>Any kind of chained child jobs are restarted.</li>
+                                <li>Directly chained parent jobs are restarted.</li>
+                            </ul>
+                            All rules are applied recursively. Advanced restarting options allow changing the behavior, e.g. excluding parents and $ok_results_explanation children. You can open the menu of advanced restarting options by clicking on the triangle icon
+                            on the left side of the <em>$restart_text</em> button for jobs with dependencies.",
+                            'https://open.qa/docs/#handling-of-related-jobs-on-failure--cancellation--restart', 'documentation', 'bottom', class => 'help_popover fa-solid fa-circle-question btn btn-secondary');
+                        %>
+                      </div>
+                    % }
+                    % if (OpenQA::Jobs::Constants::meta_state($job->state) ne OpenQA::Jobs::Constants::FINAL) {
+                      <div class="btn-group btn-group-sm">
+                        %= link_post url_for('apiv1_cancel', jobid => $job->id) => (class => 'btn btn-warning', 'data-remote' => 'true', id => 'cancel_running') => begin
+                            <i class="fa-solid fa-2 fa-regular fa-circle-xmark"></i><span>Cancel job</span>
+                        % end
+                      </div>
+                    % }
+                    % if (my $sp_id = $job->scheduled_product_id) {
+                      <div class="btn-group btn-group-sm">
+                        <a href="#"
+                          id="restart-scheduled-product" \
+                          onclick="return rescheduleProductForJob(this);" \
+                          class="btn btn-danger"\
+                           data-url="<%= url_for('apiv1_create_iso')->query(scheduled_product_clone_id => $sp_id, TEST => $job->TEST, _SKIP_CHAINED_DEPS => 1, _INCLUDE_CHILDREN => 1) %>">\
+                             <i class="fa-solid fa-2 fa-rotate"></i><span>Reschedule product from here</span>
+                        </a>
+                      <%= help_popover('Partial product re-scheduling' => "
+                          <p>Schedules the product again using the current job as starting point. That means chained parents of
+                          the current job will not be scheduled again but all its children will be. The re-scheduling is <strong>not</strong>
+                          limited to the current job group.</p>",
+                          undef, undef, 'bottom', class => 'help_popover fa-solid fa-circle-question btn btn-danger');
+                      %>
+                      </div>
+                    % }
+                </div>
+                % }
+            </div>

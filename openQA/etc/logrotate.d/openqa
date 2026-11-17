@@ -1,0 +1,13 @@
+/var/log/openqa {
+    compress
+    hourly
+    maxage 30
+    rotate 20
+    size 300M
+    notifempty
+    missingok
+    copytruncate
+    compresscmd /usr/bin/xz
+    uncompresscmd /usr/bin/xzdec
+}
+

@@ -1,0 +1,41 @@
+---
+name: Perl tests
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      stability_test:
+        description: 'Set to 1 to fail if any of the RETRY fails'
+        default: 0
+      target:
+        description: 'Makefile target'
+        default: fullstack
+
+jobs:
+  fullstack:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    container:
+      image: registry.opensuse.org/devel/openqa/containers/opensuse/openqa_devel:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Build os-autoinst
+        run: bash -x tools/ci/build_autoinst.sh
+      - name: Make project folder user-writable
+        run: sudo chown -R $USER $PWD
+      - name: Running unit tests
+        run: tools/ci/run_unit_tests.sh ${{ github.event.inputs.target }}
+        env:
+          STABILITY_TEST: ${{ github.event.inputs.stability_test }}
+      - name: Merge coverage databases
+        run: cover -write cover_db cover_db*
+      - name: Generate coverage report
+        run: make coverage-report-html
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: Upload artifacts
+          path: |
+            test-results
+            cover_db
+        if: always()

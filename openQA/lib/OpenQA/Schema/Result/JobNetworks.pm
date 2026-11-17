@@ -1,0 +1,29 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Schema::Result::JobNetworks;
+
+
+use Mojo::Base 'DBIx::Class::Core', -signatures;
+
+__PACKAGE__->table('job_networks');
+__PACKAGE__->add_columns(
+    name => {
+        data_type => 'text',
+        is_nullable => 0,
+    },
+    job_id => {
+        data_type => 'bigint',
+        is_foreign_key => 1,
+        is_nullable => 0,
+    },
+    vlan => {
+        data_type => 'integer',
+        default_value => undef,
+    });
+
+__PACKAGE__->set_primary_key('name', 'job_id');
+
+__PACKAGE__->belongs_to(job => 'OpenQA::Schema::Result::Jobs', 'job_id');
+
+1;

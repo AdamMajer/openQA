@@ -1,0 +1,47 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+
+use OpenQA::Utils;
+require OpenQA::Test::Database;
+use OpenQA::Test::TimeLimit '10';
+use Test::Mojo;
+use Test::Warnings ':report_warnings';
+
+OpenQA::Test::Database->new->create(fixtures_glob => '03-users.pl');
+my $t = Test::Mojo->new('OpenQA::WebAPI');
+
+my $arthur = $t->app->schema->resultset('Users')->find({username => 'arthur'});
+my $key = $t->app->schema->resultset('ApiKeys')->create({user_id => $arthur->id});
+like $key->key, qr/[0-9a-fA-F]{16}/, 'new keys have a valid random key attribute';
+like $key->secret, qr/[0-9a-fA-F]{16}/, 'new keys have a valid random secret attribute';
+$key->discard_changes;
+is $key->comment, '', 'api key created without comment has empty comment in database';
+
+my $commented_key = $t->app->schema->resultset('ApiKeys')->create({user_id => $arthur->id, comment => 'test key'});
+is $commented_key->comment, 'test key', 'api key created with comment stores and returns the comment';
+
+is $t->app->schema->resultset('ApiKeys')->find($commented_key->id)->comment, 'test key',
+  'comment is loaded from the database unmodified';
+
+my $padded_key = $t->app->schema->resultset('ApiKeys')->create({user_id => $arthur->id, comment => '  padded  '});
+is $padded_key->comment, 'padded', 'comment is trimmed on creation through the result class';
+
+is $key->is_operator, 1, 'api key defaults to is_operator = 1';
+is $key->is_admin, 1, 'api key defaults to is_admin = 1';
+
+my $restricted_key = $t->app->schema->resultset('ApiKeys')->create(
+    {
+        user_id => $arthur->id,
+        is_operator => 0,
+        is_admin => 0,
+    });
+is $restricted_key->is_operator, 0, 'api key created with is_operator = 0';
+is $restricted_key->is_admin, 0, 'api key created with is_admin = 0';
+
+done_testing();

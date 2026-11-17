@@ -1,0 +1,71 @@
+% layout 'bootstrap';
+% title 'Audit log';
+
+% content_for 'ready_function' => begin
+    audit_url   = "<%= url_for('audit_log') %>";
+    ajax_url    = "<%= url_for('audit_ajax') %>";
+    searchquery = "<%= $search %>";
+    loadAuditLogTable();
+% end
+
+<div class="row">
+    <div class="col-sm-12">
+        <h2><%= title %>
+            % if (!$audit_enabled) {
+                <em class="text-warning">(auditing disabled)</em>
+            % }
+        </h2>
+
+    %= include 'layouts/info'
+
+    <span class="search-popover">
+        <%= help_popover('Search' => '
+            <p>Allows to filter the log.</p>
+            <p>
+                By default, the filter will only consider the <em>Event data</em> column.
+                The following key words can be used to filter the other columns:
+            </p>
+            <p>
+                <code>older:yyyy/mm/dd</code>:<br>
+                events older than the specified date
+            </p>
+            <p>
+                <code>newer:yyyy/mm/dd</code>:<br>
+                events newer than the specified date
+            </p>
+            <p>
+                <code>user:string</code>:<br>
+                <em>User</em> column
+            </p>
+            <p>
+                <code>event:string</code>:<br>
+                <em>Event</em> column
+            </p>
+            <p>
+                <code>data:string</code>:<br>
+                <em>Event data</em> column
+            </p>
+            <p>
+                <strong>Example</strong><br>
+                <code>user:Demo newer:15 days older:2016/12/14 event:job_restart</code>
+            </p>
+            ', undef, undef, 'left');
+        %>
+    </span>
+
+    <table id="audit_log_table" class="table table-striped" style="width: 100%">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Time</th>
+                    <th>User</th>
+                    <th>Connection</th>
+                    <th>Event</th>
+                    <th>Event data</th>
+                </tr>
+            </thead>
+            <tbody>
+             </tbody>
+        </table>
+    </div>
+</div>

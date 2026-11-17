@@ -1,0 +1,582 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Mojo::Base -signatures;
+use Test::Mojo;
+use Test::MockModule;
+use Test::Warnings qw(:all :report_warnings);
+use Test::Output qw(combined_like);
+use Mojo::URL;
+use OpenQA::Test::TimeLimit '10';
+use OpenQA::Test::Case;
+use OpenQA::Test::Client 'client';
+use OpenQA::Test::Utils 'embed_server_for_testing';
+use OpenQA::WorkerReservation 'RESERVATION_PROPERTIES';
+use OpenQA::Client;
+use OpenQA::WebSockets::Client;
+use OpenQA::Constants qw(DEFAULT_WORKER_TIMEOUT DB_TIMESTAMP_ACCURACY WEBSOCKET_API_VERSION);
+use OpenQA::Jobs::Constants;
+use Date::Format 'time2str';
+
+my $test_case = OpenQA::Test::Case->new;
+my $schema = $test_case->init_data(fixtures_glob => '01-jobs.pl 02-workers.pl 03-users.pl');
+my $jobs = $schema->resultset('Jobs');
+my $workers = $schema->resultset('Workers');
+
+# assume all workers are online
+$workers->update({t_seen => time2str('%Y-%m-%d %H:%M:%S', time + 60, 'UTC')});
+
+embed_server_for_testing(
+    server_name => 'OpenQA::WebSockets',
+    client => OpenQA::WebSockets::Client->singleton,
+);
+
+my $t = Test::Mojo->new('OpenQA::WebAPI');
+my $app = $t->app;
+$t->ua(OpenQA::Client->new->ioloop(Mojo::IOLoop->singleton));
+$t->app($app);
+
+$t->post_ok('/api/v1/workers', form => {host => 'localhost', instance => 1, backend => 'qemu'})
+  ->status_is(403, 'register worker without API key fails (403)')->json_is(
+    '' => {
+        error => 'no api key',
+        error_status => 403,
+    },
+    'register worker without API key fails (error message)'
+  );
+
+$t->ua(OpenQA::Client->new(api => 'testapi')->ioloop(Mojo::IOLoop->singleton));
+$t->app($app);
+
+my @workers = (
+    {
+        id => 1,
+        instance => 1,
+        connected => 1,    # deprecated
+        websocket => 1,    # deprecated
+        error => undef,
+        alive => 1,
+        jobid => 99963,
+        host => 'localhost',
+        properties => {'JOBTOKEN' => 'token99963'},
+        status => 'running'
+    },
+    {
+        jobid => 99961,
+        properties => {
+            JOBTOKEN => 'token99961'
+        },
+        id => 2,
+        connected => 1,    # deprecated
+        websocket => 1,    # deprecated
+        error => undef,
+        alive => 1,
+        status => 'running',
+        host => 'remotehost',
+        instance => 1
+    });
+
+$t->get_ok('/api/v1/workers')->status_is(200, 'listing of all workers');
+$t->json_is('' => {workers => \@workers}, 'workers present with deprecated websocket flag');
+always_explain $t->tx->res->json unless $t->success;
+
+$t->get_ok('/api/v1/workers/2')->status_is(200, 'info for existing individual worker');
+$t->json_is('' => {worker => $workers[1]}, 'info for correct worker returned');
+$t->get_ok('/api/v1/workers/3')->status_is(404, 'no info for non-existing worker');
+
+my %worker_key = (host => 'localhost', instance => 1);
+my %registration_params = %worker_key;
+$t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(400, 'worker with missing parameters refused')
+  ->json_is('/error' => 'Erroneous parameters (cpu_arch missing, mem_max missing, worker_class missing)');
+
+$registration_params{cpu_arch} = 'foo';
+$t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(400, 'worker with missing parameters refused')
+  ->json_is('/error' => 'Erroneous parameters (mem_max missing, worker_class missing)');
+
+$registration_params{mem_max} = '4711';
+$t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(400, 'worker with missing parameters refused')
+  ->json_is('/error' => 'Erroneous parameters (worker_class missing)');
+
+$registration_params{worker_class} = 'bar';
+my $worker_mock = Test::MockModule->new('OpenQA::WebAPI::Controller::API::V1::Worker');
+$worker_mock->redefine(_register => sub (@) { die "some error\n" });
+$t->post_ok('/api/v1/workers', form => \%registration_params);
+$t->status_is(500, 'internal error occurred during registration');
+$t->json_is('/error', "Failed: some error\n");
+
+undef $worker_mock;
+$t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(426, 'worker informed to upgrade');
+
+$workers->find(\%worker_key)->update({error => 'cache not available'});
+$registration_params{websocket_api_version} = WEBSOCKET_API_VERSION;
+$t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(200, 'register existing worker with token')
+  ->json_is('/id' => 1, 'worker id is 1');
+always_explain $t->tx->res->json unless $t->success;
+is $workers->find(\%worker_key)->error, undef, 'possibly still present error from previous connection cleaned';
+
+$registration_params{instance} = 42;
+$t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(200, 'register new worker')
+  ->json_is('/id' => 3, 'new worker id is 3');
+always_explain $t->tx->res->json unless $t->success;
+is_deeply
+  OpenQA::Test::Case::find_most_recent_event($t->app->schema, 'worker_register'),
+  {
+    id => $t->tx->res->json->{id},
+    host => 'localhost',
+    instance => 42,
+  },
+  'worker event was logged correctly';
+
+subtest 'incompleting previous job on worker registration' => sub {
+    # assume the worker runs some job
+    my $running_job_id = 99961;
+    my $worker_id = $workers->find({job_id => $running_job_id})->id;
+
+    my %registration_params = (
+        host => 'remotehost',
+        instance => 1,
+        job_id => $running_job_id,
+        cpu_arch => 'aarch64',
+        mem_max => 2048,
+        worker_class => 'foo',
+        websocket_api_version => WEBSOCKET_API_VERSION,
+    );
+
+    is $jobs->find($running_job_id)->state, RUNNING, 'job is running in the first place';
+
+    subtest 'previous job not incompleted when still being worked on' => sub {
+        $t->post_ok('/api/v1/workers', form => \%registration_params)
+          ->status_is(200, 'register existing worker passing job ID')
+          ->json_is('/id' => $worker_id, 'worker ID returned');
+        return always_explain $t->tx->res->json unless $t->success;
+        is $jobs->find($running_job_id)->state, RUNNING, 'assigned job still running';
+    };
+
+    my $expected_breakage = '';
+    my $expected_warning = qr//;
+    my $test_registration = sub {
+        $schema->txn_begin;
+        combined_like sub { $t->post_ok('/api/v1/workers', form => \%registration_params) },
+          $expected_warning, 'expected warning logged';
+        $t->status_is(200, 'register existing worker passing no job ID');
+        $t->json_is('/id' => $worker_id, 'worker ID returned');
+        always_explain $t->tx->res->json unless $t->success;
+        return $schema->txn_rollback if $expected_breakage eq 'worker';
+        is $workers->find($worker_id)->job_id, undef, 'worker has no longer an assigned job';
+        return $schema->txn_rollback if $expected_breakage eq 'job';
+        my $incomplete_job = $jobs->find($running_job_id);
+        is $incomplete_job->state, DONE, 'assigned job set to done';
+        ok $incomplete_job->result eq INCOMPLETE || $incomplete_job->result eq PARALLEL_RESTARTED,
+          'assigned job considered incomplete or parallel restarted'
+          or always_explain 'actual job result: ' . $incomplete_job->result;
+        $schema->txn_rollback;
+    };
+
+    subtest 'previous job incompleted when worker doing something else' => sub {
+        delete $registration_params{job_id};
+
+        subtest 'no errors occurred' => $test_registration;
+
+        # test the worst case where workers will end up stuck with a job
+        # note: This is not supposed to happen in production as errors are now supposed to be caught
+        #       earlier by the cases tested in further subtests. However, this warning turned out to
+        #       be useful when investigating problems so we should keep it and have this test.
+        my $mock = Test::MockModule->new('OpenQA::WebAPI::Controller::API::V1::Worker');
+        $mock->redefine(_incomplete_previous_job => sub { die 'foo1' });
+        $expected_breakage = 'worker';
+        $expected_warning = qr/Unable to incomplete.*reschedule.*abandoned by worker 2: foo1/;
+        subtest 'incompleting previous job fails' => $test_registration;
+
+        # test that everything else works as expected despite failing duplication
+        $mock = Test::MockModule->new('OpenQA::Schema::Result::Jobs');
+        $mock->redefine(auto_duplicate => sub { die 'foo2' });
+        $expected_breakage = '';
+        $expected_warning = qr/Unable to duplicate job.*abandoned by worker remotehost:1: foo2/;
+        subtest 'failure when duplicating job does not prevent anything else' => $test_registration;
+
+        # test that when we cannot set the job to done the worker is at least freed from its job
+        # note: It is very important to free the worker from its job as it would otherwise be stuck
+        #       forever. The jobs seem to be mostly cancelled by obsoletion in practices anyway and
+        #       can also be cancelled manually by users if needed.
+        $mock->unmock('auto_duplicate');
+        $mock->redefine(done => sub { die 'foo3' });
+        $expected_breakage = 'job';
+        $expected_warning = qr/Unable to incomplete job.*abandoned by worker remotehost:1: foo3/;
+        subtest 'worker still freed from its job, even if job cannot be set done' => $test_registration;
+
+        # test that failures when reading results (e.g. for carry over) are not preventing anything else to happen
+        $mock = Test::MockModule->new('OpenQA::Schema::Result::JobModules');
+        $jobs->find($running_job_id)->modules->create({name => 'foo', script => 'bar', category => 'testsuite'});
+        $mock->redefine(results => sub ($self, %options) { die 'foo4' });
+        $expected_breakage = '';
+        $expected_warning = qr/Unable to carry-over bugrefs of job.*: foo4/;
+        subtest 'failure when reading job module results does not prevent anything else' => $test_registration;
+    };
+};
+
+
+subtest 'server-side limit has precedence over user-specified limit' => sub {
+    my $limits = OpenQA::App->singleton->config->{misc_limits};
+    $limits->{admin_table_max_limit} = 5;
+    $limits->{admin_table_default_limit} = 2;
+
+    # create more test-workers
+    my $id = 4;
+    for (1 .. 4) {
+        $registration_params{instance} = $id;
+        $t->post_ok('/api/v1/workers', form => \%registration_params)->status_is(200, 'register new worker')
+          ->json_is('/id' => $id, "new worker id is $id");
+        always_explain $t->tx->res->json unless $t->success;
+        $id++;
+    }
+
+    $t->get_ok('/api/v1/workers?limit=10', 'query with exceeding user-specified limit for workers')->status_is(200);
+    my $workers = $t->tx->res->json->{workers};
+    is ref $workers, 'ARRAY', 'data returned (1)' and is scalar @$workers, 5, 'maximum limit for workers is effective';
+
+    $t->get_ok('/api/v1/workers?limit=3', 'query with exceeding user-specified limit for workers')->status_is(200);
+    $workers = $t->tx->res->json->{workers};
+    is ref $workers, 'ARRAY', 'data returned (2)' and is scalar @$workers, 3, 'user limit for workers is effective';
+
+    $t->get_ok('/api/v1/workers', 'query with (low) default limit for workers')->status_is(200);
+    $workers = $t->tx->res->json->{workers};
+    is ref $workers, 'ARRAY', 'data returned (3)' and is scalar @$workers, 2, 'default limit for workers is effective';
+};
+
+subtest 'server-side limit with pagination' => sub {
+    subtest 'input validation' => sub {
+        $t->get_ok('/api/v1/workers?limit=a')->status_is(400)
+          ->json_is({error_status => 400, error => 'Erroneous parameters (limit invalid)'});
+        $t->get_ok('/api/v1/workers?offset=a')->status_is(400)
+          ->json_is({error_status => 400, error => 'Erroneous parameters (offset invalid)'});
+    };
+
+    subtest 'navigation with limit' => sub {
+        my $links;
+
+        subtest 'first page' => sub {
+            $t->get_ok('/api/v1/workers?limit=3')->status_is(200)->json_has('/workers/0')->json_has('/workers/2')
+              ->json_hasnt('/workers/3');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+
+        subtest 'second page' => sub {
+            $t->get_ok($links->{next}{link})->status_is(200)->json_has('/workers/0')->json_has('/workers/2')
+              ->json_hasnt('/workers/3');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'third page' => sub {
+            $t->get_ok($links->{next}{link})->status_is(200)->json_has('/workers/0')->json_hasnt('/workers/1');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok !$links->{next}, 'no next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'second page (prev link)' => sub {
+            $t->get_ok($links->{prev}{link})->status_is(200)->status_is(200)->json_has('/workers/0')
+              ->json_has('/workers/2')->json_hasnt('/workers/3');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'first page (first link)' => sub {
+            $t->get_ok($links->{first}{link})->status_is(200)->status_is(200)->json_has('/workers/0')
+              ->json_has('/workers/2')->json_hasnt('/workers/3');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+    };
+};
+
+subtest 'delete offline worker' => sub {
+    my $offline_worker_id = 9;
+    $workers->create(
+        {
+            id => $offline_worker_id,
+            host => 'offline_test',
+            instance => 5,
+            t_seen => time2str('%Y-%m-%d %H:%M:%S', time - DEFAULT_WORKER_TIMEOUT - DB_TIMESTAMP_ACCURACY, 'UTC'),
+        });
+
+    my $worker_mock = Test::MockModule->new('OpenQA::Schema::Result::Workers');
+    $worker_mock->redefine(delete => sub (@) { die "some deletion error\n" });
+    $t->delete_ok("/api/v1/workers/$offline_worker_id")->status_is(409, 'error during deletion returned as a conflict');
+    $t->json_is('/error', "some deletion error\n");
+
+    undef $worker_mock;
+    $t->delete_ok("/api/v1/workers/$offline_worker_id")->status_is(200, 'offline worker deleted');
+
+    is_deeply
+      OpenQA::Test::Case::find_most_recent_event($t->app->schema, 'worker_delete'),
+      {
+        id => $offline_worker_id,
+        name => 'offline_test:5'
+      },
+      'Delete worker was logged correctly.';
+
+    $t->delete_ok('/api/v1/workers/99')->status_is(404, 'worker not found');
+    $t->delete_ok('/api/v1/workers/1')->status_is(400, 'deleting online worker prevented');
+};
+
+subtest 'worker reservation API' => sub {
+    # $t authenticates as percival, an operator without admin rights, via the default test API key
+    my $users = $schema->resultset('Users');
+    my ($admin, $operator) = map { $users->find($_) } 99901, 99903;
+    my $other_operator = $users->create(
+        {
+            username => 'galahad',
+            is_operator => 1,
+            feature_version => 0,
+            api_keys => [{key => 'GALAHADKEY01', secret => 'GALAHADSECRET01'}]});
+    my $t_admin = client(Test::Mojo->new($t->app), apikey => 'ARTHURKEY01', apisecret => 'EXCALIBUR');
+    my $t_non_op = client(Test::Mojo->new($t->app), apikey => 'LANCELOTKEY01', apisecret => 'MANYPEOPLEKNOW');
+    my $t_other_op = client(Test::Mojo->new($t->app), apikey => 'GALAHADKEY01', apisecret => 'GALAHADSECRET01');
+
+    my $worker = $workers->find(2);
+    $worker->delete_properties([RESERVATION_PROPERTIES]);
+    my $reservation_url = '/api/v1/workers/2/reservation';
+
+    $t_non_op->post_ok($reservation_url, form => {comment => 'non-op attempt', duration => '1h'})
+      ->status_is(403, 'reserve attempt by non-operator users is refused by the route guard');
+    $t->post_ok('/api/v1/workers/99/reservation', form => {comment => 'ghost', duration => '1h'})
+      ->status_is(404, 'reserve attempt on an unknown worker is refused with 404');
+    $t->delete_ok('/api/v1/workers/99/reservation')
+      ->status_is(404, 'release attempt on an unknown worker is refused with 404');
+    $t->delete_ok($reservation_url)->status_is(400, 'release attempt on an unreserved worker is refused with 400');
+    $t->post_ok($reservation_url, form => {comment => 'op reservation', duration => 'soon'})
+      ->status_is(400, 'reserve attempt with an unparsable duration is refused with 400')
+      ->json_like('/error' => qr/Invalid duration format/);
+
+    $t->post_ok($reservation_url,
+        form => {comment => 'op reservation', duration => '2h', worker_class => 'invalid tag'})
+      ->status_is(400, 'reserve attempt with invalid worker_class is refused with 400')
+      ->json_like('/error' => qr/Invalid specific worker class/);
+
+    $t->post_ok($reservation_url, form => {comment => 'op reservation', duration => '2h', worker_class => 'poo123'})
+      ->status_is(200, 'reserve attempt by operator users is allowed with 200')
+      ->json_is('/reservation/comment' => 'op reservation')->json_is('/reservation/user' => $operator->username)
+      ->json_is('/reservation/worker_class' => 'poo123');
+    is_deeply OpenQA::Test::Case::find_most_recent_event($t->app->schema, 'worker_reserve'),
+      {
+        id => 2,
+        name => $worker->name,
+        user => $operator->username,
+        comment => 'op reservation',
+        expires => $worker->reservation->{t_expires},
+        worker_class => 'poo123',
+      },
+      'reservation is logged in the audit table with the expected fields including worker_class';
+
+    $t->get_ok('/api/v1/workers/2')->status_is(200)
+      ->json_is('/worker/reservation/worker_class' => 'poo123', 'worker_class is exposed in subsequent GET');
+
+    $t->delete_ok($reservation_url)->status_is(200);
+
+    $t->post_ok($reservation_url, form => {comment => 'op reservation', duration => '2h'})->status_is(200)
+      ->json_hasnt('/reservation/worker_class', 'reservation without tag reports worker_class as absent');
+
+    $t->post_ok($reservation_url, form => {comment => 'another', duration => '1h'})
+      ->status_is(409, 'reserve attempt on an already reserved worker is refused with 409');
+    $t_other_op->delete_ok($reservation_url)
+      ->status_is(403, 'release attempt by an operator other than the owner is refused with 403');
+
+    $t->delete_ok($reservation_url)->status_is(200, 'release attempt by the reservation owner is allowed with 200');
+    is_deeply OpenQA::Test::Case::find_most_recent_event($t->app->schema, 'worker_release'),
+      {id => 2, name => $worker->name, user => $operator->username},
+      'release is logged in the audit table with the expected fields';
+
+    $t->post_ok($reservation_url, form => {comment => 'op again', duration => '1h'})->status_is(200);
+    $t_admin->post_ok($reservation_url, form => {comment => 'admin override', duration => '2h', force => 1})
+      ->status_is(200, 'admin force override on an existing reservation is allowed with 200')
+      ->json_is('/reservation/comment' => 'admin override')->json_is('/reservation/user' => $admin->username);
+
+    $t_admin->delete_ok('/api/v1/workers/remotehost:1/reservation')
+      ->status_is(200, 'release via host:instance identifier is allowed with 200');
+    $t->post_ok('/api/v1/workers/remotehost:1/reservation',
+        form => {comment => 'host:instance reservation', duration => '1h'})
+      ->status_is(200, 'reserve via host:instance identifier is allowed with 200')
+      ->json_is('/reservation/comment' => 'host:instance reservation');
+
+    $t->get_ok('/api/v1/workers?reserved=1')->status_is(200, 'list only reserved workers when reserved filter is 1')
+      ->json_is('/workers/0/id' => 2)->json_has('/workers/0/reservation')->json_hasnt('/workers/1');
+    $t->get_ok('/api/v1/workers?reserved=0')->status_is(200, 'list only unreserved workers when reserved filter is 0')
+      ->json_is('/workers/0/id' => 1)->json_hasnt('/workers/0/reservation');
+
+    $worker->update(
+        {t_seen => time2str('%Y-%m-%d %H:%M:%S', time - DEFAULT_WORKER_TIMEOUT - DB_TIMESTAMP_ACCURACY, 'UTC')});
+    $t_admin->delete_ok('/api/v1/workers/2')
+      ->status_is(400, 'refuse deletion attempts of reserved workers even if they are dead')
+      ->json_is('/error' => 'Cannot delete a reserved worker.');
+    $t_admin->delete_ok('/api/v1/workers/2?force=1')
+      ->status_is(200, 'admins can force the deletion of a reserved worker');
+    is $workers->find(2), undef, 'forcibly deleted reserved worker is gone';
+    $other_operator->delete;
+};
+
+subtest 'worker host reservation API' => sub {
+    $schema->txn_begin;
+    my $users = $schema->resultset('Users');
+    my ($admin, $operator) = map { $users->find($_) } 99901, 99903;
+    my $other_operator = $users->create(
+        {
+            username => 'galahad_host',
+            is_operator => 1,
+            feature_version => 0,
+            api_keys => [{key => 'GALAHADHOSTKEY01', secret => 'GALAHADHOSTSECRET01'}]});
+    my $t_admin = client(Test::Mojo->new($t->app), apikey => 'ARTHURKEY01', apisecret => 'EXCALIBUR');
+    my $t_non_op = client(Test::Mojo->new($t->app), apikey => 'LANCELOTKEY01', apisecret => 'MANYPEOPLEKNOW');
+    my $t_other_op = client(Test::Mojo->new($t->app), apikey => 'GALAHADHOSTKEY01', apisecret => 'GALAHADHOSTSECRET01');
+
+    my $w1 = $workers->create({host => 'worker01.infra.opensuse.org', instance => 1});
+    my $w2 = $workers->create({host => 'worker01.infra.opensuse.org', instance => 2});
+
+    my $host_res_url = '/api/v1/worker_hosts/worker01.infra.opensuse.org/reservation';
+
+    $t_non_op->post_ok($host_res_url, form => {comment => 'maint', duration => '1h'})
+      ->status_is(403, 'reserve attempt by non-operator is forbidden');
+
+    $t_admin->post_ok('/api/v1/worker_hosts/nonexistent.host/reservation',
+        form => {comment => 'maint', duration => '1h'})
+      ->status_is(404, 'reserve attempt on nonexistent host returns 404');
+    $t_admin->delete_ok('/api/v1/worker_hosts/nonexistent.host/reservation')
+      ->status_is(404, 'release attempt on nonexistent host returns 404');
+
+    $t->post_ok($host_res_url,
+        form => {comment => 'operator host reservation', duration => '2h', worker_class => 'poo167749'})
+      ->status_is(200, 'operator can reserve complete host')
+      ->json_is('/message' => "Worker host 'worker01.infra.opensuse.org' reserved successfully.")
+      ->json_is('/worker_ids' => [$w1->id, $w2->id]);
+
+    $w1->discard_changes;
+    is $w1->reservation->{comment}, 'operator host reservation', 'host reservation comment is stored on instance 1';
+    is $w1->reservation->{scope}, 'host', 'host reservation scope is stored on instance 1';
+
+    is_deeply OpenQA::Test::Case::find_most_recent_event($t->app->schema, 'worker_host_reserve'),
+      {
+        host => 'worker01.infra.opensuse.org',
+        worker_ids => [$w1->id, $w2->id],
+        user => $operator->username,
+        comment => 'operator host reservation',
+        expires => $w1->reservation->{t_expires},
+        worker_class => 'poo167749',
+      },
+      'worker_host_reserve audit row was emitted with correct fields';
+
+    $t_other_op->post_ok($host_res_url, form => {comment => 'other op reservation', duration => '1h'})
+      ->status_is(409, 'refuse overlapping host reservation')->json_like('/error' => qr/already reserved/);
+
+    $t_admin->post_ok($host_res_url, form => {comment => 'admin host override', duration => '1h', force => 1})
+      ->status_is(200, 'admin can force reserve the host')
+      ->json_is('/message' => "Worker host 'worker01.infra.opensuse.org' reserved successfully.");
+
+    $w1->discard_changes;
+    is $w1->reservation->{user}, $admin->username, 'instance 1 owner updated to admin after forced host override';
+
+    $t_other_op->delete_ok($host_res_url)
+      ->status_is(403, 'release of host reserved by admin by non-admin operator is forbidden');
+
+    $t_admin->delete_ok($host_res_url)->status_is(200, 'admin can release host')
+      ->json_is('/message' => "Worker host 'worker01.infra.opensuse.org' reservation released successfully.");
+
+    is_deeply OpenQA::Test::Case::find_most_recent_event($t->app->schema, 'worker_host_release'),
+      {
+        host => 'worker01.infra.opensuse.org',
+        worker_ids => [$w1->id, $w2->id],
+        user => $admin->username,
+      },
+      'worker_host_release audit row was emitted with correct fields';
+
+    $t->post_ok($host_res_url, form => {comment => 'operator host reservation', duration => '2h'})->status_is(200);
+    $w1->update(
+        {t_seen => time2str('%Y-%m-%d %H:%M:%S', time - DEFAULT_WORKER_TIMEOUT - DB_TIMESTAMP_ACCURACY, 'UTC')});
+    $t_admin->delete_ok('/api/v1/workers/' . $w1->id)
+      ->status_is(400, 'cannot delete worker covered by host reservation without force')
+      ->json_is('/error' => 'Cannot delete a worker covered by active host reservation.');
+
+    $t_admin->delete_ok('/api/v1/workers/' . $w1->id . '?force=1')
+      ->status_is(200, 'admin can delete worker covered by host reservation with force');
+
+    $schema->txn_rollback;
+};
+
+subtest 'developer connection hint registration' => sub {
+    my %reg_params = (
+        host => 'hint-host',
+        instance => 1,
+        cpu_arch => 'x86_64',
+        mem_max => 4096,
+        worker_class => 'qemu',
+        websocket_api_version => WEBSOCKET_API_VERSION,
+    );
+    my $stored_hint = sub { $workers->find({host => 'hint-host', instance => 1})->developer_connection_hint };
+
+    $t->post_ok('/api/v1/workers', form => {%reg_params, developer_connection_hint => 'worker-host.example.com:5903'})
+      ->status_is(200, 'worker registered with developer connection hint');
+    is $stored_hint->(), 'worker-host.example.com:5903', 'developer connection hint stored on registration';
+
+    $t->post_ok('/api/v1/workers', form => \%reg_params)->status_is(200, 'worker re-registered without hint');
+    is $stored_hint->(), undef, 'stale developer connection hint cleared when re-registered without one';
+    $workers->find({host => 'hint-host', instance => 1})->delete;
+};
+
+subtest 'worker registration reservation inheritance' => sub {
+    $schema->txn_begin;
+    my $users = $schema->resultset('Users');
+    my $operator = $users->find(99903);
+
+    my $w1 = $workers->create({host => 'inherit-host', instance => 1});
+    $workers->reserve_host('inherit-host', $operator, comment => 'inherit comment', duration => '2h');
+
+    my %reg_params = (
+        host => 'inherit-host',
+        instance => 2,
+        cpu_arch => 'x86_64',
+        mem_max => 4096,
+        worker_class => 'qemu',
+        websocket_api_version => WEBSOCKET_API_VERSION,
+    );
+
+    $t->post_ok('/api/v1/workers', form => \%reg_params)
+      ->status_is(200, 'register new sibling worker on host-reserved machine');
+    my $w2_id = $t->tx->res->json->{id};
+    my $w2 = $workers->find($w2_id);
+    ok $w2->is_reserved, 'newly registered sibling worker inherited active host reservation';
+    is $w2->reservation->{comment}, 'inherit comment', 'inherited reservation comment matches';
+    is $w2->reservation->{scope}, 'host', 'inherited reservation scope is host';
+
+    $workers->release_host('inherit-host', $operator);
+    $w2->delete;
+
+    $workers->reserve_host('inherit-host', $operator, comment => 'expired comment', duration => '1h');
+    $w1->discard_changes;
+    $w1->set_property(RESERVED_T_EXPIRES => time - 10);
+    ok !$w1->is_reserved, 'worker reservation on host is expired';
+
+    $reg_params{instance} = 3;
+    $t->post_ok('/api/v1/workers', form => \%reg_params)
+      ->status_is(200, 'register instance 3 with expired host reservation');
+    my $w3_id = $t->tx->res->json->{id};
+    my $w3 = $workers->find($w3_id);
+    ok !$w3->is_reserved, 'new worker did not inherit expired reservation';
+
+    $schema->txn_rollback;
+};
+
+done_testing();

@@ -1,0 +1,3 @@
+%= include 'layouts/flash_message', var => 'warning', type => 'warning';
+%= include 'layouts/flash_message', var => 'info', type => 'primary';
+%= include 'layouts/flash_message', var => 'error', type => 'danger';

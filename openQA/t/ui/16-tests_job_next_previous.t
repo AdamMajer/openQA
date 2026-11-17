@@ -1,0 +1,381 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Test::Mojo;
+use Test::Warnings ':report_warnings';
+use OpenQA::Test::TimeLimit '20';
+use OpenQA::Test::Case;
+use Date::Format 'time2str';
+
+my $test_case = OpenQA::Test::Case->new;
+my $schema_name = OpenQA::Test::Database::generate_schema_name;
+my $schema = $test_case->init_data(
+    schema_name => $schema_name,
+    fixtures_glob => '01-jobs.pl 03-users.pl 04-products.pl 05-job_modules.pl 07-needles.pl'
+);
+
+use OpenQA::SeleniumTest;
+
+my $t = Test::Mojo->new('OpenQA::WebAPI');
+
+sub prepare_database () {
+    my $jobs = $schema->resultset('Jobs');
+
+    # Populate more jobs to test page setting and include incompletes
+    for my $n (1 .. 15) {
+        my $result = $n < 8 ? 'passed' : 'incomplete';
+        my $offset = time;
+        my $new = {
+            id => 99900 + $n,
+            group_id => 1001,
+            priority => 35,
+            result => $result,
+            state => 'done',
+            t_finished => time2str('%Y-%m-%d %H:%M:%S', $offset - 14400, 'UTC'),
+            t_started => time2str('%Y-%m-%d %H:%M:%S', $offset - 18000, 'UTC'),
+            t_created => time2str('%Y-%m-%d %H:%M:%S', $offset - 7200, 'UTC'),
+            TEST => 'textmode',
+            FLAVOR => 'DVD',
+            DISTRI => 'opensuse',
+            BUILD => '0091',
+            VERSION => '13.1',
+            MACHINE => '32bit',
+            ARCH => 'i586',
+            jobs_assets => [{asset_id => 1},],
+            settings => [
+                {key => 'QEMUCPU', value => 'qemu32'},
+                {key => 'DVD', value => '1'},
+                {key => 'VIDEOMODE', value => 'text'},
+                {key => 'ISO', value => 'openSUSE-13.1-DVD-i586-Build0091-Media.iso'},
+                {key => 'DESKTOP', value => 'textmode'},
+                {key => 'ISO_MAXSIZE', value => '4700372992'}]};
+        $jobs->create($new);
+    }
+
+    # Create bug reference
+    $schema->resultset('Comments')->create(
+        {
+            job_id => 99981,
+            user_id => 99901,
+            text => 'boo#1138417',
+        });
+    $schema->resultset('Bugs')->create(
+        {
+            bugid => 'boo#1138417',
+            title => 'some title with "quotes" and <html>elements</html>',
+            existing => 1,
+            refreshed => 1,
+        });
+}
+
+prepare_database;
+
+driver_missing unless my $driver = call_driver;
+disable_timeout;
+
+sub goto_next_previous_tab () {
+    my $tab_link = wait_for_element(selector => 'Next & previous results', method => 'link_text');
+    wait_for_element(trigger_function => sub { $tab_link->click }, selector => '.dt-container');
+    wait_for_ajax(msg => 'Next & previous table ready');
+}
+
+# check job next and previous not loaded when open tests/x
+$t->get_ok('/tests/99946')->status_is(200)->element_exists_not('#job_next_previous_table_wrapper .dt-container',
+    'datatable of job next and previous not loaded when open tests/x');
+
+my $job_header = $t->tx->res->dom->at('#next_previous #scenario');
+like
+  OpenQA::Test::Case::trim_whitespace($job_header->all_text),
+  qr/Next & previous results for opensuse-13\.1-DVD-i586-textmode/,
+  'header for job scenario';
+
+# trigger job next and previous for current job
+$driver->title_is('openQA', 'on main page');
+$driver->find_element_by_link_text('All Tests')->click();
+wait_for_ajax(msg => 'wait for All Tests displayed before looking for 99946');
+wait_for_element(selector => '[href="/tests/99946"]')->click();
+goto_next_previous_tab;
+
+# check job next and previous for current job
+my ($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) entries$/;
+is $entries, 19, '19 entries found for 99946';
+my $job99946 = $driver->find_element('#job_next_previous_table #job_result_99946');
+my @tds = $driver->find_child_elements($job99946, 'td');
+is +(shift @tds)->get_text(), 'C', '99946 is current job';
+is +(shift @tds)->get_text() =~ s/\s+\d+$//r, 'zypper_up', 'failed module of 99946';
+is +(shift @tds)->get_text(), '0091', 'build of 99946 is 0091';
+is +(shift @tds)->get_text(), '3 hours ago ( 01:00 hours )', 'finished and duration of 99946';
+
+my $job99947 = $driver->find_element('#job_next_previous_table #job_result_99947');
+@tds = $driver->find_child_elements($job99947, 'td');
+is +(shift @tds)->get_text(), 'L', '99947 is the latest job';
+my $state = $driver->find_child_element(shift @tds, '.status', 'css');
+is $state->get_attribute('title'), 'Done: passed', 'the latest job 99947 was passed';
+is +(shift @tds)->get_text(), '0092', 'build of 99947 is 0092';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99945')},
+  1, 'found nearest previous job 99945';
+is scalar @{$driver->find_elements(q{//*[@title='Done: incomplete']}, 'xpath')}, 6, 'include 6 incomletes in page 1';
+$driver->find_element('[aria-label="Next"]')->click();
+is scalar @{$driver->find_elements(q{//*[@title='Done: incomplete']}, 'xpath')}, 2, 'include 2 incomletes in page 2';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99901')},
+  1, 'found farmost previous job 99901';
+
+# select the most previous job in the table and check its job next and previous results
+$driver->find_element('[href="/tests/99901"]')->click();
+goto_next_previous_tab;
+
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) entries$/;
+is $entries, 19, '19 entries found for 99901';
+my $init_page = $driver->find_element_by_xpath(q{//*[@class='dt-paging-button page-item active']})->get_text();
+is $init_page, 2, 'init page is 2 for 99901';
+my $job99901 = $driver->find_element('#job_next_previous_table #job_result_99901');
+@tds = $driver->find_child_elements($job99901, 'td');
+is +(shift @tds)->get_text(), 'C', '99901 is current job';
+$state = $driver->find_child_element(shift @tds, '.status', 'css');
+is $state->get_attribute('title'), 'Done: passed', 'the latest job 99901 was passed';
+is +(shift @tds)->get_text(), '0091', 'build of 99901 is 0091';
+is +(shift @tds)->get_text(), '4 hours ago ( 01:00 hours )', 'finished and duration of 99901';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99902')}, 1, 'found nearest next job 99902';
+$driver->find_element('[aria-label="Previous"]')->click();
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99946')}, 1, 'found farmost next job 99946';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99947')}, 1, 'found next and latest job 99947';
+
+# select the latest job in the table and check its job next and previous results
+$driver->find_element('[href="/tests/99947"]')->click();
+goto_next_previous_tab;
+
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) entries$/;
+is $entries, 19, '19 entries found for 99947';
+$job99947 = $driver->find_element('#job_next_previous_table #job_result_99947');
+@tds = $driver->find_child_elements($job99947, 'td');
+is +(shift @tds)->get_text(), 'C&L', '99947 is current and the latest job';
+$state = $driver->find_child_element(shift @tds, '.status', 'css');
+is $state->get_attribute('title'), 'Done: passed', 'the latest job 99947 was passed';
+is +(shift @tds)->get_text(), '0092', 'build of 99947 is 0092';
+is +(shift @tds)->get_text(), '2 hours ago ( 01:58 hours )', 'finished and duration of 99947';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99946')},
+  1, 'found nearest previous job 99946';
+$driver->find_element('[aria-label="Next"]')->click();
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99901')},
+  1, 'found farmost previous job 99901';
+
+#check build links to overview page
+$driver->find_element_by_link_text('0091')->click();
+like
+  $driver->find_element('#summary .card-header')->get_text(),
+  qr/Overall Summary of opensuse 13\.1 build 0091/,
+  'build links to overview page';
+
+# check job next and previous of current running/scheduled job
+$driver->find_element_by_link_text('All Tests')->click();
+wait_for_ajax(msg => 'wait for All Tests displayed before looking for 99963');
+$driver->find_element('[href="/tests/99963"]')->click();
+goto_next_previous_tab;
+
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)/;
+is $entries, 2, '2 entries found for 99963';
+my $job99963 = $driver->find_element('#job_next_previous_table #job_result_99963');
+@tds = $driver->find_child_elements($job99963, 'td');
+is +(shift @tds)->get_text(), 'C&L', '99963 is current and the latest job';
+$state = $driver->find_child_element(shift @tds, '.status', 'css');
+is $state->get_attribute('title'), 'running', 'job 99963 was running';
+is +(shift @tds)->get_text(), '0091', 'build of 99963 is 0091';
+is +(shift @tds)->get_text(), 'Not yet: running', '99963 is not yet finished';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99962')}, 1, 'found previous job 99962';
+
+$driver->find_element_by_link_text('All Tests')->click();
+wait_for_ajax(msg => 'wait for All Tests displayed before looking for 99928');
+$driver->find_element('[href="/tests/99928"]')->click();
+goto_next_previous_tab;
+
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)$/;
+is $entries, 1, '1 entries found for 99928';
+my $job99928 = $driver->find_element('#job_next_previous_table #job_result_99928');
+@tds = $driver->find_child_elements($job99928, 'td');
+is +(shift @tds)->get_text(), 'C&L', '99928 is current and the latest job';
+$state = $driver->find_child_element(shift @tds, '.status', 'css');
+is $state->get_attribute('title'), 'scheduled', 'job 99928 was scheduled';
+is +(shift @tds)->get_text(), '0091', 'build of 99928 is 0091';
+is +(shift @tds)->get_text(), 'Not yet: scheduled', '99928 is not yet finished';
+
+# check job next and previous under tests/latest route
+$driver->get('/tests/latest');
+goto_next_previous_tab;
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)/;
+is $entries, 1, '1 entries found for 99981';
+my $job99981 = $driver->find_element('#job_next_previous_table #job_result_99981');
+@tds = $driver->find_child_elements($job99981, 'td');
+is +(shift @tds)->get_text(), 'C&L', '99981 is current and the latest job';
+
+# check job next and previous with scenario latest url
+$driver->get('/tests/99945');
+goto_next_previous_tab;
+$driver->find_element_by_link_text('latest job for this scenario')->click();
+my $scenario_latest_url = $driver->get_current_url();
+like $scenario_latest_url, qr/latest?/, 'latest scenario URL includes latest';
+like $scenario_latest_url, qr/arch=i586/, 'latest scenario URL includes architecture';
+like $scenario_latest_url, qr/flavor=DVD/, 'latest scenario URL includes flavour';
+like $scenario_latest_url, qr/test=textmode/, 'latest scenario URL includes test';
+like $scenario_latest_url, qr/version=13.1/, 'latest scenario URL includes version';
+like $scenario_latest_url, qr/machine=32bit/, 'latest scenario URL includes machine';
+like $scenario_latest_url, qr/distri=opensuse/, 'latest scenario URL includes distri';
+goto_next_previous_tab;
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)$/;
+is $entries, 19, '19 entries found for 99947';
+$job99947 = $driver->find_element('#job_next_previous_table #job_result_99947');
+@tds = $driver->find_child_elements($job99947, 'td');
+is +(shift @tds)->get_text(), 'C&L', '99947 is current and the latest job';
+
+# check limit with query parameters of job next & previous
+$driver->get('/tests/99947?previous_limit=10#next_previous');
+wait_for_ajax();
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)$/;
+is $entries, 12, '10 previous of 99947, 99947 itself and note about limit shown';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99947')}, 1, 'found current job 99947';
+$driver->find_element('[aria-label="Next"]')->click();
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99909')}, 1, 'found 10th previous job 99909';
+
+$driver->get('/tests/99901?next_limit=10#next_previous');
+wait_for_ajax();
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)$/;
+is $entries, 13, '10 next of 99901, 99901 itself, the latest and the note about the limit shown';
+$init_page = $driver->find_element_by_xpath(q{//*[@class='dt-paging-button page-item active']})->get_text();
+is $init_page, 2, 'init page is 2 for 99901';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99901')}, 1, 'found current job 99901';
+$driver->find_element('[aria-label="Previous"]')->click();
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99947')}, 1, 'found the latest job 99947';
+
+$driver->get('/tests/99908?previous_limit=3&next_limit=2#next_previous');
+wait_for_ajax();
+($entries) = $driver->get_text('#job_next_previous_table_info') =~ /of (\d+) (entries|entry)$/;
+is $entries, 9, '3 previous and 2 next of 99901, 99901 itself, the latest and the limit notes shown';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99908')}, 1, 'found current job 99908';
+is scalar @{$driver->find_elements('#job_next_previous_table #job_result_99947')}, 1, 'found the latest job 99947';
+
+$driver->get('/tests/latest?previous_limit=1&next_limit=1#next_previous');
+wait_for_ajax();
+is scalar @{$driver->find_elements('#job_next_previous_table tbody tr', 'css')},
+  1, 'job next and previous of the latest job - 99981';
+element_not_present '#job_next_previous_table_wrapper .alert', 'no info about limit present';
+
+subtest 'bug reference shown' => sub {
+    my @bug_labels = $driver->find_elements('#bug-99981 .label_bug');
+    is scalar @bug_labels, 1, 'one bug label present';
+    is $bug_labels[0]->get_attribute('title'),
+      qq{Bug referenced: boo#1138417\nsome title with "quotes" and <html>elements</html>},
+      'title rendered with new-line, HTML code is rendered as text';
+};
+
+subtest 'server-side limit has precedence over user-specified limit' => sub {
+    my $limits = OpenQA::App->singleton->config->{misc_limits};
+    $limits->{next_jobs_max_limit} = 5;
+    $limits->{previous_jobs_max_limit} = 5;
+    $limits->{next_jobs_default_limit} = 2;
+    $limits->{previous_jobs_default_limit} = 2;
+
+    # expected amount is the defined limit plus current and latest job
+    $t->get_ok('/tests/99910/ajax?previous_limit=0&next_limit=6', 'query with exceeding user-specified limit for next')
+      ->status_is(200);
+    my $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (1)' and is scalar @$jobs, 9, 'maximum limit for next is effective';
+
+    $t->get_ok('/tests/99910/ajax?previous_limit=6&next_limit=0',
+        'query with exceeding user-specified limit for previous')->status_is(200);
+    $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (2)' and is scalar @$jobs, 9, 'maximum limit for previous is effective';
+
+    $t->get_ok('/tests/99910/ajax?previous_limit=3&next_limit=0', 'query with low user-specified limit for next')
+      ->status_is(200);
+    $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (3)' and is scalar @$jobs, 7, 'user-specified limit for next is effective';
+
+    $t->get_ok('/tests/99910/ajax?previous_limit=0&next_limit=3', 'query with low user-specified limit for previous')
+      ->status_is(200);
+    $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (4)'
+      and is scalar @$jobs, 7, 'user-specified limit for previous is effective';
+
+    $t->get_ok('/tests/99910/ajax', 'query with (low) default limit for next and previous')->status_is(200);
+    $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (5)' and is scalar @$jobs, 8, 'default limit for next is effective';
+
+    $driver->get('/tests/99910?previous_limit=6&next_limit=0#next_previous');
+    my $info = wait_for_element
+      selector => '#job_next_previous_table tbody tr:nth-child(2)',
+      desc => 'next limit shown';
+    like $info->get_text, qr/omitted.*0.*next/is, 'info about next jobs being limited shown';
+    $info = wait_for_element selector => '#job_next_previous_table tbody tr:last-child', desc => 'previous limit shown';
+    like $info->get_text, qr/previous.*6.*exceeded/is, 'info about previous jobs being limited shown';
+};
+
+subtest 'history isolation toggle for "Next & Previous"' => sub {
+    my $jobs_rs = $schema->resultset('Jobs');
+    my $base_id = 99500;
+    my %base = (
+        group_id => 1001,
+        priority => 35,
+        result => 'passed',
+        state => 'done',
+        TEST => 'isoscen',
+        FLAVOR => 'DVD',
+        DISTRI => 'opensuse',
+        BUILD => '0091',
+        VERSION => '13.1',
+        MACHINE => '32bit',
+        ARCH => 'i586',
+    );
+    # 3 jobs of PR 1 and 2 jobs of PR 2, all sharing the scenario
+    for my $spec ([1, 1], [2, 1], [3, 1], [4, 2], [5, 2]) {
+        my ($n, $pr) = @$spec;
+        $jobs_rs->create(
+            {
+                %base,
+                id => $base_id + $n,
+                settings => [{key => 'PR_ID', value => $pr}, {key => '_HISTORY_ISOLATION_KEYS', value => 'PR_ID'}],
+            });
+    }
+    my $current = $base_id + 3;    # a PR 1 job
+
+    $t->get_ok("/tests/$current/ajax", 'generalized next/previous')->status_is(200);
+    my %gen = map { $_->{id} => 1 } @{$t->tx->res->json->{data}};
+    ok $gen{$base_id + 4}, 'generalized view includes a job from the other PR';
+
+    $t->get_ok("/tests/$current/ajax?strict=1", 'strict next/previous')->status_is(200);
+    my %strict = map { $_->{id} => 1 } @{$t->tx->res->json->{data}};
+    ok !$strict{$base_id + 4}, 'strict view excludes jobs from the other PR';
+    ok $strict{$base_id + 1}, 'strict view keeps same-PR jobs';
+    ok $strict{$current}, 'strict view keeps the current job';
+
+    subtest 'toggle renders and syncs the URL' => sub {
+        $driver->get("/tests/$current#next_previous");
+        my $toggle = wait_for_element selector => '#next_previous_strict', desc => 'strict toggle present';
+        like $driver->find_element('label[for=next_previous_strict]')->get_text, qr/isolate history by PR_ID/,
+          'toggle labelled with the isolation key';
+        $toggle->click;
+        wait_for_ajax msg => 'table reloaded after enabling strict';
+        like $driver->get_current_url, qr/strict=1/, 'URL reflects the strict view for sharing';
+    };
+
+    subtest 'reserved SUBMISSION_ID enables isolation without meta-setting' => sub {
+        my $sub_id = $base_id + 10;
+        for my $spec ([10, 'a'], [11, 'a'], [12, 'b']) {
+            my ($n, $sid) = @$spec;
+            $jobs_rs->create({%base, id => $base_id + $n, settings => [{key => 'SUBMISSION_ID', value => $sid}]});
+        }
+        my $cur = $base_id + 11;
+        $t->get_ok("/tests/$cur/ajax?strict=1", 'strict via default key')->status_is(200);
+        my %strict = map { $_->{id} => 1 } @{$t->tx->res->json->{data}};
+        ok $strict{$base_id + 10}, 'keeps same-submission job';
+        ok !$strict{$base_id + 12}, 'excludes a different submission';
+        $driver->get("/tests/$cur#next_previous");
+        like $driver->find_element('label[for=next_previous_strict]')->get_text, qr/isolate history by SUBMISSION_ID/,
+          'toggle labelled with the default SUBMISSION_ID key';
+    };
+};
+
+kill_driver();
+done_testing();

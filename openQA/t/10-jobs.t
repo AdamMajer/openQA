@@ -1,0 +1,1577 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+BEGIN {
+    # increase coverage scale factor for timeout to account for the Minion jobs being executed
+    $ENV{OPENQA_TEST_TIMEOUT_SCALE_COVER} = 3.5;
+}
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+use Mojo::Base -signatures;
+use autodie ':all';
+use File::Copy;
+use OpenQA::Jobs::Constants;
+use OpenQA::JobInvestigation 'annotate_pull_requests';
+use OpenQA::Test::Case;
+use Test::MockModule 'strict';
+use Test::Mojo;
+use Test::Output;
+use Test::Warnings qw(:report_warnings);
+use Mojo::File qw(path tempdir);
+use Mojo::JSON qw(decode_json encode_json);
+use OpenQA::Test::Utils qw(perform_minion_jobs mock_io_loop);
+use OpenQA::Test::TimeLimit '30';
+
+binmode STDOUT, ':encoding(UTF-8)';
+
+my $schema_name = OpenQA::Test::Database::generate_schema_name;
+my $schema = OpenQA::Test::Case->new->init_data(
+    fixtures_glob => '01-jobs.pl 05-job_modules.pl 06-job_dependencies.pl',
+    schema_name => $schema_name
+);
+my $t = Test::Mojo->new('OpenQA::WebAPI');
+my ($jobs, $users, $comments) = map { $t->app->schema->resultset($_) } qw(Jobs Users Comments);
+
+# for "investigation" tests
+my $fake_git_log = 'deadbeef Break test foo';
+
+subtest 'adding job module without required fields' => sub {
+    my $res = $jobs->first->insert_module({name => undef, category => 'foo', script => 'unk'});
+    is $res, 0, 'no job module inserted if name missing';
+};
+
+subtest 'handling of concurrent deletions in code updating jobs' => sub {
+    ok my $job = $jobs->find(99927), 'job exists in first place';
+
+    # delete job "in the middle" via another schema
+    my $schema2 = OpenQA::Schema->connect($ENV{TEST_PG} // 'DBI:Pg:dbname=openqa_test;host=/dev/shm/tpg');
+    $schema2->storage->on_connect_do(qq{SET search_path TO "$schema_name"});
+    $schema2->resultset('Jobs')->search({id => 99927})->delete;
+
+    # update the job (so far only accounting the result size is covered)
+    $job->discard_changes;
+    is $job->id, 99927, 'job ID still accessible (despite deletion and discarding changes)';
+    ok !$job->account_result_size(test => 123), 'no exception when accounting result size, just falsy return code';
+};
+
+my %settings = (
+    DISTRI => 'Unicorn',
+    FLAVOR => 'pink',
+    VERSION => '42',
+    BUILD => '666',
+    ISO => 'whatever.iso',
+    MACHINE => 'RainbowPC',
+    ARCH => 'x86_64',
+);
+
+sub _job_create (@args) {
+    my $job = $jobs->create_from_settings(@args);
+    # reload all values from database so we can check against default values
+    $job->discard_changes;
+    return $job;
+}
+
+subtest 'latest jobs' => sub {
+    is $jobs->latest_build, '0091', 'can find latest build from jobs';
+    is $jobs->latest_build(version => 'Factory', distri => 'opensuse'), '0048@0815', 'latest for non-integer build';
+    is $jobs->latest_build(version => '13.1', distri => 'opensuse'), '0091', 'latest for different version differs';
+
+    my $ids = $jobs->complex_query_latest_ids;
+    # These two jobs have later clones in the fixture set, so should not appear
+    ok + (grep { !/^(?:99962|99945)$/ } @$ids), 'jobs with later clones do not show up in latest jobs';
+    # These are the later clones, they should appear
+    ok + (grep { /^99963$/ } @$ids), 'cloned jobs appear as latest job';
+    ok + (grep { /^99946$/ } @$ids), 'cloned jobs appear as latest job (2nd)';
+
+    my $filtered_ids = $jobs->complex_query_latest_ids(filters => [{result => {-in => [FAILED, PASSED]}}]);
+    ok + (grep { !/^(?:99962|99945)$/ } @$filtered_ids), 'jobs with later clones still not present';
+    ok + (grep { /^99946$/ } @$filtered_ids), 'failed/passed job still returned';
+    ok + (grep { !/^99963$/ } @$filtered_ids), 'running job filtered out';
+};
+
+
+subtest 'has_dependencies' => sub {
+    ok $jobs->find(99961)->has_dependencies, 'positive case: job is parent';
+    ok $jobs->find(99963)->has_dependencies, 'positive case: job is child';
+    ok !$jobs->find(99946)->has_dependencies, 'negative case';
+};
+
+subtest 'has_modules' => sub {
+    ok $jobs->find(99937)->has_modules, 'positive case';
+    ok !$jobs->find(99926)->has_modules, 'negative case';
+};
+
+subtest 'name/label/scenario and description' => sub {
+    my $job = $schema->resultset('Jobs')->find(99926);
+    is $job->name, 'opensuse-Factory-staging_e-x86_64-Build87.5011-minimalx@32bit', 'job name';
+    is $job->label, 'minimalx@32bit', 'job label';
+    is $job->scenario, undef, 'test scenario';
+    is $job->scenario_name, 'opensuse-Factory-staging_e-x86_64-minimalx@32bit', 'test scenario name';
+    is $job->scenario_description, undef, 'return undef if no description';
+
+    my $minimalx_testsuite = $schema->resultset('TestSuites')->create(
+        {
+            name => 'minimalx',
+            description => 'foobar',
+        });
+    is $job->scenario_description, 'foobar', 'description returned';
+    $minimalx_testsuite->delete;
+};
+
+subtest 'hard-coded initial job module statistics consistent; no automatic handling via DBIx hooks interferes' => sub {
+    my $job = $jobs->find(99946);
+    my $modules = $job->modules;
+    is $job->passed_module_count, $modules->search({result => PASSED})->count, 'number of passed modules';
+    is $job->softfailed_module_count, $modules->search({result => SOFTFAILED})->count, 'number of softfailed modules';
+    is $job->failed_module_count, $modules->search({result => FAILED})->count, 'number of failed modules';
+    is $job->skipped_module_count, $modules->search({result => SKIPPED})->count, 'number of skipped modules';
+};
+
+subtest 'job with all modules passed => overall is passsed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'A';
+    my $job = _job_create(\%_settings);
+    for my $i (qw(a b c d)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {}});
+        $job->update_module($i, {result => 'ok', details => []});
+    }
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+    is $job->passed_module_count, 4, 'number of passed modules incremented';
+    is $job->softfailed_module_count, 0, 'number of softfailed modules not incremented';
+    is $job->failed_module_count, 0, 'number of failed modules not incremented';
+    is $job->skipped_module_count, 0, 'number of skipped modules not incremented';
+};
+
+subtest 'job with one skipped module => overall is failed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'A';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'e', category => 'e', script => 'e', flags => {}});
+    $job->update_module('e', {result => 'none', details => []});
+    for my $i (qw(a b c d)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {}});
+        $job->update_module($i, {result => 'ok', details => []});
+    }
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::FAILED, 'job result is failed';
+    is $job->passed_module_count, 4, 'number of passed modules incremented';
+    is $job->softfailed_module_count, 0, 'number of softfailed modules not incremented';
+    is $job->failed_module_count, 0, 'number of failed modules not incremented';
+    is $job->skipped_module_count, 1, 'number of skipped modules incremented';
+};
+
+subtest 'job with at least one module failed => overall is failed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'B';
+    my $job = _job_create(\%_settings);
+    for my $i (qw(a b c d)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {}});
+        $job->update_module($i, {result => $i eq 'c' ? 'fail' : 'ok', details => []});
+    }
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::FAILED, 'job result is failed';
+    is $job->passed_module_count, 3, 'number of passed modules incremented';
+    is $job->softfailed_module_count, 0, 'number of softfailed modules not incremented';
+    is $job->failed_module_count, 1, 'number of failed modules incremented';
+    is $job->skipped_module_count, 0, 'number of skipped modules not incremented';
+};
+
+subtest 'job with at least one softfailed and rest passed => overall is softfailed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'C';
+    my $job = _job_create(\%_settings);
+    for my $i (qw(a b c)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {}});
+        $job->update_module($i, {result => 'ok', details => []});
+    }
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {}});
+    $job->update_module('d', {result => 'ok', details => [], dents => 1});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::SOFTFAILED, 'job result is softfailed';
+    is $job->passed_module_count, 3, 'number of passed modules incremented';
+    is $job->softfailed_module_count, 1, 'number of softfailed modules incremented';
+    is $job->failed_module_count, 0, 'number of failed modules not incremented';
+    is $job->skipped_module_count, 0, 'number of skipped modules not incremented';
+};
+
+subtest 'inserting the same module twice keeps the job module statistics intact' => sub {
+    my $job = _job_create({%settings, TEST => 'TEST2'});
+    my @test_module_names = (qw(a b b c));
+    my @test_modules = map { {name => $_, category => $_, script => $_, flags => {}} } @test_module_names;
+    $job->insert_test_modules(\@test_modules);
+    $job->update_module($_, {result => 'ok', details => []}) for @test_module_names;
+    $job->discard_changes;
+
+    subtest 'all modules passed; b not accounted twice' => sub {
+        is $job->passed_module_count, 3, 'number of passed modules incremented';
+        is $job->softfailed_module_count, 0, 'number of softfailed modules still zero';
+        is $job->failed_module_count, 0, 'number of failed modules still zero';
+        is $job->skipped_module_count, 0, 'number of skipped modules still zero';
+    };
+};
+
+subtest 'job with at least one failed module and one softfailed => overall is failed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'D';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {}});
+    $job->update_module('a', {result => 'ok', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'fail', details => []});
+    $job->insert_module({name => 'c', category => 'c', script => 'c', flags => {}});
+    $job->update_module('c', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {}});
+    $job->update_module('d', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::FAILED, 'job result is failed';
+};
+
+subtest 'job with all modules passed and at least one ignore_failure failed => overall passed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'E';
+    my $job = _job_create(\%_settings);
+    for my $i (qw(a b c)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {}});
+        $job->update_module($i, {result => 'ok', details => []});
+    }
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {ignore_failure => 1}});
+    $job->update_module('d', {result => 'fail', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+};
+
+subtest
+'job with important modules passed and at least one softfailed and at least one ignore_failure failed => overall softfailed'
+  => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'F';
+    my $job = _job_create(\%_settings);
+    for my $i (qw(a b)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {}});
+        $job->update_module($i, {result => 'ok', details => []});
+    }
+    $job->insert_module({name => 'c', category => 'c', script => 'c', flags => {}});
+    $job->update_module('c', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {ignore_failure => 1}});
+    $job->update_module('d', {result => 'fail', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::SOFTFAILED, 'job result is softfailed';
+  };
+
+subtest
+'job with one "important" (old flag we now ignore) module failed and at least one ignore_failure passed => overall failed'
+  => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'G';
+    my $job = _job_create(\%_settings);
+    for my $i (qw(a b c)) {
+        $job->insert_module({name => $i, category => $i, script => $i, flags => {ignore_failure => 1}});
+        $job->update_module($i, {result => 'ok', details => []});
+    }
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {important => 1}});
+    $job->update_module('d', {result => 'fail', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::FAILED, 'job result is failed';
+  };
+
+subtest 'job with first ignore_failure failed and rest softfails => overall is softfailed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'H';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {ignore_failure => 1}});
+    $job->update_module('a', {result => 'fail', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {important => 1}});
+    $job->update_module('b', {result => 'ok', details => [], dents => 1});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::SOFTFAILED, 'job result is softfailed';
+};
+
+subtest 'job with one ignore_failure pass => overall is passed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'H';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {ignore_failure => 1}});
+    $job->update_module('a', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+};
+
+subtest 'job with one ignore_failure fail => overall is passed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'H';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {ignore_failure => 1}});
+    $job->update_module('a', {result => 'fail', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+};
+
+subtest 'job with at least one softfailed => overall is softfailed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'I';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {important => 1}});
+    $job->update_module('a', {result => 'ok', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'ok', details => []});
+    $job->insert_module({name => 'c', category => 'c', script => 'c', flags => {}});
+    $job->update_module('c', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {}});
+    $job->update_module('d', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::SOFTFAILED, 'job result is softfailed';
+};
+
+subtest 'job with no modules => overall is incomplete' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'J';
+    my $job = _job_create(\%_settings);
+    $job->update;
+    $job->discard_changes;
+
+    is $job->result, NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, INCOMPLETE, 'job result is incomplete';
+};
+
+subtest 'carry over, including soft-fails' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'K';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {}});
+    $job->update_module('a', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::SOFTFAILED, 'job result is softfailed';
+    my $user = $users->create_user('foo');
+    $job->comments->create({text => 'bsc#101', user_id => $user->id});
+
+    $_settings{BUILD} = '667';
+    $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {}});
+    $job->update_module('a', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    is $job->comments, 0, 'no comment';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::SOFTFAILED, 'job result is softfailed';
+    is $job->comments, 1, 'one comment';
+    like $job->comments->first->text, qr/\Qbsc#101\E/, 'right take over';
+
+    $_settings{BUILD} = '668';
+    $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {}});
+    $job->update_module('a', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'fail', details => []});
+    $job->update;
+    $job->done;
+    $job->discard_changes;
+
+    $_settings{BUILD} = '669';
+    $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {}});
+    $job->update_module('a', {result => 'ok', details => [], dents => 1});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'fail', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    is $job->comments, 0, 'no comment';
+
+    subtest 'additional investigation notes provided on new failed' => sub {
+        my $job_mock = Test::MockModule->new('OpenQA::Schema::Result::Jobs', no_auto => 1);
+        my $got_limit = 0;
+        my $got_diff_limit = 0;
+        $job_mock->redefine(
+            git_log_diff => sub ($dir, $range, %options) {
+                $got_limit = $options{limit};
+                return $fake_git_log;
+            });
+        $job_mock->redefine(
+            git_diff => sub ($dir, $range, %options) {
+                $got_diff_limit = $options{limit};
+                return $fake_git_log;
+            });
+        path('t/data/last_good.json')->copy_to(path(($job->_previous_scenario_jobs)[1]->result_dir(), 'vars.json'));
+        path('t/data/first_bad.json')->copy_to(path($job->result_dir(), 'vars.json'));
+        path('t/data/last_good_packages.txt')
+          ->copy_to(path(($job->_previous_scenario_jobs)[1]->result_dir(), 'worker_packages.txt'));
+        path('t/data/first_bad_packages.txt')->copy_to(path($job->result_dir(), 'worker_packages.txt'));
+        $job->done;
+        is $job->result, OpenQA::Jobs::Constants::FAILED, 'job result is failed';
+        ok my $inv = $job->investigate, 'job can provide investigation details';
+        ok $inv, 'job provides failure investigation';
+        is ref(my $last_good = $inv->{last_good}), 'HASH', 'previous job identified as last good and it is a hash';
+        is $last_good->{text}, 99997, 'last_good hash has the text';
+        is $last_good->{type}, 'link', 'last_good hash has the type';
+        is $last_good->{link}, '/tests/99997', 'last_good hash has the correct link';
+        is ref(my $first_bad = $inv->{first_bad}), 'HASH', 'previous job identified as first bad and it is a hash';
+        is $first_bad->{text}, 99998, 'first_bad hash has the text';
+        is $first_bad->{type}, 'link', 'first_bad hash has the type';
+        is $first_bad->{link}, '/tests/99998', 'first_bad hash has the correct link';
+        like $inv->{diff_to_last_good}, qr/^\+.*BUILD.*669/m, 'diff for job settings is shown';
+        unlike $inv->{diff_to_last_good}, qr/JOBTOKEN/, 'special variables are not included';
+        like $inv->{diff_packages_to_last_good}, qr/^\+python/m, 'diff packages for job is shown';
+        is $inv->{test_log}, $fake_git_log, 'test git log is evaluated';
+        is $inv->{needles_log}, $fake_git_log, 'needles git log is evaluated';
+        $fake_git_log = '';
+        ok $inv = $job->investigate, 'job investigation ok for no test changes';
+        is $inv->{test_log}, 'No test changes recorded, test regression unlikely', 'git log with no test changes';
+
+        subtest 'investigation can display test_log with git stats when one commit' => sub {
+            $fake_git_log = "\nqwertyuio0 test0\n mylogfile0 | 1 +\n 1 file changed, 1 insertion(+)\nqwertyuio1";
+            ok $inv = $job->investigate, 'job investigation ok with test changes';
+            my $actual_lines = split /\n/, $inv->{test_log};
+            my $expected_lines = 5;
+            is $actual_lines, $expected_lines, 'test_log have correct number of lines';
+            like $inv->{test_log}, qr/^.*file changed/m, 'git log with test changes';
+        };
+        subtest 'investigation can display test_log with git stats when more than one commit' => sub {
+            $got_limit = 0;
+            $fake_git_log
+              = "\nqwertyuio0 test0\n mylogfile0 | 1 +\n 1 file changed, 1 insertion(+)\nqwertyuio1 test1\n mylogfile1 | 1 +\n 1 file changed, 1 insertion(+)\n";
+            ok $inv = $job->investigate(git_limit => 23), 'job investigation ok with test changes';
+            my $actual_lines = split /\n/, $inv->{test_log};
+            my $expected_lines = 7;
+            is $actual_lines, $expected_lines, 'test_log has the correct number of lines';
+            like $inv->{test_log}, qr/^.*file changed/m, 'git log with test changes';
+            is $got_limit, 23, 'git_limit was correctly passed';
+        };
+    };
+
+    subtest 'vars.json with a UNKNOWN TEST_GIT_HASH' => sub {
+        path('t/data/first_bad.json')->copy_to(path($job->result_dir(), 'vars.json'));
+        my $last_good_path = path(($job->_previous_scenario_jobs)[1]->result_dir(), 'vars.json');
+        path('t/data/last_good.json')->copy_to($last_good_path);
+        my $last_good_vars = decode_json $last_good_path->slurp;
+        $last_good_vars->{TEST_GIT_HASH} = 'UNKNOWN';
+        $last_good_vars->{NEEDLES_GIT_HASH} = 'UNKNOWN';
+        $last_good_path->spew(encode_json $last_good_vars);
+        ok my $inv = $job->investigate, 'job can provide investigation details';
+        is ref(my $last_good = $inv->{last_good}), 'HASH', 'previous job identified as last good and it is a hash';
+        is $last_good->{link}, '/tests/99997', 'last_good hash has the correct link';
+        like $inv->{test_log}, qr/Invalid range UNKNOWN..c65/, 'test_log has message about invalid range';
+        like $inv->{test_diff_stat}, qr/Invalid range UNKNOWN..c65/, 'test_diff_stat has message about invalid range';
+    };
+
+    subtest 'No vars.json' => sub {
+        unlink path($job->result_dir(), 'vars.json');
+        my $last_good_path = path(($job->_previous_scenario_jobs)[1]->result_dir(), 'vars.json');
+        path('t/data/last_good.json')->copy_to($last_good_path);
+        ok my $inv = $job->investigate, 'Minimal investigation info is shown';
+        is ref(my $last_good = $inv->{last_good}), 'HASH', 'previous job identified as last good and it is a hash';
+        is $last_good->{link}, '/tests/99997', 'last_good hash has the correct link';
+    };
+
+    subtest 'vars.json of last good already deleted' => sub {
+        path('t/data/first_bad.json')->copy_to(path($job->result_dir(), 'vars.json'));
+        unlink path(($job->_previous_scenario_jobs)[1]->result_dir(), 'vars.json');
+        ok my $inv = $job->investigate, 'job can provide investigation details';
+        is ref(my $last_good = $inv->{last_good}), 'HASH', 'previous job identified as last good and it is a hash';
+        is $inv->{diff_to_last_good}, undef, 'diff_to_last_good does not exist';
+        is $last_good->{link}, '/tests/99997', 'last_good hash has the correct link';
+        like $inv->{diff_packages_to_last_good}, qr/^\+python/m, 'diff packages for job is shown';
+    };
+
+    subtest 'investigation lists recent changes to files involved in the failure' => sub {
+        my $repo = tempdir;
+        my $git = sub (@args) { system 'git', '-C', "$repo", '-c', 'commit.gpgsign=false', @args };
+        local @ENV{qw(GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL)}
+          = qw(t t@e.com t t@e.com);
+        my $commit = sub ($file, $message, $content = $message, $date = time) {
+            local @ENV{qw(GIT_AUTHOR_DATE GIT_COMMITTER_DATE)} = ("$date +0000") x 2;
+            $repo->child($file)->dirname->make_path;
+            $repo->child($file)->spew($content);
+            $git->(qw(add -A));
+            $git->(qw(commit -q -m), $message);
+            chomp(my $hash = qx{git -C "$repo" rev-parse HEAD});
+            return $hash;
+        };
+        $git->(qw(init -q -b main));
+        $commit->('tests/x.pm', 'Ancient change', 'Ancient change', 946_684_800);
+        $git->(qw(switch -q -c feature));
+        $commit->('tests/x.pm', 'Break x');
+        $commit->('tests/unrelated.pm', 'Unrelated');
+        $git->(qw(switch -q main));
+        $git->(qw(merge -q --no-ff -m), 'Merge pull request #42 from fork/feature', 'feature');
+        chomp(my $merge = qx{git -C "$repo" rev-parse HEAD});
+        $commit->('tests/x.pm', 'Squash fix (#43)');
+        $commit->('tests/old.pm', 'Add old');
+        $commit->('lib/helper.pm', 'Change helper');
+        $commit->('needles/foo-1.png', 'Add foo needle png');
+        $commit->('needles/foo-1.json', 'Add foo needle', '{"tags": ["foo-tag"]}');
+        $commit->('needles/bar.json', 'Add bar needle', '{"tags": ["bar"]}');
+        $commit->('needles/foo-2.json', 'Retag needle', '{"tags": ["foo-tag", "other"]}');
+        $commit->('needles/area.json', 'Add area needle', '{"tags": ["area-tag"], "area": [{"xpos": 1}]}');
+        my $gone = $commit->('needles/gone.json', 'Add gone needle', '{"tags": ["removed-tag"]}');
+        $commit->('needles/foo-1.png', 'Update foo png only');
+        $commit->('needles/area.json', 'Move area', '{"tags": ["area-tag"], "area": [{"xpos": 2}]}');
+        my $tested = $commit->('needles/gone.json', 'Drop tag from gone needle', '{"tags": ["other"]}');
+        $git->(qw(rm -q tests/old.pm));
+        $git->(qw(commit -q -m), 'Remove old');
+        my $head = $commit->('tests/later.pm', 'Later');
+
+        my $trace = join "\n", '# Test died: oops', '--- # stack trace',
+          "testapi::assert_script_run('x') called at tests/x.pm line 19",
+          'prepare::y at /var/lib/openqa/pool/1/tests/old.pm line 7', 'at ../outside.pm line 3',
+          'at .git/hook.pm line 1';
+        my $needle_step = {
+            result => 'fail',
+            tags => ['foo-tag', 'v1.2'],
+            needles => [{json => '/var/lib/openqa/needles/foo-1.json'}]};
+        my $text_step = {result => 'fail', text_data => "no candidate needle with tag(s) 'bar, removed-tag'"};
+        my $area_step = {result => 'fail', tags => ['area-tag']};
+        $job->update_module(
+            'b',
+            {
+                result => 'fail',
+                details => [{result => 'fail', text_data => $trace}, $needle_step, $text_step, $area_step]});
+        $job->insert_module({name => 'c', category => 'c', script => 'tests/x.pm', flags => {}});
+        $job->update_module('c', {result => 'fail', details => []});
+        my $needle_trace = join "\n", "# Test died: no candidate needle with tag(s) 'foo-tag' matched",
+          '--- # stack trace',
+          'testapi::assert_screen("foo-tag") called at lib/helper.pm line 94',
+          'tests::other::run() called at tests/other.pm line 5';
+        $job->insert_module({name => 'd', category => 'd', script => 'tests/other.pm', flags => {}});
+        $job->update_module('d', {result => 'fail', details => [{result => 'fail', text_data => $needle_trace}]});
+
+        my $job_mock = Test::MockModule->new('OpenQA::Schema::Result::Jobs', no_auto => 1);
+        $job_mock->redefine(testcasedir => sub (@) { "$repo" });
+        $job_mock->redefine(needledir => sub (@) { $repo->child('needles')->to_string });
+        my $investigation_mock = Test::MockModule->new('OpenQA::JobInvestigation', no_auto => 1);
+        $investigation_mock->redefine(testcasedir => sub (@) { "$repo" });
+        $investigation_mock->redefine(needledir => sub (@) { $repo->child('needles')->to_string });
+        my $set_vars = sub ($j, $hash, %extra) {
+            path($j->result_dir, 'vars.json')
+              ->spew(encode_json {TEST_GIT_HASH => $hash, NEEDLES_GIT_HASH => $hash, %extra});
+        };
+        my $last_good = ($job->_previous_scenario_jobs)[1];
+        $set_vars->($job, $tested);
+
+        subtest 'window before the job started without last good vars.json' => sub {
+            path($last_good->result_dir, 'vars.json')->remove;
+            my $inv = $job->investigate;
+            my $log = $inv->{failure_test_log};
+            like $log, qr/^[0-9a-f]{10} Break x \(#42\)$/m, 'commit merged via merge commit links its pull request';
+            like $log, qr/^[0-9a-f]{10} Squash fix \(#43\)$/m, 'pull request of squashed commit not added twice';
+            like $log, qr/tests\/x\.pm \|/, 'diff stat of involved file shown';
+            like $log, qr/^[0-9a-f]{10} Add old$/m, 'file removed after the tested commit still considered';
+            like $log, qr/^[0-9a-f]{10} Change helper$/m, 'shared library of a failed needle check considered';
+            unlike $log, qr/Ancient change/, 'commit older than the window not listed';
+            unlike $log, qr/Unrelated|Later|Remove old|outside|hook/, 'uninvolved or later changes ignored';
+            $log = $inv->{failure_needles_log};
+            like $log, qr/^[0-9a-f]{10} Add foo needle$/m, 'commit of candidate needle listed';
+            like $log, qr/^[0-9a-f]{10} Update foo png only$/m, 'commit changing only the png of a candidate listed';
+            like $log, qr/^[0-9a-f]{10} Retag needle$/m, 'commit changing a needle with the failed tag listed';
+            like $log, qr/^[0-9a-f]{10} Add bar needle$/m, 'tag from text of failed step considered';
+            like $log, qr/^[0-9a-f]{10} Move area$/m, 'commit not touching the tag lines of a needle with it listed';
+            is scalar(() = $log =~ /Add foo needle$/mg), 1, 'commits found twice only listed once';
+        };
+
+        subtest 'range to the last good job' => sub {
+            $set_vars->($last_good, $merge);
+            my $inv = $job->investigate(git_limit => 200);
+            unlike $inv->{failure_test_log}, qr/Break x/, 'commits before the last good job not listed';
+            like $inv->{failure_test_log}, qr/Squash fix \(#43\)/, 'commits after the last good job listed';
+            $set_vars->($last_good, $gone);
+            $inv = $job->investigate(git_limit => 200);
+            like $inv->{failure_needles_log}, qr/^[0-9a-f]{10} Drop tag from gone needle$/m,
+              'removal of the tag listed';
+            unlike $inv->{failure_needles_log}, qr/Add foo needle|Add gone/, 'needles before the last good job skipped';
+            $set_vars->($last_good, $tested);
+            $inv = $job->investigate(git_limit => 200);
+            is $inv->{failure_test_log}, 'No recent changes to the test files involved in the failure', 'no changes';
+            like $inv->{failure_needles_log}, qr/^No recent changes to the needles/, 'no needle changes';
+        };
+
+        subtest 'tested commit not available' => sub {
+            $set_vars->($job, 'a' x 40);
+            my $inv = $job->investigate(git_limit => 200);
+            like $inv->{failure_test_log}, qr/unknown or not available/, 'message about missing commit';
+            like $inv->{failure_needles_log}, qr/unknown or not available/, 'message for needles as well';
+            $set_vars->($job, $tested);
+        };
+
+        subtest 'expected git outcomes are not logged as problems' => sub {
+            my $run_cmd = \&OpenQA::JobInvestigation::run_cmd_with_log_return_error;
+            my %codes;
+            $investigation_mock->redefine(
+                run_cmd_with_log_return_error => sub ($cmd, %args) {
+                    my ($subcommand) = grep { /^(?:grep|ls-tree|cat-file)$/ } @$cmd;
+                    return $run_cmd->($cmd, %args) unless $subcommand;
+                    $codes{$subcommand} = $args{expected_return_codes};
+                    return {status => 0, return_code => 124, stdout => 'a:b.json', stderr => ''}
+                      if $subcommand eq 'grep';
+                    return $run_cmd->($cmd, %args);
+                });
+            my $deadline = time + 20;
+            my $unknown = 'a' x 40;
+            ok !OpenQA::JobInvestigation::git_has_commit($deadline, "$repo", $unknown), 'unknown commit detected';
+            ok $codes{'cat-file'}->{128}, 'unknown commit is an expected outcome of cat-file';
+            my ($tree, $error) = OpenQA::JobInvestigation::git_tree($deadline, "$repo", $unknown);
+            like $error, qr/unknown or not available/, 'unknown commit reported by ls-tree';
+            ok $codes{'ls-tree'}->{128}, 'unknown commit is an expected outcome of ls-tree';
+            my (undef, $message)
+              = OpenQA::JobInvestigation::tagged_needles($deadline, "$repo", $tested, undef, time - 86400, ['x']);
+            is $message, 'Computing changes timed out', 'timeout of git grep reported';
+            ok $codes{grep}->{124}, 'timeout is an expected outcome of git grep, so its output is not logged';
+            $investigation_mock->unmock('run_cmd_with_log_return_error');
+        };
+
+        subtest 'git problems are not reported as missing changes' => sub {
+            my $global = $t->app->config->{global};
+            {
+                local $global->{job_investigate_git_timeout} = 0;
+                my $inv = $job->investigate(git_limit => 200);
+                is $inv->{failure_test_log}, 'Computing changes timed out', 'timeout of test log reported';
+                is $inv->{failure_needles_log}, 'Computing changes timed out', 'timeout of needles log reported';
+            }
+            my $run_cmd = \&OpenQA::JobInvestigation::run_cmd_with_log_return_error;
+            $investigation_mock->redefine(
+                run_cmd_with_log_return_error => sub ($cmd, %args) {
+                    return {status => 0, return_code => 128, stdout => '', stderr => 'fatal'}
+                      if grep { $_ eq 'log' } @$cmd;
+                    return $run_cmd->($cmd, %args);
+                });
+            my $inv = $job->investigate(git_limit => 200);
+            is $inv->{failure_test_log}, 'Cannot list changes because of a git problem', 'failure of test log reported';
+            is $inv->{failure_needles_log}, 'Cannot list changes because of a git problem', 'needles failure reported';
+            $investigation_mock->unmock('run_cmd_with_log_return_error');
+        };
+
+        subtest 'pull requests are looked up as far as time allows' => sub {
+            chomp(my $short = qx{git -C "$repo" rev-parse --short=10 $head});
+            my $log = "$short Later\n";
+            my $run_cmd = \&OpenQA::JobInvestigation::run_cmd_with_log_return_error;
+            my @commands;
+            $investigation_mock->redefine(
+                run_cmd_with_log_return_error => sub ($cmd, %args) { push @commands, $cmd; $run_cmd->($cmd, %args) });
+            is annotate_pull_requests("$repo", $log, $head, deadline => time + 20), $log, 'direct commit as is';
+            is scalar @commands, 1, 'merge commits not searched for a commit on the first-parent line';
+            @commands = ();
+            is annotate_pull_requests("$repo", $log, $head, deadline => time - 1), $log, 'log kept if too late';
+            is scalar @commands, 0, 'no git command run after the deadline';
+            $investigation_mock->unmock('run_cmd_with_log_return_error');
+        };
+
+        subtest 'no previous job in the scenario' => sub {
+            $job_mock->redefine(_previous_scenario_jobs => sub (@) { () });
+            $set_vars->(
+                $job, $tested,
+                TEST_GIT_URL => 'https://github.com/o/r.git',
+                NEEDLES_GIT_URL => 'git@gitea.example.com:o/n.git'
+            );
+            my $inv = $job->investigate(git_limit => 200);
+            like $inv->{error}, qr/No previous job/, 'error reported';
+            like $inv->{failure_test_log}, qr/^[0-9a-f]{10} Break x \(#42\)$/m, 'test changes of the window listed';
+            like $inv->{failure_needles_log}, qr/^[0-9a-f]{10} Move area$/m, 'needle changes of the window listed';
+            is $inv->{testgiturl}, 'https://github.com/o/r/commit/', 'repository URL of tests provided for links';
+            is $inv->{needlegiturl}, 'https://gitea.example.com/o/n/commit/', 'repository URL of needles provided';
+            path($job->result_dir, 'vars.json')->spew('{');
+            throws_ok { $job->investigate(git_limit => 200) } qr/expected, at character offset/,
+              'invalid vars.json is not ignored';
+            $job_mock->unmock('_previous_scenario_jobs');
+        };
+        $job_mock->unmock_all;
+    };
+
+    subtest 'external hook is called on done job if specified' => sub {
+        my $task_mock = Test::MockModule->new('OpenQA::Task::Job::HookScript', no_auto => 1);
+        $task_mock->redefine(
+            _run_hook => sub ($hook, $openqa_job_id, $timeout, $kill_timeout) {
+                my $openqa_job = $t->app->schema->resultset('Jobs')->find($openqa_job_id);
+                $openqa_job->update({reason => "timeout --kill-after=$kill_timeout $timeout $hook"}) if $hook;
+            });
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $job->update({state => RUNNING});
+        $job->discard_changes;
+        is $job->reason, undef, 'no hook is called by default';
+        $ENV{OPENQA_JOB_DONE_HOOK_INCOMPLETE} = 'should not be called';
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $job->discard_changes;
+
+        is $job->reason, undef, 'hook not called if result does not match';
+        $ENV{OPENQA_JOB_DONE_HOOK_FAILED} = 'true';
+        $ENV{OPENQA_JOB_DONE_HOOK_TIMEOUT} = '10m';
+        $ENV{OPENQA_JOB_DONE_HOOK_KILL_TIMEOUT} = '5s';
+        $job->update({state => RUNNING});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $job->discard_changes;
+        is $job->reason, 'timeout --kill-after=5s 10m true', 'hook called if result matches';
+        $job->update({reason => undef, state => RUNNING});
+
+        delete $ENV{OPENQA_JOB_DONE_HOOK_FAILED};
+        delete $ENV{OPENQA_JOB_DONE_HOOK_TIMEOUT};
+        delete $ENV{OPENQA_JOB_DONE_HOOK_KILL_TIMEOUT};
+        my $hooks = ($t->app->config->{hooks} //= {});
+        $hooks->{job_done_hook_failed} = 'echo hook called';
+        $task_mock->unmock_all;
+        $job->settings->create({key => '_TRIGGER_JOB_DONE_HOOK', value => '0'});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        my $notes = $t->app->minion->jobs({tasks => ['finalize_job_results']})->next->{notes};
+        is $notes->{hook_id}, undef, 'hook not called despite matching result due to _TRIGGER_JOB_DONE_HOOK=0';
+
+        $job->settings->search({key => '_TRIGGER_JOB_DONE_HOOK'})->delete;
+        $job->update({state => RUNNING});
+        $job->discard_changes;
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        my $job_info = $t->app->minion->jobs({tasks => ['hook_script']})->next;
+        $notes = $job_info->{notes};
+        is $notes->{hook_cmd}, 'echo hook called', 'real hook cmd in notes if result matches (1)';
+        like $notes->{hook_result}, qr/hook called/, 'real hook cmd from config called if result matches (1)';
+        is $notes->{hook_rc}, 0, 'exit code of the hook cmd is zero';
+        $notes = $t->app->minion->jobs({tasks => ['finalize_job_results']})->next->{notes};
+        is $notes->{hook_job}, $job_info->{id}, 'hook_script job is linked to finalize_result job';
+
+        $hooks->{job_done_hook_failed} = 'echo oops && exit 23;';
+        $job->update({state => RUNNING});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $job_info = $t->app->minion->jobs({tasks => ['hook_script']})->next;
+        $notes = $job_info->{notes};
+        is $notes->{hook_cmd}, 'echo oops && exit 23;', 'real hook cmd in notes if result matches (2)';
+        like $notes->{hook_result}, qr/oops/, 'real hook cmd from config called if result matches (2)';
+        is $notes->{hook_rc}, 23, 'exit code of the hook cmd is as expected';
+        is $job_info->{retries}, 0, 'hook script has not been retried';
+
+        delete $hooks->{job_done_hook_failed};
+        $hooks->{job_done_hook} = 'echo generic hook';
+        $job->update({state => RUNNING});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $notes = $t->app->minion->jobs({tasks => ['finalize_job_results']})->next->{notes};
+        is $notes->{hook_job}, undef, 'generic hook not called by default';
+
+        $hooks->{job_done_hook_enable_failed} = 1;
+        $t->app->minion->reset({all => 1});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        is $t->app->minion->jobs({tasks => ['hook_script']})->total, 0, 'hook script only executed once';
+
+        $job->update({state => UPLOADING});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $notes = $t->app->minion->jobs({tasks => ['hook_script']})->next->{notes};
+        is $notes->{hook_cmd}, 'echo generic hook', 'generic hook cmd called if enabled for result';
+        like $notes->{hook_result}, qr/generic hook/, 'generic hook cmd called if enabled for result';
+
+        delete $hooks->{job_done_hook_enable_failed};
+        $job->update({state => UPLOADING});
+        $job->settings->create({key => '_TRIGGER_JOB_DONE_HOOK', value => '1'});
+        $job->done;
+        perform_minion_jobs($t->app->minion);
+        $notes = $t->app->minion->jobs({tasks => ['hook_script']})->next->{notes};
+        is $notes->{hook_cmd}, 'echo generic hook', 'generic hook cmd called if enabled via job setting';
+        like $notes->{hook_result}, qr/generic hook/, 'generic hook cmd called if enabled via job setting';
+
+        subtest 'Retry hook script with exit code 142' => sub {
+            # Defaults (no retry)
+            my $default_retries = 53;
+            $hooks->{job_done_hook_failed} = 'echo retried && exit 143;';
+            $job->update({state => UPLOADING});
+            $job->discard_changes;
+            $job->done;
+            perform_minion_jobs($t->app->minion);
+            $job_info = $t->app->minion->jobs({tasks => ['hook_script']})->next;
+            is_deeply $job_info->{args}[2],
+              {delay => 60, retries => $default_retries, skip_rc => 142, kill_timeout => '30s', timeout => '5m'};
+            $notes = $job_info->{notes};
+            is $notes->{hook_cmd}, 'echo retried && exit 143;', 'real hook cmd in notes if result matches (3)';
+            like $notes->{hook_result}, qr/retried/, 'real hook cmd from config called if result matches (3)';
+            is $notes->{hook_rc}, 143, 'exit code of the hook cmd is as expected';
+            is $job_info->{retries}, 0, 'hook script has not been retried';
+
+            # Environment variables (retry without delay)
+            local $ENV{OPENQA_JOB_DONE_HOOK_DELAY} = 0;
+            local $ENV{OPENQA_JOB_DONE_HOOK_RETRIES} = 2;
+            local $ENV{OPENQA_JOB_DONE_HOOK_SKIP_RC} = 143;
+            $job->update({state => UPLOADING});
+            $job->discard_changes;
+            $job->done;
+            perform_minion_jobs($t->app->minion);
+            $job_info = $t->app->minion->jobs({tasks => ['hook_script']})->next;
+            is_deeply $job_info->{args}[2],
+              {delay => 0, retries => 2, skip_rc => 143, kill_timeout => '30s', timeout => '5m'};
+            $notes = $job_info->{notes};
+            is $notes->{hook_cmd}, 'echo retried && exit 143;', 'real hook cmd in notes if result matches (4)';
+            like $notes->{hook_result}, qr/retried/, 'real hook cmd from config called if result matches (4)';
+            is $notes->{hook_rc}, 143, 'exit code of the hook cmd is as expected';
+            is $job_info->{retries}, 2, 'hook script has been retried';
+
+            # Job settings (retry without delay)
+            delete $ENV{OPENQA_JOB_DONE_HOOK_DELAY};
+            delete $ENV{OPENQA_JOB_DONE_HOOK_RETRIES};
+            delete $ENV{OPENQA_JOB_DONE_HOOK_SKIP_RC};
+            $job->update({state => UPLOADING});
+            $job->discard_changes;
+            $job->done;
+            $job->settings->create({key => '_TRIGGER_JOB_DONE_DELAY', value => '0'});
+            $job->settings->create({key => '_TRIGGER_JOB_DONE_RETRIES', value => '4'});
+            $job->settings->create({key => '_TRIGGER_JOB_DONE_SKIP_RC', value => '143'});
+            perform_minion_jobs($t->app->minion);
+            $job_info = $t->app->minion->jobs({tasks => ['hook_script']})->next;
+            is $job_info->{state}, 'finished', 'hook script has been retried without delay';
+            is_deeply $job_info->{args}[2],
+              {delay => 0, retries => 4, skip_rc => 143, kill_timeout => '30s', timeout => '5m'};
+            $notes = $job_info->{notes};
+            is $notes->{hook_cmd}, 'echo retried && exit 143;', 'real hook cmd in notes if result matches (4)';
+            like $notes->{hook_result}, qr/retried/, 'real hook cmd from config called if result matches (4)';
+            is $notes->{hook_rc}, 143, 'exit code of the hook cmd is as expected';
+            is $job_info->{retries}, 4, 'hook script has been retried';
+
+            # Defaults (retry with delay)
+            $job->settings->search({key => '_TRIGGER_JOB_DONE_DELAY'})->delete;
+            $job->settings->search({key => '_TRIGGER_JOB_DONE_RETRIES'})->delete;
+            $job->settings->search({key => '_TRIGGER_JOB_DONE_SKIP_RC'})->delete;
+            $hooks->{job_done_hook_failed} = 'echo delayed && exit 142;';
+            $job->update({state => UPLOADING});
+            $job->discard_changes;
+            $job->done;
+            perform_minion_jobs($t->app->minion);
+            $job_info = $t->app->minion->jobs({tasks => ['hook_script']})->next;
+            is $job_info->{state}, 'inactive', 'hook script has been retried with long delay';
+            is_deeply $job_info->{args}[2],
+              {delay => 60, retries => $default_retries, skip_rc => 142, kill_timeout => '30s', timeout => '5m'};
+            $notes = $job_info->{notes};
+            is $notes->{hook_cmd}, 'echo delayed && exit 142;', 'real hook cmd in notes if result matches (5)';
+            like $notes->{hook_result}, qr/delayed/, 'real hook cmd from config called if result matches (5)';
+            is $notes->{hook_rc}, 142, 'exit code of the hook cmd is as expected';
+            is $job_info->{retries}, 1, 'hook script has been retried once because of delay';
+        };
+
+        subtest 'linear delay of each hook scripts exiting with 142' => sub {
+            $job->settings->create({key => '_TRIGGER_JOB_DONE_RETRIES', value => '4'});
+            $hooks->{job_done_hook_failed} = 'echo delayed && exit 142;';
+            $job->update({state => UPLOADING});
+            $job->discard_changes;
+            $job->done;
+            my $minion = $t->app->minion;
+            perform_minion_jobs($minion);
+            $job_info = $minion->jobs({tasks => ['hook_script']})->next;
+            is_deeply
+              $job_info->{args}[2],
+              {delay => 60, retries => 4, skip_rc => 142, kill_timeout => '30s', timeout => '5m'},
+              'args contain expected parameters';
+            is $job_info->{retries}, 1, 'hook script has been already tried once since has been queued';
+            is $job_info->{state}, 'inactive', 'job ends up inactive due to retry';
+            my $linear_delay = $job_info->{delayed} - $job_info->{retried};
+            is $linear_delay, 60, 'default delay for first retry applied correctly';
+            # force some retries with delay 0 to avoid having to wait in the test
+            $minion->job($job_info->{id})->retry({delay => 0}) for 1, 2;
+            perform_minion_jobs($minion);
+            $job_info = $minion->jobs({tasks => ['hook_script']})->next;
+            is $job_info->{retries}, 4, 'hook script has been retried the expected number of times';
+            $linear_delay = $job_info->{delayed} - $job_info->{retried};
+            is $linear_delay, 240, 'linear delay calculated correctly for 4th retry';
+            $minion->job($job_info->{id})->retry({delay => 0});
+            perform_minion_jobs($minion);
+            $job_info = $minion->jobs({tasks => ['hook_script']})->next;
+            is $job_info->{retries}, 5, 'hook script retried for last time, exceeding the retry limit';
+            is $job_info->{state}, 'finished', 'hook script at the end of the retries has finished state';
+        };
+    };
+};
+
+subtest 'carry over for ignore_failure modules' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'K';
+    $_settings{BUILD} = '670';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {ignore_failure => 1}});
+    $job->update_module('a', {result => 'fail', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+    my $user = $users->create_user('foo');
+    $job->comments->create({text => 'bsc#101', user_id => $user->id});
+
+    $_settings{BUILD} = '671';
+    $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {ignore_failure => 1}});
+    $job->update_module('a', {result => 'fail', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    is $job->comments, 0, 'no comment';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+    is $job->comments, 1, 'one comment';
+    like $job->comments->first->text, qr/\Qbsc#101\E/, 'right take over';
+
+    $_settings{BUILD} = '672';
+    $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {ignore_failure => 1}});
+    $job->update_module('a', {result => 'fail', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {}});
+    $job->update_module('b', {result => 'fail', details => []});
+    $job->update;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    is $job->comments, 0, 'no comment';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::FAILED, 'job result is failed';
+    is $job->comments, 0, 'one comment with failure investigation';
+};
+
+subtest 'job with only important passes => overall is passed' => sub {
+    my %_settings = %settings;
+    $_settings{TEST} = 'L';
+    my $job = _job_create(\%_settings);
+    $job->insert_module({name => 'a', category => 'a', script => 'a', flags => {important => 1}});
+    $job->update_module('a', {result => 'ok', details => []});
+    $job->insert_module({name => 'b', category => 'b', script => 'b', flags => {important => 1}});
+    $job->update_module('b', {result => 'ok', details => []});
+    $job->insert_module({name => 'c', category => 'c', script => 'c', flags => {important => 1}});
+    $job->update_module('c', {result => 'ok', details => []});
+    $job->insert_module({name => 'd', category => 'd', script => 'd', flags => {important => 1}});
+    $job->update_module('d', {result => 'ok', details => []});
+    $job->update;
+    $job->discard_changes;
+
+    is $job->result, OpenQA::Jobs::Constants::NONE, 'result is not yet set';
+    $job->done;
+    $job->discard_changes;
+    is $job->result, OpenQA::Jobs::Constants::PASSED, 'job result is passed';
+};
+
+subtest 'job with skipped modules' => sub {
+    my $test_matrix = [
+        ['ok', 'skip', OpenQA::Jobs::Constants::PASSED],
+        ['softfail', 'skip', OpenQA::Jobs::Constants::SOFTFAILED],
+        ['fail', 'skip', OpenQA::Jobs::Constants::FAILED],
+        [undef, 'skip', OpenQA::Jobs::Constants::FAILED],
+        ['skip', 'skip', OpenQA::Jobs::Constants::PASSED],
+        ['skip', 'ok', OpenQA::Jobs::Constants::PASSED],
+        ['skip', 'softfail', OpenQA::Jobs::Constants::SOFTFAILED],
+        ['skip', 'fail', OpenQA::Jobs::Constants::FAILED],
+        ['skip', undef, OpenQA::Jobs::Constants::FAILED],
+    ];
+
+    for my $tm (@{$test_matrix}) {
+        my %_settings = %settings;
+        my @tm_str = map { $_ // 'undef' } @{$tm};
+        my %module_count = (ok => 0, softfail => 0, fail => 0, undef => 0, skip => 0);
+        $module_count{$tm_str[0]} = $module_count{$tm_str[0]} + 1;
+        $module_count{$tm_str[1]} = $module_count{$tm_str[1]} + 1;
+        $_settings{TEST} = 'SKIP_TEST_' . join '_', @tm_str;
+        my $job = _job_create(\%_settings);
+        $job->insert_module({name => 'a', category => 'a', script => 'a'});
+        $job->update_module('a', {result => $tm->[0], details => []});
+        $job->insert_module({name => 'b', category => 'b', script => 'b'});
+        $job->update_module('b', {result => $tm->[1], details => []});
+        $job->done;
+        $job->discard_changes;
+        is $job->result, $tm->[2], sprintf 'job result: %s + %s => %s', @tm_str;
+        is $job->passed_module_count, $module_count{ok}, 'check number of passed modules';
+        is $job->softfailed_module_count, $module_count{softfail}, 'check number of softfailed modules';
+        is $job->failed_module_count, $module_count{fail}, 'check number of failed modules';
+        is $job->skipped_module_count, $module_count{undef}, 'check number of skipped modules';
+        is $job->externally_skipped_module_count, $module_count{skip}, 'check number of externally skipped modules';
+    }
+};
+
+$t->get_ok('/t99946')->status_is(302)->header_like(Location => qr{tests/99946});
+
+subtest 'delete job assigned as last use for asset' => sub {
+    my $assets = $t->app->schema->resultset('Assets');
+    my $some_job = $jobs->first;
+    my $some_asset = $assets->first;
+    my $asset_id = $some_asset->id;
+
+    # let the asset reference a job
+    $some_asset->update({last_use_job_id => $some_job->id});
+
+    # delete that job
+    ok $some_job->delete, 'job deletion ok';
+    ok !$some_job->in_storage, 'job no in storage anymore';
+
+    # assert whether asset is still present
+    $some_asset = $assets->find($asset_id);
+    ok $some_asset, 'asset still exists';
+    is $some_asset->last_use_job_id, undef, 'last job unset';
+};
+
+subtest 'job setting based retriggering' => sub {
+    my $minion = $t->app->minion;
+    my %_settings = %settings;
+    $_settings{TEST} = 'no_retry';
+    my $jobs_nr = $jobs->count;
+    my $job = _job_create(\%_settings);
+    is $jobs->count, $jobs_nr + 1, 'one more job';
+    $job->done(result => FAILED);
+    perform_minion_jobs($minion);
+    is $jobs->count, $jobs_nr + 1, 'no additional job triggered (without retry)';
+    is $job->clone_id, undef, 'no clone';
+    $jobs_nr = $jobs->count;
+    $_settings{TEST} = 'retry:2';
+    $_settings{RETRY} = '2:bug#42';
+    $job = _job_create(\%_settings);
+    $job->done(result => PASSED);
+    perform_minion_jobs($minion);
+    is $jobs->count, $jobs_nr + 1, 'no additional job retriggered if PASSED (with retry)';
+    $job->update({state => SCHEDULED, result => NONE});
+    $job->done(result => USER_CANCELLED);
+    perform_minion_jobs($minion);
+    is $jobs->count, $jobs_nr + 1, 'no additional job retriggered if USER_CANCELLED (with retry)';
+    $job->update({state => SCHEDULED, result => NONE});
+    $job->done(result => OBSOLETED);
+    perform_minion_jobs($minion);
+    is $jobs->count, $jobs_nr + 1, 'no additional job retriggered if OBSOLETED (with retry)';
+    my $get_jobs = sub ($task) {
+        $minion->backend->pg->db->query(q{select * from minion_jobs where task = $1 order by id asc}, $task)->hashes;
+        # note: Querying DB directly as `$minion->jobs({tasks => [$task]})` does not return parents.
+    };
+    my $restart_job_count_before = @{$get_jobs->('restart_job')};
+    my $finalize_job_count_before = @{$get_jobs->('finalize_job_results')};
+    $job->update({state => SCHEDULED, result => NONE});
+    $job->done(result => FAILED);
+    stdout_like { perform_minion_jobs($minion) } qr/Job \d+ duplicated as \d+/,
+      'check debug message from auto_duplicate';
+    is $jobs->count, $jobs_nr + 2, 'job retriggered as it FAILED (with retry)';
+    $job->update;
+    $job->discard_changes;
+    is $job->comments->first->text, 'Restarting because RETRY is set to 2 (and only restarted 0 times so far)',
+      'comment about retry';
+    is $jobs->count, $jobs_nr + 2, 'job is automatically retriggered';
+    my $restart_jobs = $get_jobs->('restart_job');
+    my $finalize_jobs = $get_jobs->('finalize_job_results');
+    is @$restart_jobs, $restart_job_count_before + 1, 'one restart job has been triggered';
+    is @$finalize_jobs, $finalize_job_count_before + 1, 'one finalize job has been triggered';
+    ok $finalize_jobs->[-1]->{lax}, 'finalize job would also run if restart job fails';
+    is_deeply $finalize_jobs->[-1]->{parents}, [$restart_jobs->[-1]->{id}], 'finalize job triggered after restart job'
+      or always_explain $finalize_jobs;
+    my $first_job = $job;
+    my $next_job_id = $job->id + 1;
+    for (1 .. 2) {
+        is $jobs->find({id => $next_job_id - 1})->clone_id, $next_job_id, "clone exists for retry nr. $_";
+        $job = $jobs->find({id => $next_job_id});
+        $jobs->find({id => $next_job_id})->done(result => FAILED);
+        $job->update;
+        perform_minion_jobs($minion);
+        $job->discard_changes;
+        ++$next_job_id;
+    }
+    is $jobs->count, $jobs_nr + 3, 'job with retry configured + 2 retries have been triggered';
+    my $lastest_job = $jobs->find({id => $next_job_id - 1});
+    is $lastest_job->clone_id, undef, 'no clone exists for last retry';
+    is $first_job->latest_job->id, $lastest_job->id, 'found the latest job from the first job';
+    is $lastest_job->latest_job->id, $lastest_job->id, 'found the latest job from latest job itself';
+};
+
+subtest 'AMQP event emission for job restarts within Minion tasks' => sub {
+    my $plugin_mock = Test::MockModule->new('OpenQA::WebAPI::Plugin::AMQP');
+    my $conf = "[global]\nplugins=AMQP\n[amqp]\npublish_attempts = 2\npublish_retry_delay = 0\n";
+    my $tempdir = tempdir;
+    path($ENV{OPENQA_CONFIG} = $tempdir)->make_path->child('openqa.ini')->spew($conf);
+    my %published;
+    my @event_body;
+    my $io_loop_mock = Test::MockModule->new('Mojo::IOLoop');
+    $io_loop_mock->redefine(start => sub { });
+    $plugin_mock->redefine(publish_amqp => sub ($self, $topic, $data) { $published{$topic} = $data });
+
+    my $events_mock = Test::MockModule->new('OpenQA::Events');
+    $events_mock->redefine(
+        emit => sub ($self, $type, $args) {
+            if ($type eq 'openqa_job_restart') {
+                @event_body = ($type, $args);
+            }
+            $events_mock->original('emit')->($self, $type, $args);
+        });
+    # use a new app; otherwise it runs slowly, maybe trying to run none-mocked stuff
+    my $t = Test::Mojo->new('OpenQA::WebAPI');
+    my $minion = $t->app->minion;
+    is $t->app->config->{amqp}->{plugin}, 'AMQP', 'AMQP enabled from config file';
+
+    my %retry_settings = %settings;
+    $retry_settings{TEST} = 'test_amqp_restart';
+    $retry_settings{RETRY} = '1';
+    my $job = $jobs->create_from_settings(\%retry_settings);
+    $job->discard_changes;
+    my $job_id = $job->id;
+
+    %published = ();
+    $job->done(result => FAILED);
+    stdout_like { perform_minion_jobs($minion) } qr/Job \d+ duplicated as \d+/;
+    is scalar keys %published, 1, 'exactly one job restart event emitted';
+    my $event = $published{'suse.openqa.job.restart'};
+    is $event->{id}, $job_id, 'event contains original job ID';
+    is $event->{auto}, 1, 'event marked as auto restart';
+    my ($user_id, $connection, $type, $data) = @{$event_body[1]};
+    is $user_id, undef, 'user_id is undef for Minion restart';
+    is $connection, undef, 'connection is undef for Minion restart';
+    is $type, 'openqa_job_restart', 'type matches event type';
+    is_deeply $data, $event, 'published event equals emitted event';
+    ok exists $data->{result}->{$job_id}, 'old job id is in result';
+    $job->discard_changes;
+    is $job->clone_id, $data->{result}->{$job_id}, 'clone_id points to reported id';
+
+    OpenQA::Events->singleton->unsubscribe("openqa_$_")
+      for
+      qw(job_create job_delete job_cancel job_restart job_update_result job_done comment_create comment_update comment_delete);
+};
+
+subtest '"race" between status updates and stale job detection' => sub {
+    my $job = $jobs->create({TEST => 'test-job'});
+    is_deeply $job->update_status({}), {result => 0}, 'status update rejected for scheduled job';
+    is_deeply $job->update_status({uploading => 1}), {result => !!0},
+      'status update rejected for scheduled job (uploading)';
+    $job->discard_changes;
+    is $job->state, SCHEDULED, 'job is still scheduled';
+
+    $job->update({state => ASSIGNED});
+    is $job->reschedule_state, 1, 'assigned job can be set back to scheduled';
+    $job->discard_changes;
+    is $job->state, SCHEDULED, 'job is in fact scheduled again';
+
+    $job->update({state => ASSIGNED});
+    my $update = $job->update_status({});
+    is ref delete $update->{known_files}, 'ARRAY', 'known files returned';
+    is ref delete $update->{known_images}, 'ARRAY', 'known images returned';
+    is_deeply $update, {result => 1, job_result => INCOMPLETE}, 'status update accepted for assigned job (worker won)';
+    $job->discard_changes;
+    is $job->state, RUNNING, 'job is in fact running';
+    is $job->reschedule_state, 0, 'running job can NOT be set back to scheduled';
+    $job->discard_changes;
+    is $job->state, RUNNING, 'job is still running';
+
+    is_deeply $job->update_status({uploading => 1}), {result => 1}, 'job set to uploading';
+    $job->discard_changes;
+    is $job->state, UPLOADING, 'job is in fact uploading';
+    is $job->update_status({})->{result}, 1, 'status updates still possible if uploading';
+    $job->discard_changes;
+    is $job->state, UPLOADING, 'job is still uploading';
+
+    $job->update({state => CANCELLED});
+    $update = $job->update_status({});
+    is $update->{job_result}, 'incomplete', 'cancelled jobs will still get a status update';
+};
+
+subtest 'status update with result for unknown job module' => sub {
+    my $job = $jobs->create({TEST => 'test-job', state => RUNNING});
+    my $update;
+    combined_like { $update = $job->update_status({result => {boot => 'canceled'}}) }
+    qr/Job module 'boot' not found for job \d+ \(existing modules: 0\)/, 'missing module logged';
+    is $update->{error}, 'Failed modules: boot', 'error reports failed module';
+    is $update->{error_status}, 490, 'error status requests retry';
+};
+
+is $t->app->minion->jobs({states => ['failed']})->total, 0, 'No unexpected failed minion background jobs';
+
+subtest 'special cases when restarting job via Minion task' => sub {
+    local $ENV{OPENQA_JOB_RESTART_ATTEMPTS} = 2;
+    local $ENV{OPENQA_JOB_RESTART_DELAY} = 1;
+
+    my $minion = $t->app->minion;
+    my $test = sub ($args, $expected_state, $expected_result, $test, $task = 'restart_job') {
+        subtest $test => sub {
+            my $job_id = $minion->enqueue($task => $args);
+            perform_minion_jobs($minion);
+            my $job_info = $minion->job($job_id)->info;
+            is $job_info->{state}, $expected_state, 'state';
+            is $job_info->{result}, $expected_result, 'result';
+            return $job_id;
+        };
+    };
+    $test->([], 'failed', 'No job ID specified.',
+        'error without openQA job ID (can happen if job is enqueued via CLI)');
+    $test->(
+        [45678], 'finished',
+        'Job 45678 does not exist.',
+        'no error if openQA job does not exist (maybe job has already been deleted)'
+    );
+    $test->(
+        [99945], 'finished',
+        'Specified job 99945 has already been cloned as 99946',
+        'no error if openQA job already restarted but result still assigned accordingly'
+    );
+
+    # fake a different error
+    my $job_mock = Test::MockModule->new('OpenQA::Schema::Result::Jobs');
+    $job_mock->redefine(auto_duplicate => 'some error');
+
+    # run into error assuming there's one retry attempt left
+    $test->([99945], 'inactive', undef, 'retry scheduled if an error occurs and there are attempts left');
+
+    # run into error assuming there are no retry attempts left
+    local $ENV{OPENQA_JOB_RESTART_ATTEMPTS} = 1;
+    $test->([99945], 'failed', 'some error', 'error if an error occurs and there are no attempts left');
+};
+
+subtest 'git log diff' => sub {
+    my $investigation_mock = Test::MockModule->new('OpenQA::JobInvestigation', no_auto => 1);
+    $investigation_mock->redefine(
+        run_cmd_with_log_return_error => sub ($cmd, %opt) {
+            my $rc = 0;
+            my ($stdout, $stderr) = ('') x 2;
+            if ("@$cmd" =~ m/rev-list --count/) {
+                if ("@$cmd" =~ m/revlistfail/) { $stdout = 'git failed'; $rc = 1; }
+                elsif ("@$cmd" =~ m/nonumber/) { $stdout = 'NaN'; }
+                elsif ("@$cmd" =~ m/invalidrange/) { $stderr = 'fatal: Invalid revision range'; $rc = 1; }
+                else { $stdout = 10; }
+            }
+            elsif ("@$cmd" =~ m/diff --stat/) {
+                if ("@$cmd" =~ m/difffail/) { $stdout = 'git failed'; $rc = 1; }
+                elsif ("@$cmd" =~ m/longrange/) { $rc = 124; }    # see `man timeout`
+                else { $stdout = '2 files changed'; }
+            }
+            return {stdout => $stdout, stderr => $stderr, return_code => $rc};
+        });
+    my $too_big = OpenQA::JobInvestigation::git_diff('/foo', '123..456', limit => 5);
+    like $too_big, qr{Too many commits}, 'Too many commits';
+
+    combined_like {
+        my $non_numeric = OpenQA::JobInvestigation::git_diff('/foo', 'nonumber..123456', limit => 10);
+        like $non_numeric, qr{Cannot display diff because of a git problem}, 'rev-list --count returned no number';
+    }
+    qr{returned non-numeric string}, 'rev-list --count returned no number - warning is logged';
+
+    combined_like {
+        my $fail = OpenQA::JobInvestigation::git_diff('/foo', 'revlistfail..456', limit => 10);
+        like $fail, qr{Cannot display diff because of a git problem}, 'git rev-list exited with non-zero';
+    }
+    qr{git failed}, 'git rev-list exited with non-zero - warning is logged';
+
+    combined_like {
+        my $fail = OpenQA::JobInvestigation::git_diff('/foo', 'difffail..456', limit => 10);
+        like $fail, qr{Cannot display diff because of a git problem}, 'git diff exited with non-zero';
+    }
+    qr{git failed}, 'git diff exited with non-zero - warning is logged';
+
+    my $fail = OpenQA::JobInvestigation::git_diff('/foo', 'longrange', limit => 10);
+    like $fail, qr{Computing diff timed out}, 'timeout logged specifically';
+
+    my $res = OpenQA::JobInvestigation::git_diff('/foo', 'invalidrange', limit => 10);
+    like $res, qr{Cannot display diff: Invalid revision range}, 'error about invalid range returned';
+
+    my $ok = OpenQA::JobInvestigation::git_diff('/foo', '123..456', limit => 10);
+    like $ok, qr{2 files changed}, 'expected git_diff output';
+};
+
+subtest 'get all setting values for a job/key in a sorted array' => sub {
+    my $job_settings = $schema->resultset('JobSettings');
+    is_deeply $job_settings->all_values_sorted(99926, 'WORKER_CLASS'), [], 'empty array if key does not exist';
+    $job_settings->create({job_id => 99926, key => 'WORKER_CLASS', value => $_}) for qw(foo bar bar baz);
+    is_deeply $job_settings->all_values_sorted(99926, 'WORKER_CLASS'), [qw(bar baz foo)], 'all values returned';
+};
+
+subtest 'handling of array and unicode settings' => sub {
+    my %s = %settings;
+    $s{TEST} = 'array_setting_test';
+    $s{ARRAY_SETTING} = ['value1', 'ä', '…'];
+    my $job = _job_create(\%s);
+    my $entry = $job->settings->find({key => 'ARRAY_SETTING'});
+    ok $entry, 'ARRAY_SETTING exists in job settings';
+    my $v = $entry->value;
+    is ref($v), '', 'ARRAY_SETTING value is stored as a string';
+    is $v, '["value1","ä","…"]', 'retrieved correctly encoded JSON array as string';
+};
+
+subtest 'error handling when reading job module results' => sub {
+    my $modules = $jobs->find(99937)->modules;
+    my $valid_module = $modules->first;
+    my $empty_module = $modules->create({name => 'empty', script => 'foo', category => 'unittests'});
+    my $broken_module = $modules->create({name => 'broken', script => 'foo', category => 'unittests'});
+
+    my $errors = [];
+    my $results = $valid_module->results(errors => $errors);
+    is scalar @$errors, 0, 'no errors returned if JSON file exists' or always_explain $results;
+    is scalar @{$results->{details}}, 1, 'details returned if JSON file exists' or always_explain $results;
+
+    $results = $empty_module->results(errors => $errors);
+    is scalar @$errors, 0, 'no errors returned if JSON file empty' or always_explain $results;
+    is scalar @{$results->{details}}, 0, 'empty details returned if JSON file empty' or always_explain $results;
+
+    $results = $broken_module->results(errors => $errors);
+    like $errors->[0], qr/Malformed.*JSON/i, 'error returned if JSON file malformed' or always_explain $results;
+    is scalar @{$results->{details}}, 0, 'empty details returned if JSON file malformed' or always_explain $results;
+};
+
+subtest 'marking job as linked' => sub {
+    OpenQA::App->singleton->config->{global}->{recognized_referers} = ['progress.opensuse.org', 'foo.bar'];
+    my $job_id = 99937;
+    my $job = $jobs->find($job_id);
+    $jobs->mark_job_linked($job_id, 'https://progress.opensuse.org/issues/194990');
+    my $expected = ['label:linked:poo#194990 mentions this job'];
+    is_deeply [map { $_->text } $job->comments], $expected,
+      'bugref resolved (to be rendered as such in comment) and used in label (to be not treated like an actual bugref)';
+
+    my $comment_data = $comments->comment_data_for_jobs([$job]);
+    subtest 'label recognized' => sub {
+        my $data = $comment_data->{$job_id};
+        is $data->{label}, 'linked:poo#194990', 'added label is recognized';
+        is $data->{label_url}, 'https://progress.opensuse.org/issues/194990', 'URL is extracted again from label';
+    } or always_explain $comment_data;
+
+    $jobs->mark_job_linked($job_id, 'https://foo.bar/some/path');
+    is_deeply [map { $_->text } $job->comments], $expected, 'no 2nd label added';
+
+    $job->comments->delete;
+    $jobs->mark_job_linked($job_id, 'https://foo.bar/some/path');
+    $expected = ['label:linked https://foo.bar/some/path mentions this job'];
+    is_deeply [map { $_->text } $job->comments], $expected, 'linked label for non-bugref URL';
+};
+
+subtest 'error handling when duplicating jobs' => sub {
+    my $job = $jobs->find(99937);
+    my $job_mock = Test::MockModule->new('OpenQA::Schema::Result::Jobs', no_auto => 1);
+    my $res;
+
+    $job_mock->redefine(_create_clones => sub ($self, @args) { die "Rollback failed: foo\n" });
+    combined_like { $res = $job->duplicate } qr/unable to roll back/i, 'failing rollback logged';
+    is $res, 'Rollback failed after failure to clone cluster of job 99937', 'failing rollback handled';
+
+    $job_mock->redefine(_create_clones => sub ($self, @args) { die "internal error\n" });
+    combined_like { $res = $job->duplicate } qr/rolled back after error.*internal error/, 'error logged';
+    is $res, 'An internal error occurred when cloning cluster of job 99937', 'internal error handled';
+};
+
+subtest 'setting and deleting properties' => sub {
+    my $job = $jobs->find(99937);
+    $job->set_property(foo => 42);
+    is $job->settings->find({key => 'foo'})->value, 42, 'property has been created';
+    $job->set_property(foo => undef);
+    is $job->settings->find({key => 'foo'}), undef, 'property has been deleted';
+};
+
+subtest 'adding logs to result file list, including virtio console logs' => sub {
+    my $job = $jobs->find(99937);
+    $job->set_property(VIRTIO_CONSOLE_NUM => 2);
+    path($job->result_dir, 'serial_terminal1.txt')->spew('foo');
+    my $files = $job->test_resultfile_list;
+    my @expected = qw(video.ogv autoinst-log.txt serial0.txt serial_terminal1.txt);
+    is_deeply $files, \@expected, 'list of existing result files returned' or always_explain $files;
+};
+
+subtest 'history isolation keys separate the scenario history' => sub {
+    my %s = (%settings, TEST => 'isolation', DISTRI => 'iso-distri');
+    my $mk = sub (%extra) {
+        my $job = _job_create({%s, %extra});
+        $job->update({state => DONE, result => PASSED});
+        $job->discard_changes;
+        return $job;
+    };
+    # independent PRs sharing every scenario key but differing in PR_ID
+    my %iso = (PACKAGE_TESTED => 'vim', _HISTORY_ISOLATION_KEYS => 'PR_ID,PACKAGE_TESTED');
+    my $pr1a = $mk->(%iso, PR_ID => 1);
+    my $pr1b = $mk->(%iso, PR_ID => 1);
+    my $pr2 = $mk->(%iso, PR_ID => 2);
+    my $cur = $mk->(%iso, PR_ID => 1);
+
+    is_deeply $cur->history_isolation_keys, [qw(PACKAGE_TESTED PR_ID)], 'declared keys parsed and sorted';
+    is_deeply $cur->history_isolation_values, {PR_ID => 1, PACKAGE_TESTED => 'vim'}, 'all declared values';
+    is_deeply $cur->history_isolation_values(['PR_ID']), {PR_ID => 1}, 'subset of values';
+    is_deeply $cur->history_isolation_values([]), {}, 'empty subset yields no values';
+
+    my $ids = sub ($j, @args) {
+        [sort { $a <=> $b } map { $_->id } $j->_previous_scenario_jobs(@args)]
+    };
+    my @same_pr = sort { $a <=> $b } ($pr1a->id, $pr1b->id);
+    my @all = sort { $a <=> $b } ($pr1a->id, $pr1b->id, $pr2->id);
+    is_deeply $ids->($cur), \@all, 'without isolation all previous jobs match';
+    is_deeply $ids->($cur, undef, {}, undef), \@same_pr, 'full isolation keeps only same PR and package';
+    is_deeply $ids->($cur, undef, {}, ['PR_ID']), \@same_pr, 'isolating on PR_ID only keeps same-PR jobs';
+    is_deeply $ids->($cur, undef, {}, ['PACKAGE_TESTED']), \@all,
+      'isolating on same package keeps all PRs testing that package';
+    is_deeply $ids->($cur, undef, {}, []), \@all, 'empty isolation key-set matches generalized history';
+
+    subtest 'job without isolation meta-setting is unaffected' => sub {
+        my %p = (%settings, TEST => 'plain', DISTRI => 'plain-distri');
+        my $prev = _job_create(\%p);
+        $prev->update({state => DONE, result => PASSED});
+        my $now = _job_create(\%p);
+        is_deeply $now->history_isolation_keys, [], 'no declared keys';
+        is_deeply [map { $_->id } $now->_previous_scenario_jobs(undef, {}, undef)], [$prev->id],
+          'undef isolation with no declared keys behaves generalized';
+    };
+
+    subtest 'reserved SUBMISSION_ID default key' => sub {
+        my %d = (%settings, TEST => 'submission', DISTRI => 'sub-distri');
+        my @cases = (
+            {
+                settings => {%d, SUBMISSION_ID => 5},
+                expected => ['SUBMISSION_ID'],
+                desc => 'SUBMISSION_ID present but no meta-setting auto-isolates on SUBMISSION_ID',
+            },
+            {
+                settings => {%d},
+                expected => [],
+                desc => 'no keys with missing SUBMISSION_ID and no meta-setting (no-op default)',
+            },
+            {
+                settings => {%d, SUBMISSION_ID => 5, _HISTORY_ISOLATION_KEYS => ''},
+                expected => [],
+                desc => 'empty meta-setting disables the SUBMISSION_ID default',
+            },
+            {
+                settings => {%d, SUBMISSION_ID => 5, _HISTORY_ISOLATION_KEYS => 'PR_ID,SUBMISSION_ID'},
+                expected => [qw(PR_ID SUBMISSION_ID)],
+                desc => 'explicit meta-setting overrides or extends the SUBMISSION_ID default',
+            },
+        );
+
+        for my $case (@cases) {
+            is_deeply _job_create($case->{settings})->history_isolation_keys, $case->{expected}, $case->{desc};
+        }
+    };
+
+    subtest 'next_previous_jobs_query honors isolation keys' => sub {
+        # the raw view returns rows under multiple sources (l/n/p/c); assert on
+        # the unique id set which is the meaningful isolation contract
+        my $uniq_ids = sub ($j, %a) {
+            my %seen;
+            $seen{$_->id} = 1
+              for $jobs->next_previous_jobs_query($j, $j->id, previous_limit => 10, next_limit => 10, %a)->all;
+            return [sort { $a <=> $b } keys %seen];
+        };
+        my @all = sort { $a <=> $b } ($pr1a->id, $pr1b->id, $pr2->id, $cur->id);
+        my @same = sort { $a <=> $b } ($pr1a->id, $pr1b->id, $cur->id);
+        # empty key-set = generalized (matches the controller default), undef/full = strict
+        is_deeply $uniq_ids->($cur, isolation_keys => []), \@all, 'generalized query returns all PRs plus current';
+        is_deeply $uniq_ids->($cur, isolation_keys => undef), \@same, 'strict query keeps same-PR jobs and current';
+        is_deeply $uniq_ids->($cur, isolation_keys => ['PR_ID']), \@same, 'isolating on PR_ID keeps same-PR jobs';
+    };
+
+    subtest 'investigation picks last good from the isolated history' => sub {
+        my %inv_s = (%settings, TEST => 'inviso', DISTRI => 'inv-distri', _HISTORY_ISOLATION_KEYS => 'PR_ID');
+        my $good_same = $mk->(%inv_s, PR_ID => 1);    # isolated last good
+        my $good_other = $mk->(%inv_s, PR_ID => 2);    # unrelated PR, must be ignored
+        my $cur = _job_create({%inv_s, PR_ID => 1});
+        $cur->update({state => DONE, result => FAILED});
+        $cur->discard_changes;
+        $cur->create_result_dir;
+        my $inv = $cur->investigate;
+        is $inv->{last_good}{link}, '/tests/' . $good_same->id, 'last good is the same-PR job, not the newer other PR';
+
+        my $inv_non_strict = $cur->investigate(isolation_keys => []);
+        is $inv_non_strict->{last_good}{link}, '/tests/' . $good_other->id,
+          'non-strict investigation picks the newer other PR';
+
+        $t->get_ok('/tests/' . $cur->id . '/investigation_ajax')->status_is(200);
+        $t->json_is('/last_good/link' => '/tests/' . $good_same->id);
+        $t->get_ok('/tests/' . $cur->id . '/investigation_ajax?strict=0')->status_is(200);
+        $t->json_is('/last_good/link' => '/tests/' . $good_other->id);
+    };
+
+    subtest 'history API endpoint handles isolation parameters' => sub {
+        my $cur_id = $cur->id;
+        $t->get_ok("/api/v1/jobs/$cur_id/history")
+          ->status_is(200, 'history API returns successful response for valid job');
+
+        my $res_all = $t->tx->res->json;
+        my $ids_all = [sort { $a <=> $b } map { $_->{id} } @{$res_all->{jobs}}];
+        my @expected_all = sort { $a <=> $b } ($pr1a->id, $pr1b->id, $pr2->id, $cur->id);
+        is_deeply $ids_all, \@expected_all,
+          'non-strict/generalized history API returns all jobs from all PRs and current job';
+
+        $t->get_ok("/api/v1/jobs/$cur_id/history?strict=1")
+          ->status_is(200, 'strict history API returns successful response');
+        my $res_strict = $t->tx->res->json;
+        my $ids_strict = [sort { $a <=> $b } map { $_->{id} } @{$res_strict->{jobs}}];
+        my @expected_strict = sort { $a <=> $b } ($pr1a->id, $pr1b->id, $cur->id);
+        is_deeply $ids_strict, \@expected_strict, 'strict history API filters out jobs from other PRs';
+
+        $t->get_ok("/api/v1/jobs/$cur_id/history?strict=0&isolation_keys=PR_ID")
+          ->status_is(200, 'history API with custom isolation keys returns successful response');
+        my $res_custom = $t->tx->res->json;
+        my $ids_custom = [sort { $a <=> $b } map { $_->{id} } @{$res_custom->{jobs}}];
+        is_deeply $ids_custom, \@expected_strict,
+          'history API with explicit PR_ID isolation key matches same-PR results';
+    };
+
+    subtest 'investigation ignores previous jobs which are not final' => sub {
+        my %nofinal = (%settings, TEST => 'invnofinal', DISTRI => 'invnof-distri');
+        my $scheduled = _job_create(\%nofinal);
+        my $bad = $mk->(%nofinal);
+        $bad->update({state => DONE, result => FAILED});
+        $bad->discard_changes;
+        my $cur = _job_create(\%nofinal);
+        $cur->update({state => DONE, result => FAILED});
+        $cur->discard_changes;
+        $cur->create_result_dir;
+        my $inv = $cur->investigate;
+        is $inv->{first_bad}{link}, '/tests/' . $bad->id, 'scheduled job is not the first bad job';
+        is $inv->{last_good}, 'not found', 'scheduled job is not the last good job';
+    };
+};
+
+done_testing();

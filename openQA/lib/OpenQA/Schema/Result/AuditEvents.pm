@@ -1,0 +1,36 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Schema::Result::AuditEvents;
+
+
+use Mojo::Base 'DBIx::Class::Core', -signatures;
+
+__PACKAGE__->table('audit_events');
+__PACKAGE__->load_components(qw(Timestamps));
+__PACKAGE__->add_columns(
+    id => {
+        data_type => 'bigint',
+        is_auto_increment => 1,
+    },
+    user_id => {
+        data_type => 'bigint',
+        is_nullable => 1
+    },
+    connection_id => {
+        data_type => 'text',
+        is_nullable => 1
+    },
+    event => {
+        data_type => 'text',
+        is_nullable => 0
+    },
+    event_data => {
+        data_type => 'text',
+        is_nullable => 1
+    });
+__PACKAGE__->add_timestamps;
+__PACKAGE__->set_primary_key('id');
+__PACKAGE__->belongs_to(owner => 'OpenQA::Schema::Result::Users', 'user_id', {join_type => 'left'});
+
+1;

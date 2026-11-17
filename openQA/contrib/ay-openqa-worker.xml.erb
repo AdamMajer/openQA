@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE profile>
+<profile xmlns="http://www.suse.com/1.0/yast2ns" xmlns:config="http://www.suse.com/1.0/configns">
+  <general>
+    <mode>
+      <confirm t="boolean">false</confirm>
+    </mode>
+  </general>
+  <networking>
+    <!-- okurz: 2023-06-13: For multiple network interfaces by default the last is configured, prefer the first -->
+    <interfaces t="list">
+      <interface>
+        <bootproto>dhcp</bootproto>
+        <name>eth0</name>
+        <startmode>auto</startmode>
+      </interface>
+    </interfaces>
+    <keep_install_network t="boolean">true</keep_install_network>
+    <routing t="map">
+      <ipv4_forward t="boolean">true</ipv4_forward>
+      <ipv6_forward t="boolean">true</ipv6_forward>
+    </routing>
+  </networking>
+  <% if os_release[:id] == 'opensuse-leap' %>
+  <add-on>
+    <add_on_others t="list">
+      <listentry>
+        <media_url>https://download.opensuse.org/distribution/leap/<%= os_release[:version] %>/repo/oss</media_url>
+        <alias>repo-oss</alias>
+        <name>repo-oss</name>
+      </listentry>
+      <listentry>
+        <media_url>https://download.opensuse.org/distribution/leap/<%= os_release[:version] %>/repo/non-oss</media_url>
+        <alias>repo-non-oss</alias>
+        <name>repo-non-oss</name>
+      </listentry>
+      <listentry>
+        <media_url>https://download.opensuse.org/update/leap/<%= os_release[:version] %>/oss</media_url>
+        <alias>repo-update-oss</alias>
+        <name>repo-update-oss</name>
+      </listentry>
+      <listentry>
+        <media_url>https://download.opensuse.org/update/leap/<%= os_release[:version] %>/non-oss</media_url>
+        <alias>repo-update-non-oss</alias>
+        <name>repo-update-non-oss</name>
+      </listentry>
+    </add_on_others>
+  </add-on>
+  <% end %>
+  <software>
+    <% if os_release[:id] == 'opensuse-leap' %>
+    <products t="list">
+      <product>Leap</product>
+    </products>
+    <% end %>
+    <patterns t="list">
+      <pattern>kvm_server</pattern>
+    </patterns>
+    <packages t="list">
+      <package>openssh</package>
+      <package>sudo</package>
+      <package>salt-minion</package>
+      <package>chrony</package>
+    </packages>
+  </software>
+  <timezone t="map">
+    <hwclock>UTC</hwclock>
+    <timezone>Etc/UTC</timezone>
+  </timezone>
+  <partitioning t="list">
+    <drive>
+      <initialize t="boolean">true</initialize> <%# wipe out partition table before AutoYaST starts partition calculation %>
+      <% disk = disks.sort_by { |d| d[:size] }.first %> <%# find the [smallest] disk for main OS installation %>
+      <device><%= disk[:udev_names][0] %></device> <%# print the disk device name %>
+      <partitions t="list">
+        <partition>
+          <mount>/</mount>
+          <size>max</size>
+          <filesystem t="symbol">btrfs</filesystem>
+        </partition>
+        <partition>
+          <mount>swap</mount>
+          <size>auto</size>
+        </partition>
+      </partitions>
+      <use>all</use>
+    </drive>
+    <% raidarray = disks.sort_by { |d| d[:size] }.slice(1..-1) %> <%# remove first [smallest] disk from array %>
+    <% if raidarray.length > 1 %> <%# if there is more than one disk remaining on the system, combine them into a raid array %>
+      <% for d in 0..raidarray.length - 1 %>
+      <drive>
+      <initialize t="boolean">true</initialize> <%# wipe out partition table before AutoYaST starts partition calculation %>
+      <type t="symbol">CT_DISK</type>
+      <device><%= raidarray[d][:udev_names][0] %></device> <%# print full device name such as /dev/nvme0n1 %>
+      <partitions t="list">
+        <partition>
+          <raid_name>/dev/md/openqa</raid_name> <%# device node used within automount systemd service var-lib-automount %>
+          <size>max</size>
+        </partition>
+      </partitions>
+      <use>all</use>
+    </drive>
+    <% end %> <%# end for loop %>
+    <drive>
+      <type t="symbol">CT_MD</type>
+      <device>/dev/md/openqa</device>
+      <raid_options>
+        <raid_type>raid0</raid_type>
+        <device_order t="list">
+          <% for d in 0..raidarray.length - 1 %>
+          <device><%= raidarray[d][:udev_names][0] %></device>
+          <% end %>
+        </device_order>
+      </raid_options>
+      <use>all</use>
+    </drive>
+    <% else %> <%# maybe we have only one disk left on the system %>
+    <% if raidarray.length != 0 %>
+    <drive>
+      <initialize t="boolean">true</initialize> <%# wipe out partition table %>
+      <device><%= raidarray[0][:udev_names][0] %></device> <%# print full device name such as /dev/nvme0n1 %>
+      <partitions t="list">
+        <partition>
+          <%# create raid device even with a single disk to comply with systemd automount service %>
+          <raid_name>/dev/md/openqa</raid_name>
+          <size>max</size>
+        </partition>
+      </partitions>
+      <use>all</use>
+    </drive>
+    <drive>
+    <type t="symbol">CT_MD</type>
+    <device>/dev/md/openqa</device>
+    <raid_options>
+      <raid_type>raid0</raid_type>
+      <device_order t="list">
+        <device><%= raidarray[0][:udev_names][0] %></device>
+      </device_order>
+    </raid_options>
+    <use>all</use>
+    </drive>
+    <% end %> <%# end inner if %>
+    <% end %> <%# end outer if-else %>
+  </partitioning>
+  <scripts>
+    <post-scripts t="list">
+      <script>
+        <filename>setup.sh</filename>
+        <interpreter>shell</interpreter>
+        <debug t="boolean">true</debug>
+        <source><![CDATA[
+            echo 'roles: worker' > /etc/salt/grains
+        ]]></source>
+      </script>
+    </post-scripts>
+  </scripts>
+  <firewall>
+    <enable_firewall t="boolean">true</enable_firewall>
+    <start_firewall t="boolean">true</start_firewall>
+    <default_zone>public</default_zone>
+    <zones t="list">
+      <zone>
+	<name>public</name>
+	<services t="list">
+          <service>ssh</service>
+	</services>
+      </zone>
+    </zones>
+  </firewall>
+  <services-manager t="map">
+    <services>
+      <enable t="list">
+        <service>sshd</service>
+        <service>chronyd</service>
+      </enable>
+    </services>
+  </services-manager>
+</profile>

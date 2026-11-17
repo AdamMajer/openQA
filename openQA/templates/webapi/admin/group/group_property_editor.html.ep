@@ -1,0 +1,299 @@
+% use OpenQA::Utils 'human_readable_size';
+% use OpenQA::Constants qw(BUILD_SORT_BY_NAME BUILD_SORT_BY_NEWEST_JOB BUILD_SORT_BY_OLDEST_JOB);
+% use OpenQA::JobGroupDefaults ();
+% content_for 'ready_function' => begin
+    validateJobGroupForm(document.getElementById('group_properties_form'));
+    setupTriStateCheckboxes(document.getElementById('group_properties_form'));
+% end
+<div id="properties" class="card"
+    % if (!$is_parent) {
+        style="display: none;"
+    % }
+>
+    <div class="card-header">
+        % if (is_admin) {
+            Edit job group properties
+        % }
+        % else {
+            Job group properties
+        % }
+    </div>
+    <div class="card-body">
+        <form action="#" id="group_properties_form" class="form-horizontal" onsubmit="return submitProperties(this);"
+          data-put-url="<%= url_for(($is_parent ? 'apiv1_put_parent_group' : 'apiv1_put_job_group') => (group_id => $group->id)) %>">
+            % if (!is_admin) {
+                <fieldset disabled>
+            % }
+            <div class="mb-3 row">
+                <label for="editor-name" class="form-label col-sm-2 control-label">Name</label>
+                <div class="col-sm-10">
+                    <input type="text" class="form-control" id="editor-name" name="name" value="<%= $group->name %>">
+                </div>
+            </div>
+            <div class="mb-3 row">
+                <label for="editor-description" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Shown on top of the group overview">Description</label>
+                <div class="col-sm-10">
+                    <textarea class="form-control" id="editor-description" name="description" ><%= $group->description %></textarea>
+                </div>
+            </div>
+            %= include 'admin/group/tri_state_checkbox', group => $group, is_parent => $is_parent, name => 'carry_over_bugrefs', label => 'Bug reference carry over', default => OpenQA::JobGroupDefaults::CARRY_OVER_BUGREFS, help_text => '<p>By default all attached bug references will be copied to jobs of the next build if the test failed with exactly the same error.</p>'
+            %= include 'admin/group/tri_state_checkbox', group => $group, is_parent => $is_parent, name => 'always_show_version', label => 'Always show version', default => OpenQA::JobGroupDefaults::ALWAYS_SHOW_VERSION, help_text => '<p>Always show the version with the build number on the group overview and index page, even if there is only one version tested.</p>'
+            % my $ignored_info = job_group_ignored_info($group, $is_parent);
+            % my $ignored_by_config = $ignored_info->{ignored_by_config};
+            % my $ignored_title = $ignored_info->{ignored_title};
+            <div class="mb-3 row">
+                <label for="editor-ignore-on-dashboard" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="<%= $ignored_title %>">Ignore on dashboard</label>
+                <div class="col-sm-10" <% if ($ignored_by_config) { %> data-bs-toggle="tooltip" title="<%= $ignored_title %>" <% } %>>
+                    <input type="hidden" name="ignore_on_dashboard" value="0">
+                    <input type="checkbox"
+                           id="editor-ignore-on-dashboard" name="ignore_on_dashboard"
+                           value="1"
+                        % if ($group->ignore_on_dashboard || $ignored_by_config) {
+                            checked="checked"
+                        % }
+                        % if ($ignored_by_config) {
+                            disabled="disabled"
+                        % }
+                    >
+                    <%= help_popover 'Ignore on dashboard' =>
+                        '<p>
+                            If checked, this job group (and all its subgroups if it is a parent group) will be excluded from evaluation for the main dashboard page.
+                        </p>';
+                    %>
+                </div>
+            </div>
+            <div class="mb-3 row">
+                <label for="editor-build-version-sort" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Sets how builds are sorted when groups of them are displayed together">How to sort builds for display</label>
+                <div class="col-sm-10" id="editor-build-version-sort">
+                    <input type="radio" id="editor-build-version-sort-name" name="build_version_sort" value="<%= BUILD_SORT_BY_NAME %>"
+                        %= 'checked' if $group->build_version_sort == BUILD_SORT_BY_NAME
+                        >
+                    <label class="form-label" for="editor-build-version-sort-name" data-bs-toggle="tooltip" title="Treat the build values as version numbers and sort based on those">Sort by build value (as a version)</label>
+                    <br>
+                    <input type="radio" id="editor-build-version-sort-newest" name="build_version_sort" value="<%= BUILD_SORT_BY_NEWEST_JOB %>"
+                        %= 'checked' if $group->build_version_sort == BUILD_SORT_BY_NEWEST_JOB
+                        >
+                    <label class="form-label" for="editor-build-version-sort-newest" data-bs-toggle="tooltip" title="Sort builds by the creation time of the newest job for each build (choose this if the build values do not sort properly as version numbers)">Sort by newest job creation time</label>
+
+                    <br>
+                    <input type="radio" id="editor-build-version-sort-oldest" name="build_version_sort" value="<%= BUILD_SORT_BY_OLDEST_JOB %>"
+                        %= 'checked' if $group->build_version_sort == BUILD_SORT_BY_OLDEST_JOB
+                        >
+                    <label class="form-label" for="editor-build-version-sort-oldest" data-bs-toggle="tooltip" title="Sort builds by the creation time of the oldest job for each build (choose this if the build values do not sort properly as version numbers)">Sort by oldest job creation time</label>
+                </div>
+            </div>
+            <div class="mb-3 row">
+                <label for="editor-default-priority" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Default priority for jobs created in the group">Default priority</label>
+                <div class="col-sm-10">
+                    <input
+                        type="number" class="form-control"
+                        id="editor-default-priority" name="default_priority"
+                        value="<%= $group->default_priority %>" data-initial-value="<%= $group->default_priority %>">
+                    <%= help_popover 'Default priority' =>
+                        '<p>
+                            Specifies the default priority for jobs created in the group.
+                        </p>
+                        <ul>
+                            <li>
+                                Does not affect existing jobs.
+                            </li>
+                            <li>
+                                It is possible to override this priority on job template level (the rows in the table above).
+                                In this case the default set here has no effect.
+                            </li>
+                            <li>
+                                The actual priority may be adjusted dynamically based on job group properties (e.g. name or description) as configured in <code>openqa.ini</code>.
+                            </li>
+                        </ul>';
+                    %>
+                </div>
+            </div>
+                <div class="mb-3 row">
+                    <label for="editor-size-limit" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Size limit for assets">Size limit for assets</label>
+                    <div class="col-sm-10">
+                        <div class="container">
+                            <div class="row">
+                                <div class="col-sm">
+                                    <input id="editor-size-limit" name="size_limit_gb" type="number" min="1" class="form-control"
+                                        value="<%= $group->get_column('size_limit_gb') // '' %>"
+                                        placeholder="<%= $is_parent
+                                                ? 'none, limits set on job group level apply'
+                                                : 'default, configured to ' . app->config->{default_group_limits}->{asset_size_limit} %>">&nbsp;GiB
+                                </div>
+                                <div class="col-md-auto">
+                                    <button id="clear-size-limit-button" type="button"
+                                            class="btn btn-outline-info btn-sm" onclick="$('#editor-size-limit').val('');"
+                                            data-bs-toggle="tooltip" data-bs-placement="bottom"
+                                            title="<%= $is_parent ? 'to use the limits set on job group level instead'
+                                                                  : 'to use configured default instead' %>">
+                                        <i class="fa-solid fa-eraser"></i> Clear limit
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            % my ($overridden_asset_limit, $parent_group);
+            % $overridden_asset_limit = $parent_group->size_limit_gb if !$is_parent && defined ($parent_group = $group->parent);
+            % if (defined $overridden_asset_limit) {
+                <div class="mb-3 row">
+                    <label for="editor-size-limit-warning" class="form-label col-sm-2 control-label"><i class="fa-solid fa-exclamation-triangle"></i></label>
+                    <div class="col-sm-10">
+                        <span id="editor-size-limit-warning">
+                            <div>
+                                The size limit for this group is overridden by its <a href="<%= url_for 'admin_edit_parent_group', groupid => $parent_group->id %>">parent job
+                                group</a> to <%= human_readable_size($overridden_asset_limit * 1024 * 1024 * 1024) %>. Therefore
+                                the value set here is ignored and the size of exclusively kept assets not displayed.
+                            </div>
+                        </span>
+                    </div>
+                </div>
+            % }
+            % else {
+                <div class="mb-3 row">
+                    <label class="form-label col-sm-2 control-label" data-bs-toggle="tooltip"
+                           title="Size of the assets which are kept only because they are used by jobs of this group" style="font-weight: normal;">
+                        Size of exclusively kept assets
+                    </label>
+                    <div class="col-sm-10">
+                        % my $size = $group->exclusively_kept_asset_size;
+                        %= defined $size ? human_readable_size($size) : 'unknown'
+                    </div>
+                </div>
+            % }
+            % if (!$is_parent) {
+                <div class="mb-3 row">
+                    <label for="editor-keep-logs-in-days" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep logs of jobs">Keep logs for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-logs-in-days" name="keep_logs_in_days" value="<%= $group->keep_logs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row">
+                    <label for="editor-keep-important-logs-in-days"
+                    class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep logs of important jobs">Keep important logs for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-important-logs-in-days" name="keep_important_logs_in_days" value="<%= $group->keep_important_logs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row">
+                    <label for="editor-keep-results-in-days" class="form-label
+                    col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep results of jobs">Keep results for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-results-in-days" name="keep_results_in_days" value="<%= $group->keep_results_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row">
+                    <label for="editor-keep-important-results-in-days"
+                    class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep results of important jobs">Keep important results for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-important-results-in-days" name="keep_important_results_in_days" value="<%= $group->keep_important_results_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                %= include 'admin/group/cleanup_buttons';
+                <div class="mb-3 row collapse multi-collapse advanced-cleanup-settings">
+                    <label for="editor-keep-jobs-in-days" class="form-label
+                    col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep jobs in the database">Keep jobs in the database for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-jobs-in-days" name="keep_jobs_in_days" value="<%= $group->keep_jobs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row collapse multi-collapse advanced-cleanup-settings">
+                    <label for="editor-keep-important-jobs-in-days"
+                    class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep important jobs in the database">Keep important jobs in the database for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-important-jobs-in-days" name="keep_important_jobs_in_days" value="<%= $group->keep_important_jobs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+            % }
+            % else {
+                <div class="mb-3 row">
+                    <label for="editor-keep-logs-in-days" class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep logs of jobs">Keep logs for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-logs-in-days" name="default_keep_logs_in_days" value="<%= $group->default_keep_logs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row">
+                    <label for="editor-keep-important-logs-in-days"
+                    class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep logs of important jobs">Keep important logs for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-important-logs-in-days" name="default_keep_important_logs_in_days" value="<%= $group->default_keep_important_logs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row">
+                    <label for="editor-keep-results-in-days" class="form-label
+                    col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep results of jobs">Keep results for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-results-in-days" name="default_keep_results_in_days" value="<%= $group->default_keep_results_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row">
+                    <label for="editor-keep-important-results-in-days"
+                    class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep results of important jobs">Keep important results for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-important-results-in-days" name="default_keep_important_results_in_days" value="<%= $group->default_keep_important_results_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                %= include 'admin/group/cleanup_buttons';
+                <div class="mb-3 row collapse multi-collapse advanced-cleanup-settings">
+                    <label for="editor-keep-jobs-in-days" class="form-label
+                    col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep jobs in database">Keep jobs in database for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-jobs-in-days" name="default_keep_jobs_in_days" value="<%= $group->default_keep_jobs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+                <div class="mb-3 row collapse multi-collapse advanced-cleanup-settings">
+                    <label for="editor-keep-important-jobs-in-days"
+                    class="form-label col-sm-2 control-label" data-bs-toggle="tooltip" title="Number of days to keep important jobs in database">Keep important jobs in database for</label>
+                    <div class="col-sm-10">
+                        <input type="number" min="0" class="form-control" id="editor-keep-important-jobs-in-days" name="default_keep_important_jobs_in_days" value="<%= $group->default_keep_important_jobs_in_days %>"> days
+                        <%= include 'admin/group/cleanup_help' %>
+                    </div>
+                </div>
+            % }
+            <div class="mb-3 row">
+                <label for="editor-info" class="form-label col-sm-2 control-label"><i class="fa-solid fa-circle-info"></i></label>
+                <div class="col-sm-10">
+                    <span id="editor-info">
+                        <div>All time-related properties (measured in days) can be set to <em>0</em> to denote infinity.</div>
+                        % my $limits = app->config->{misc_limits};
+                        % if ($limits->{results_min_free_disk_space_percentage} || $limits->{archive_min_free_disk_space_percentage}) {
+                        <div>
+                            Results and logs might be deleted earlier than configured to prevent running out of disk space. In this case only videos are deleted at
+                            first and only if that is not sufficient the results are deleted. Important jobs are only considered if deleting other jobs was not sufficient.
+                            The affected jobs will stay visible on the web UI in any case; only the videos and possibly logs and screenshots will be gone.
+                        </div>
+                        % }
+                    </span>
+                </div>
+            </div>
+            <div class="mb-3 row">
+                <div class="col-sm-2 control-label"></div>
+                <div class="col-sm-10">
+                    <p class="buttons">
+                        <button type="submit" class="btn btn-primary"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                        <button type="reset" class="btn btn-danger"><i class="fa-regular fa-trash-can"></i> Reset</button>
+                    </p>
+                    <p class="properties-progress-indication">
+                        <i class="fa-solid fa-gear fa-spin fa-3x fa-fw"></i>
+                        <span class="visually-hidden">Loading…</span>
+                    </p>
+                    <p class="properties-status"></p>
+                </div>
+            </div>
+            % if (!is_admin) {
+                </fieldset>
+            % }
+        </form>
+    </div>
+</div>

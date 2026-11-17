@@ -1,0 +1,89 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Mojo::Base -signatures;
+use lib 'lib', 't/lib', 'external/os-autoinst-common/lib';
+use OpenQA::Schema;
+use OpenQA::Test::Database;
+use OpenQA::Test::Utils qw(assume_all_assets_exist);
+use Getopt::Long::Descriptive;
+
+sub init ($opt) {
+    # Initialize or reset the openQA test database with standard fixtures and mock assets
+
+    # Ensure t/fixtures exists
+    my $fixtures_dir = 't/fixtures';
+    unless (-e $fixtures_dir) {
+        die sprintf 'Error: Fixtures directory %s not found.', $fixtures_dir;    # uncoverable statement
+    }
+
+    my $schema = OpenQA::Schema::connect_db(mode => 'test', deploy => 0);
+    my $schema_name = $ENV{OPENQA_DATABASE_SEARCH_PATH} // 'public';
+
+    unless ($opt->silent) {
+        if ($opt->reset) {
+            say sprintf "Resetting schema '%s'...", $schema_name;
+        }
+        say sprintf "Deploying schema and loading fixtures from '%s'...", $opt->fixtures;
+    }
+
+    if ($opt->reset) {
+        my $dbh = $schema->storage->dbh;
+        $dbh->do('SET client_min_messages TO WARNING');
+        $dbh->do(qq{DROP SCHEMA IF EXISTS "$schema_name" CASCADE});
+        $dbh->do(qq{CREATE SCHEMA "$schema_name"});
+    }
+
+    # Deploy schema and insert fixtures
+    OpenQA::Test::Database->new->create(
+        skip_schema => 1,
+        fixtures_glob => $opt->fixtures,
+    );
+
+    # Configure mock assets to avoid 404s/warnings
+    assume_all_assets_exist();
+
+    return if $opt->silent;
+
+    print <<~"EOM";
+    ========================================================================
+      openQA interactive test environment has been initialized
+    ========================================================================
+
+      Database resets and schema deployed onto '${\$schema_name}'.
+      Loaded fixtures matching: ${\$opt->fixtures}
+      Mock assets activated.
+
+      You can interact with the local Web UI using the following links:
+        - Home/Overview:  http://localhost:9526/
+        - Test Results:   http://localhost:9526/tests/overview
+        - Sample Details:  http://localhost:9526/tests/99981
+        - Admin Workers:  http://localhost:9526/admin/workers
+
+      Authentication Info:
+        - Click 'Login' in the top-right corner to log in automatically
+          as the 'Demo' user (who has administrator/operator rights).
+
+    ========================================================================
+    EOM
+}
+
+sub main () {
+    my ($opt, $usage) = describe_options(
+        <<~"EOM",
+    $0 %o
+
+    Helper tool to initialize the openQA developer test environment with fixtures
+    EOM
+        ['fixtures|f=s', 'Specify fixture files to load', {default => $ENV{FIXTURES_GLOB} // '*.pl'}],
+        ['reset!', 'Drop and recreate the schema before populating', {default => $ENV{RESET_SCHEMA} // 1}],
+        ['silent', 'Suppress summary and status output'],
+        ['help|h', 'print usage message and exit', {shortcircuit => 1}],
+    );
+    print($usage->text), exit if $opt->help;
+    init($opt);
+}
+
+main unless caller;

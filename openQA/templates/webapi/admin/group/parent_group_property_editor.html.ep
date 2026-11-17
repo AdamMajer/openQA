@@ -1,0 +1,19 @@
+% layout 'bootstrap';
+% title 'Parent group ' . $group->name;
+
+<div class="row">
+    <div class="col-sm-12">
+        % if (is_admin) {
+            <form action="<%= url_for('admin_groups') %>" class="corner-buttons">
+                <button type="submit" class="btn btn-light">
+                    <span><span class="glyphicon glyphicon-th-list" aria-hidden="true"></span> Manage all job groups</span>
+                </button>
+            </form>
+        % }
+        <h2>
+            Parent group <span id="job-group-name"><%= $group->name %></span>
+        </h2>
+        %= include 'layouts/info'
+        %= include 'admin/group/group_property_editor', group => $group, is_parent => 1
+    </div>
+</div>

@@ -1,0 +1,274 @@
+% use DateTime;
+% layout 'bootstrap';
+% title 'Test summary';
+% use OpenQA::Jobs::Constants;
+% use List::Util qw(any sum);
+
+% content_for 'ready_function' => begin
+  window.overviewParallelChildrenCollapsableResultsSel = '<%= $parallel_children_collapsable_results_sel %>';
+  setupOverview({metaMapping: <%== Mojo::JSON::to_json($meta_mapping) %>});
+% end
+
+%= include 'layouts/limit_warning'
+<div>
+    <h2>Test result overview</h2>
+    <div id="summary" class="card <%= status_border_class($aggregate_status) %>">
+        <div class="card-header">
+            %= badge_markdown_copy_button('overview', '[![openQA build status](' . (url_with('tests_overview_badge')->to_abs->to_string =~ s/\.svg\b//r) . ')](' . url_with->to_abs . ')', 'float-end')
+            Overall Summary of
+            % if (@$groups) {
+                <strong>
+                % my @links;
+                % for my $i (0 .. $#$groups) {
+                    % my $group = $groups->[$i];
+                    % my $link = link_to $group->name => url_for('group_overview', groupid => $group->id);
+                    % my $comma = $i > 0 ? ', ' : '';
+                    % if ($i >= $max_groups) {
+                        % push @links, '<span class="more-groups d-none">' . $comma . $link . '</span>';
+                    % } else {
+                        % push @links, $comma . $link->to_string;
+                    % }
+                % }
+                %== join '', @links
+                % if (@$groups > $max_groups) {
+                    <a href="javascript:void(0)" id="show-more-groups" title="Show more" onclick="this.classList.add('d-none'); document.querySelectorAll('.more-groups').forEach(e => e.classList.remove('d-none'));">…</a>
+                % }
+                </strong>
+            % }
+            % elsif (@$summary_parts) {
+                <strong><% for my $part (@$summary_parts) { %><%= $part %><% } %></strong>
+            % }
+            % else {
+                multiple distri/version
+            % }
+            % if ($build) {
+                build <%= $build %>
+            % }
+            <div class="time-params">
+                % if ($until) {
+                    at the time of <abbr class="timeago" title="<%= $until %>Z"><%= $until %>Z</abbr>,
+                    <a href="<%= url_with->query({t => undef}) %>">show latest jobs</a>
+                % }
+                % else {
+                    showing latest jobs,
+                    <a href="<%= url_with->query({t => format_time(DateTime->now)}) %>">overview fixed to the current time</a>
+                %}
+            </div>
+        </div>
+        <div class="card-body">
+            % my $allow_commenting = @$job_ids && current_user;
+            % if ($allow_commenting) {
+            <button type="button" class="btn btn-secondary btn-circle btn-sm trigger-edit-button" onclick="showAddCommentsDialog()" title="Restart or comment jobs">
+                <span class="fa-stack group-comment-icon-stack">
+                    <i class="fa-solid fa-comment fa-stack-2x text-danger-info" aria-hidden="true"></i>
+                    <i class="fa-solid fa-rotate-left fa-stack-1x" aria-hidden="true"></i>
+                </span>
+            </button>
+            % }
+            % my @badges = qw(success warning     danger secondary  info      primary light   light);
+            % my @labels = qw(Passed  Soft-Failed Failed Incomplete Scheduled Running Cancelled Aborted None);
+            % my $index  = 0;
+            % for my $category (qw(passed softfailed failed not_complete scheduled running cancelled aborted none)) {
+                % my ($label, $badge) = ($labels[$index], $badges[$index++]);
+                % next unless my $count = delete $aggregated->{$category};
+                <a href="<%= url_with->query($summary_category_query->{$category}) %>" class="badge-btn btn btn-sm btn-outline-<%= $badge %> mb-1 d-inline-flex align-items-center"><%= $label %>: <span class="badge text-bg-<%= $badge %> ms-1"><%= $count %></span></a>
+            % }
+            % if (my $unknown_count = sum values %$aggregated) {
+                Unknown: <span class="badge text-bg-light"><%= $unknown_count %></span>
+            % }
+            <a href="<%= url_with->query({result => undef, state => undef}) %>" class="btn btn-sm btn-outline-secondary mb-1 d-inline-flex align-items-center">All</a>
+        </div>
+    </div>
+    <div class="card" id="filter-panel">
+        <div class="card-header"><strong>Filter</strong>
+            <%= help_popover('Help for the <em>test overview</em>' => '
+                    <p>This page shows an overview of job results in a matrix
+                    view. Only the latest job for each scenario is shown. The
+                    view can be configured based on query parameters which can
+                    be set within this filter box.</p>
+                    <p><b>Caveat:</b> Based on the parameters the resulting
+                    job query might consider jobs as latest which do not
+                    represent the complete picture for a corresponding
+                    "latest" build so be careful with a more advanced
+                    selection of checkboxes with the interpretation of the
+                    results.</p>
+                    <p>Additional tweaking of the query is possible by leaving
+                    out query parameters completely or specifying them
+                    multiple times equivalent to an logical "or" search.</p>',
+                    'https://open.qa/docs/#allow-group-overview-query-by-result-gh' => 'the documentation')
+                %>
+            <span>no filter present, click to toggle filter form</span>
+        </div>
+        <div class="card-body">
+            <form action="#" method="get" id="filter-form">
+                %= include 'test/_overview_filter_section', id_suffix => 'results', label => 'Job result', name => 'result', items => [OpenQA::Jobs::Constants::RESULTS], meta_items => [OpenQA::Jobs::Constants::META_RESULTS]
+                %= include 'test/_overview_filter_section', id_suffix => 'states', label => 'Job state', name => 'state', items => [OpenQA::Jobs::Constants::STATES], meta_items => [OpenQA::Jobs::Constants::META_STATES]
+                <div class="row" id="filter-arch-flavor">
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <strong>Architecture</strong>
+                            <input type="text" class="form-control" name="arch" placeholder="any" id="filter-arch">
+                        </div>
+                    </div>
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <strong>Flavor</strong>
+                            <input type="text" class="form-control" name="flavor" id="filter-flavor"
+                            placeholder="flavors, comma separated, e.g. foo,bar">
+                        </div>
+                    </div>
+                </div>
+                <div class="row" id="filter-machine-test">
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <strong>Machines</strong>
+                            <input type="text" class="form-control" name="machine" placeholder="any" id="filter-machine">
+                        </div>
+                    </div>
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <strong>Test</strong>
+                            <input type="text" class="form-control" name="test" placeholder="any" id="filter-test">
+                        </div>
+                    </div>
+                </div>
+                <div class="row" id="filter-modules">
+                    <div class="col-4">
+                        <div class="mb-3">
+                            <label class="form-label" for="modules"><strong>Module name</strong></label>
+                            <%= help_popover('Help for the <em>Module name</em> filter' => '
+                            <p>Shows jobs that contain the specified modules</p>') %>
+                            <input name="modules" type="text" id="modules"
+                            placeholder="modules, comma separated, e.g. mod1,mod2"
+                            class="form-control">
+                        </div>
+                    </div>
+                    <div class="col-4">
+                        <div class="mb-3">
+                            <label class="form-label" for="filter-module-re"><strong>Module code</strong></label>
+                            <%= help_popover('Help for the <em>Module code</em> filter' => '
+                            <p>Shows jobs that contain the modules found by grep command over module source code</p>') %>
+                            <input type="text" class="form-control" name="module_re" placeholder="regular expression" id="filter-module-re">
+                        </div>
+                    </div>
+                    <div class="col-2">
+                        <div class="mb-3">
+                            <label class="form-label" for="modules_result"><strong>Module result</strong></label>
+                            <%= help_popover('Help for the <em>Module result</em> filter' => '<p>Show jobs with selected result.</p>') %>
+                            <select name="modules_result" id="modules_result" data-placeholder="any" class="chosen-select" multiple>
+                                % for my $modules_result (OpenQA::Jobs::Constants::MODULE_RESULTS) {
+                                    <option><%= $modules_result %></option>
+                                % }
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="row" id="filter-job-groups">
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <label class="form-label" for="group-glob"><strong>Include job groups</strong></label>
+                            <%= help_popover('Help for the <em>Include job group</em> filter' => '
+                            <p>Shows jobs from job groups matching these globs</p>') %>
+                            <input name="group_glob" type="text" id="group-glob"
+                            placeholder="globs, comma separated, e.g. *kernel*,*Tumbleweed*"
+                            class="form-control">
+                        </div>
+                    </div>
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <label class="form-label" for="not-group-glob"><strong>Exclude job groups</strong></label>
+                            <%= help_popover('Help for the <em>Exclude job groups</em> filter' => '
+                            <p>Do not show jobs matching these globs</p>') %>
+                            <input type="text" class="form-control" name="not_group_glob"
+                            placeholder="globs, comma separated, e.g. *development*,*test*" id="not-group-glob">
+                        </div>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <label class="form-label" for="comment-text-filter"><strong>Comment text</strong></label>
+                                <%= help_popover('Help for the <em>Comment text</em> filter' => '
+                                <p>Show only jobs with comments containing the specified term</p>') %>
+                                <input type="text" class="form-control" name="comment"
+                                placeholder="comment text" id="comment-text-filter">
+                        </div>
+                    </div>
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <label class="form-label" for="filter-min-restarts"><strong>Minimum restarts</strong></label>
+                            <%= help_popover('Help for the <em>Minimum restarts</em> filter' => '
+                            <p>Shows jobs that have been restarted at least this many times</p>') %>
+                            <input type="number" class="form-control" name="min_restarts" id="filter-min-restarts" min="1" placeholder="e.g. 1">
+                        </div>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-5">
+                        <div class="mb-3">
+                            <strong>Misc</strong>
+                            <input value="1" name="todo" type="checkbox" id="filter-todo">
+                            <label class="form-label" for="filter-todo">TODO</label>
+                            %= help_popover_todo
+                        </div>
+                    </div>
+                </div>
+                %= include 'main/_filter_form_buttons'
+            </form>
+        </div>
+    </div>
+    %= include 'layouts/info'
+    % for my $distri (sort keys %$results) {
+        % my $type_prefix_distri = $only_distri ? '' : "Distri: $distri / ";
+        % my $version_results = $results->{$distri};
+        % my $only_version = scalar keys %$version_results == 1;
+        % for my $version (sort keys %$version_results) {
+            % my $type_prefix = $type_prefix_distri . ($only_version && $only_distri ? '' : " Version: $version / ");
+            % my $type_archs = $archs->{$distri}{$version};
+            % for my $type (sort keys %$type_archs) {
+                % my $type_result = $version_results->{$version}{$type};
+                <h3><%= $type_prefix %>Flavor: <%= $type %></h3>
+                %= include 'test/overview_result_table', type => $type, type_results => $type_result, type_archs => $type_archs->{$type}
+            % }
+        % }
+    % }
+</div>
+
+% if ($allow_commenting) {
+<div class="modal fade" id="add-comments-modal">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header">
+          <h4 class="modal-title">Add comment on all currently shown jobs</h4>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          %= include 'comments/add_comment_form_groups', group_comment => 0, nosubmit => 1
+        </div>
+        <div class="modal-footer">
+          <div id="add-comments-progress-indication">
+            <div class="flex-fill"><i class="fa-solid fa-gear fa-spin fa-fw"></i> Saving…</div>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+          <div id="add-comments-controls">
+            <button type="button" class="btn btn-warning" id="commentJobsBtn"
+                    data-url="<%= url_for('apiv1_post_comments')->query(job_id=>$job_ids) %>"
+                    onclick="addComments(this);">
+              <i class="fa-solid fa-comment"></i> Comment on all <%= scalar @$job_ids %> jobs
+            </button>
+            <button type="button" class="btn btn-danger" id="restartAndCommentJobsBtn"
+                    data-jobs="<%= join(',', @$job_ids) %>"
+                    data-url="<%= url_for('apiv1_restart_jobs')->query(jobs=>$job_ids) %>"
+                    onclick="restartJobsWithComment(this);">
+              <i class="fa-regular fa-circle-play"></i> Restart and comment on <%= scalar @$job_ids %> jobs
+            </button>
+            <button type="button" class="btn btn-secondary"
+                    data-bs-dismiss="modal">Discard</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+% }

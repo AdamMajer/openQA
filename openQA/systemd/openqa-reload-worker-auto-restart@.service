@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart openqa-worker-auto-restart@%i.service ASAP without interrupting jobs
+
+[Service]
+Type=oneshot
+# Ignore failures: systemctl exits 1 when an idle worker deactivates mid-reload
+ExecStart=-/usr/bin/systemctl try-reload-or-restart openqa-worker-auto-restart@%i.service
+Slice=openqa-worker.slice

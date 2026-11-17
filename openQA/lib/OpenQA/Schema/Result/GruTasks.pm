@@ -1,0 +1,85 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Schema::Result::GruTasks;
+
+
+use Mojo::Base 'DBIx::Class::Core', -signatures;
+
+use Mojo::JSON qw(decode_json encode_json);
+use OpenQA::Parser::Result::OpenQA;
+use OpenQA::Parser::Result::Test;
+use OpenQA::Jobs::Constants;
+
+__PACKAGE__->table('gru_tasks');
+__PACKAGE__->load_components(qw(InflateColumn::DateTime FilterColumn Timestamps));
+__PACKAGE__->add_columns(
+    id => {
+        data_type => 'bigint',
+        is_auto_increment => 1,
+    },
+    taskname => {
+        data_type => 'text',
+        is_nullable => 0,
+    },
+    args => {
+        data_type => 'text',
+        is_nullable => 0,
+    },
+    run_at => {
+        data_type => 'datetime',
+        is_nullable => 0,
+    },
+    priority => {
+        data_type => 'integer',
+        is_nullable => 0,
+        default => 0
+    });
+__PACKAGE__->add_timestamps;
+__PACKAGE__->set_primary_key('id');
+
+__PACKAGE__->has_many(jobs => 'OpenQA::Schema::Result::GruDependencies', 'gru_task_id');
+
+__PACKAGE__->filter_column(
+    args => {
+        filter_to_storage => 'encode_json_to_db',
+        filter_from_storage => 'decode_json_from_db',
+    });
+
+sub sqlt_deploy_hook ($self, $sqlt_table) {
+    $sqlt_table->add_index(name => 'gru_tasks_run_at_reversed', fields => 'run_at DESC');
+}
+
+sub decode_json_from_db ($self, $value) {
+    my $ret = decode_json($value);
+    return $ret->{_} if ref($ret) eq 'HASH' && defined $ret->{_};
+    return $ret;
+}
+
+sub encode_json_to_db ($self, $args) {
+    encode_json($args);
+}
+
+sub fail ($self, $reason = undef) {
+    $reason //= 'Unknown';
+    my $deps = $self->jobs->search;
+    my $detail_text = 'Minion-GRU.txt';
+
+    my $result = OpenQA::Parser::Result::OpenQA->new(
+        details => [{text => $detail_text, title => 'GRU'}],
+        name => 'background_process',
+        result => 'fail',
+        test => OpenQA::Parser::Result::Test->new(name => 'GRU', category => 'background_task'));
+    my $output
+      = OpenQA::Parser::Result::Output->new(file => $detail_text, content => "Gru job failed\nReason: $reason");
+
+    while (my $d = $deps->next) {
+        $d->job->custom_module($result => $output);
+        $d->job->done(result => INCOMPLETE, reason => "preparation failed: $reason");
+        $d->delete();
+    }
+
+    $self->delete();
+}
+
+1;

@@ -1,0 +1,99 @@
+% layout 'bootstrap';
+% title '';
+
+%= include 'layouts/info'
+
+% content_for 'ready_function' => begin
+    setupIndexPage();
+% end
+
+<div class="jumbotron">
+  <div class='container'>
+    <div class="row">
+      <div class="col-md-9">
+        %= include_branding 'docbox'
+      </div>
+      <div class="col-md-3 hidden-sm-down">
+        %= include_branding 'sponsorbox'
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="build-results-loading">
+    <div class="d-flex justify-content-center">
+        <i class="fa-solid fa-circle-notch fa-spin fa-4x" role="status"><span class="visually-hidden">Loading…</span></i>
+    </div>
+</div>
+<div id="build-results" data-build-results-url="<%= url_for('dashboard_build_results') %>">
+</div>
+
+<div class="card card-outline-secondary filter-panel-bottom" id="filter-panel">
+    <div class="card-header"><strong>Filter and settings</strong> <span>no filter present, click to toggle filter form</span></div>
+    <div class="card-body">
+        <form action="#" method="get" id="filter-form">
+            <div class="mb-3">
+                <p>
+                    <strong>
+                        Groups
+                        <%= help_popover('Help for <i>group filter</i>' => '
+                            <p>Filters groups by its name. Use of regular expressions is supported.</p>
+                            <p>Note that for the purpose of filtering, the name of a nested group is combined with the name of its parent. This is done in the same way as on the group overview, eg.: <pre>SLE 15 / Functional</pre>
+                            So nested groups can be matched unambiguously.</p>')
+                        %>
+                    </strong>
+                    <input type="text" class="form-control" name="group" placeholder="all" id="filter-group">
+                </p>
+                <p>
+                    <input value="1" name="default_expanded" type="checkbox" id="filter-default-expanded">
+                    <label class="form-label" for="filter-default-expanded">Nested groups by default expanded</label>
+                    <%= help_popover('Help for <i>default expanded</i>' => '
+                        <p>This option allows to show nested groups directly when loading the page.</p>')
+                    %>
+                </p>
+            </div>
+            <div class="mb-3">
+                <strong style="display: block;">Limit builds</strong>
+                <p class="d-flex flex-row align-items-center p-1">
+                    <label class="form-label">Maximum number of builds per group</label>
+                    <input type="number" class="form-control" name="limit_builds" value="<%= app->config->{global}->{frontpage_builds} %>" id="filter-limit-builds">
+                </p>
+                <p class="d-flex flex-row align-items-center p-1">
+                    <label class="form-label">Maximum age in days</label>
+                    <input type="number" class="form-control" name="time_limit_days" value="<%= app->config->{global}->{frontpage_time_limit_days} %>" id="filter-time-limit-days">
+                </p>
+            </div>
+            <div class="mb-3">
+                <strong>Misc</strong>
+                <input value="1" name="show_tags" type="checkbox" id="filter-show-tags">
+                <label class="form-label" for="filter-show-tags">Show tags</label>
+                <%= help_popover('Help for <i>Show tags</i>' => '<p>Show tags from the corresponding group overview comments</p>',
+                    'https://open.qa/docs/#build-tagging' => 'the documentation')
+                %>
+                <input value="1" name="only_tagged" type="checkbox" id="filter-only-tagged">
+                <label class="form-label" for="filter-only-tagged">Only tagged</label>
+                <%= help_popover('Help for <i>Only tagged</i>' => '
+                    <p>Show only builds that have been tagged in the corresponding group overview comments</p>
+                    <p>Implies <i>Show tags</i></p>',
+                    'https://open.qa/docs/#build-tagging' => 'the documentation')
+                %>
+                <input value="1" name="fullscreen" type="checkbox" id="filter-fullscreen">
+                <label class="form-label" for="filter-fullscreen">Full screen</label>
+                <%= help_popover('Help for <i>Full screen</i>' => '<p>Show builds in full screen mode</p>')
+                %>
+            </div>
+
+            <div class="mb-3">
+                <strong>
+                    Auto-refresh interval
+                    <%= help_popover('Help for <i>Auto refresh</i>' => '<p>Allows to update the data of this page automatically</p>') %>
+                </strong>
+                <p class="d-flex align-items-center">
+                    <input type="number" class="form-control d-flex flex-row align-items-center p-2" name="interval" min="0" placeholder="no auto-refresh" id="filter-autorefresh-interval" onchange="event.target.value == 0 ? event.target.value='' : {}">
+                    <label class="form-label p-2" for="filter-autorefresh-interval">seconds</label>
+                </p>
+            </div>
+            %= include 'main/_filter_form_buttons'
+        </form>
+    </div>
+</div>

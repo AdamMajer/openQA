@@ -1,0 +1,435 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Mojo::Base -signatures;
+use utf8;
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Test::Mojo;
+use Test::Warnings ':report_warnings';
+use OpenQA::Test::TimeLimit '30';
+use OpenQA::Test::Case;
+use OpenQA::Test::Utils qw(assume_all_assets_exist);
+use OpenQA::SeleniumTest;
+use OpenQA::Jobs::Constants;
+use OpenQA::JobDependencies::Constants;
+use Date::Format 'time2str';
+use Mojo::Util 'scope_guard';
+
+my $test_case = OpenQA::Test::Case->new;
+my $schema_name = OpenQA::Test::Database::generate_schema_name;
+my $fixtures = '01-jobs.pl 06-job_dependencies.pl';
+my $schema = $test_case->init_data(schema_name => $schema_name, fixtures_glob => $fixtures);
+my $jobs = $schema->resultset('Jobs');
+my $job_deps = $schema->resultset('JobDependencies');
+my $assets = $schema->resultset('Assets');
+
+sub prepare_database () {
+    # Populate more cluster jobs
+    my @test_names = qw(create_hdd support_server master_node slave_node);
+    for my $n (0 .. 3) {
+        my $new = {
+            id => 99900 + $n,
+            group_id => 1001,
+            priority => 35,
+            result => SOFTFAILED,
+            state => DONE,
+            t_finished => time2str('%Y-%m-%d %H:%M:%S', time - 576600, 'UTC'),
+            t_started => time2str('%Y-%m-%d %H:%M:%S', time - 576000, 'UTC'),
+            t_created => time2str('%Y-%m-%d %H:%M:%S', time - 7200, 'UTC'),
+            TEST => $test_names[$n],
+            FLAVOR => 'DVD',
+            DISTRI => 'opensuse',
+            BUILD => '0091',
+            VERSION => '13.1',
+            MACHINE => '32bit',
+            ARCH => 'i586',
+            jobs_assets => [{asset_id => 1},],
+            settings => [
+                {key => 'QEMUCPU', value => 'qemu32'},
+                {key => 'DVD', value => '1'},
+                {key => 'VIDEOMODE', value => 'text'},
+                {key => 'ISO', value => 'openSUSE-13.1-DVD-i586-Build0091-Media.iso'},
+                {key => 'DESKTOP', value => 'textmode'},
+                {key => 'ISO_MAXSIZE', value => '4700372992'}]};
+        $jobs->create($new);
+    }
+    $jobs->find(99900)->children->create(
+        {
+            child_job_id => 99901,
+            dependency => OpenQA::JobDependencies::Constants::CHAINED,
+        });
+    $jobs->find(99901)->children->create(
+        {
+            child_job_id => 99902,
+            dependency => OpenQA::JobDependencies::Constants::PARALLEL,
+        });
+    $jobs->find(99901)->children->create(
+        {
+            child_job_id => 99903,
+            dependency => OpenQA::JobDependencies::Constants::PARALLEL,
+        });
+
+    # ensure chained jobs 99937 and 99938 show up together on the first page
+    $jobs->search({id => {-in => [99937, 99938]}})->update({t_finished => time2str('%Y-%m-%d %H:%M:%S', time, 'UTC')});
+
+    assume_all_assets_exist;
+}
+
+prepare_database;
+
+my $last_job_id;
+sub update_last_job_id () { $last_job_id = $jobs->search(undef, {rows => 1, order_by => {-desc => 'id'}})->first->id }
+
+sub expected_job_id_regex ($offset = 1) {
+    my $expected_job_id = $last_job_id + $offset;
+    return qr|tests/$expected_job_id|;
+}
+
+driver_missing unless my $driver = call_driver;
+disable_timeout;
+disable_bootstrap_animations;
+
+$driver->title_is('openQA', 'on main page');
+$driver->find_element_by_link_text('Login')->click();
+
+sub flash_messages () { $driver->find_element('#flash-messages')->get_text }
+
+sub ensure_asset_exists ($name) { $assets->find_or_create({name => $name, type => 'iso', size => 0}) }
+
+sub verify_parent_skip_ok_button (%args) {
+    my $button = $driver->find_element('#flash-messages .restart-parent-skip-ok');
+    ok $button, 'restart parent skipping OK children button is present' or return undef;
+    is $button->get_text, 'Restart parent job skipping passed/softfailed children', 'button text';
+    $button->click if $args{click};    # click the button to restart parent job skipping OK children
+    return $button;
+}
+
+
+subtest 'restart job from info panel in test results' => sub {
+    subtest 'parent job shows options for advanced restart' => sub {
+        $driver->get_ok('/tests/99900', 'go to job 99900');
+        is @{$driver->find_elements('//a[contains(@class, "restart")]', 'xpath')}, 4, 'multiple restart actions found';
+        ok !$driver->find_element('.restart-result-skip-parents')->is_displayed, 'advanced restart entries present';
+        $driver->find_element('.restart-button-options')->click;
+        my $restart_parent = $driver->find_element('.restart-result-skip-parents');
+        ok $restart_parent->is_displayed, 'advanced restart entries shown';
+        $restart_parent->attribute_like('href', qr/skip_parents=1/, 'skip parents API URL correct');
+        $driver->find_element('.restart-result-skip-ok-children')
+          ->attribute_like('href', qr/skip_ok_result_children=1/, 'skip OK children API URL correct');
+        $driver->find_element('.restart-result-skip-children')->click;
+        wait_until(sub { $driver->get_current_url =~ qr{/tests/99982} }, 'shows cloned job');
+        $jobs->find(99982)->delete;
+    };
+    subtest 'child job shows options for advanced restart' => sub {
+        $driver->get_ok('/tests/99901', 'go to job 99901');
+        ok !$driver->find_element('.restart-result-skip-parents')->is_displayed, 'advanced restart present for child';
+        $driver->find_element('.restart-button-options')->click;
+        my $restart_parent = $driver->find_element('.restart-result-skip-parents');
+        ok $restart_parent->is_displayed, 'advanced restart entries shown for child';
+        $restart_parent->attribute_like('href', qr/skip_parents=1/, 'skip parents API URL correct for child');
+        $driver->find_element('.restart-result-skip-ok-children')
+          ->attribute_like('href', qr/skip_ok_result_children=1/, 'skip OK children API URL correct for child');
+    };
+    subtest 'assets missing; there is no parent' => sub {
+        is $driver->get('/tests/99939'), 1, 'go to job 99939';
+        is @{$driver->find_elements('//a[contains(@id, "restart")]', 'xpath')}, 1, 'only one restart action found';
+        $driver->find_element('#restart-result')->click();
+        wait_for_ajax(msg => 'fail to start job with missing asset and no parent');
+        like $driver->get_current_url, qr|tests/99939|, 'no auto refresh when there are errors/warnings';
+        wait_until(sub { flash_messages =~ m/Job 99939 misses.*\.iso.*Ensure to provide mandatory assets/s },
+            'restarting job with missing asset results in an error', 20);
+    };
+    subtest 'assets missing; there is a parent' => sub {
+        $job_deps->create({child_job_id => 99939, parent_job_id => 99947, dependency => CHAINED});
+        is $driver->get('/tests/99939'), 1, 'go to job 99939';
+        $driver->find_element('#restart-result')->click();
+        wait_until(sub { flash_messages =~ m/Job 99939 misses.*\.iso.*You may try to retrigger the parent job 99947/s },
+            'restarting job with missing asset results in an error', 20);
+        verify_parent_skip_ok_button;
+    };
+    subtest 'restart parent skipping OK children option on regularly chained dependency error' => sub {
+        # cleanup after leaving subtest (not using txn here as the forked process needs to see changes)
+        my $cleanup = scope_guard sub {
+            $jobs->search({id => 99947})->update({clone_id => undef});
+            $jobs->search({id => 99983})->delete;
+            $schema->storage->dbh->do('ALTER SEQUENCE jobs_id_seq RESTART WITH 99983');
+        };
+
+        # ensure parent job's asset exists so it can be restarted
+        ensure_asset_exists('openSUSE-13.1-DVD-i586-Build0092-Media.iso');
+
+        is $driver->get('/tests/99939'), 1, 'go to job 99939 (regularly chained child)';
+        $driver->find_element('#restart-result')->click();
+        wait_for_ajax(msg => 'fail to restart job because of regularly chained parent');
+        wait_until(sub { flash_messages =~ m/You may try to retrigger the parent job 99947/s },
+            'regularly chained parent error shown', 20);
+        verify_parent_skip_ok_button(click => 1) or return;
+        wait_for_ajax(msg => 'parent job restarted skipping OK children');
+        wait_until(sub { $driver->get_current_url =~ qr{/tests/(\d+)} && $1 != 99939 },
+            'redirects to successfully restarted parent job');
+    };
+    subtest 'restart parent skipping OK children option on directly chained dependency error' => sub {
+        # cleanup after leaving subtest (not using txn here as the forked process needs to see changes)
+        my $job_deps_search = {parent_job_id => 99937, child_job_id => 99938};
+        my $cleanup = scope_guard sub {
+            $job_deps->search($job_deps_search)->update({dependency => CHAINED});
+            $jobs->search({id => [99937, 99938]})->update({clone_id => undef});
+            $jobs->search({id => [99983, 99984]})->delete;
+            $schema->storage->dbh->do('ALTER SEQUENCE jobs_id_seq RESTART WITH 99983');
+        };
+
+        # create a parent-prefixed asset to satisfy the missing asset check, change dependency to directly chained
+        ensure_asset_exists('00099937-openSUSE-Factory-DVD-x86_64-Build0048-Media.iso');
+        $job_deps->search($job_deps_search)->update({dependency => DIRECTLY_CHAINED});
+
+        is $driver->get('/tests/99938'), 1, 'go to job 99938 (directly chained child)';
+        $driver->find_element('#restart-result')->click();
+        wait_for_ajax(msg => 'fail to restart job because of directly chained parent');
+        wait_until(sub { flash_messages =~ m/Direct parent 99937 needs to be cloned as well/s },
+            'direct parent error shown', 20);
+        verify_parent_skip_ok_button(click => 1) or return;
+        wait_for_ajax(msg => 'parent job restarted skipping OK children');
+        wait_until(sub { $driver->get_current_url =~ qr{/tests/(\d+)} && $1 != 99938 },
+            'redirects to successfully restarted parent job');
+    };
+    subtest 'force restart' => sub {
+        is $driver->get('/tests/99939'), 1, 'go to job 99939';
+        $driver->find_element('#restart-result')->click();
+        wait_for_ajax(msg => 'fail to start job with missing asset and parent');
+        update_last_job_id;
+        $driver->find_element('#flash-messages button.force-restart')->click();
+        wait_for_ajax(msg => 'forced job restart');
+        like
+          $driver->find_element_by_link_text('new job')->get_attribute('href'),
+          expected_job_id_regex(2),
+          'warning with link to new job appears';
+
+        my $test = "return addParam('/api/v1/jobs/123/restart?skip_ok_result_children=1', 'force', '1')";
+        my $path = $driver->execute_script($test);
+        is $path, '/api/v1/jobs/123/restart?skip_ok_result_children=1&force=1',
+          'advanced restarting parameter preserved when adding force parameter';
+    };
+    subtest 'successful restart' => sub {
+        is $driver->get('/tests/99946'), 1, 'go to job 99946';
+        update_last_job_id;
+        $driver->find_element('#restart-result')->click;
+        wait_until(sub { $driver->get_current_url =~ expected_job_id_regex }, 'auto refresh to restarted job');
+        like $driver->find_element('#info_box .card-header')->get_text(),
+          qr/textmode\@32bit/, 'restarted job is correct';
+    };
+};
+
+subtest 'check single job restart in /tests page' => sub {
+    is $driver->get('/tests'), 1, 'get /tests page';
+    wait_for_ajax();
+    subtest 'unable to restart' => sub {
+        my $td = $driver->find_element('#job_99936 td.test');
+        is $td->get_text() =~ s/\s+\d+$//r, 'kde@64bit-uefi', '99936 is kde@64bit-uefi';
+        $driver->find_child_element($td, '.restart', 'css')->click();
+        wait_for_ajax(msg => 'failed job restart');
+        like
+          $driver->find_element('#flash-messages-finished-jobs')->get_text(),
+          qr/Job 99936 misses.*\.iso.*Ensure to provide mandatory assets/s,
+          'restarting job with missing asset results in an error';
+        is $td->get_text() =~ s/\s+\d+$//r, 'kde@64bit-uefi', 'job not marked as restarted';
+        $driver->find_element('#flash-messages-finished-jobs button.force-restart')->click();
+        wait_until(sub { $td->get_text() =~ qr/kde\@64bit-uefi \(restarted\)/ }, 'job is marked as restarted');
+        $_->click for $driver->find_elements('#flash-messages-finished-jobs button.close');
+
+    };
+    subtest 'successful restart' => sub {
+        update_last_job_id;
+        my $td = $driver->find_element('#job_99926 td.test');
+        is $td->get_text() =~ s/\s+\d+$//r, 'minimalx@32bit', '99926 is minimalx@32bit';
+        $driver->find_child_element($td, '.restart', 'css')->click();
+        wait_until(sub { $td->get_text() =~ qr/minimalx\@32bit \(restarted\)/ }, 'job is marked as restarted');
+        like $driver->find_child_element($td, q{./a[@title='new test']}, 'xpath')->get_attribute('href'),
+          expected_job_id_regex, 'restart link is correct';
+
+        # open restart link then verify its test name
+        $driver->find_child_element($td, q{./a[@title='new test']}, 'xpath')->click();
+        like $driver->find_element('#info_box .card-header')->get_text(),
+          qr/minimalx\@32bit/, 'restarted job is correct';
+    };
+};
+
+subtest 'check cluster jobs restart in /tests page' => sub {
+    ok $driver->get('/tests'), 'back on /tests page';
+    wait_for_ajax();
+    my $first_tab = $driver->get_current_window_handle();
+
+    my $check_restarted_tab = sub ($link, $expected_qr, $desc) {
+        my $tab = open_new_tab($link);
+        $driver->switch_to_window($tab);
+        like wait_for_element(selector => '#info_box .card-header')->get_text(), $expected_qr, $desc;
+        $driver->close();
+        $driver->switch_to_window($first_tab);
+    };
+
+    # Check chain jobs restart
+    my $chained_parent = $driver->find_element('#job_99937 td.test');
+    my $chained_child = $driver->find_element('#job_99938 td.test');
+    is $chained_parent->get_text() =~ s/\s+\d+$//r, 'kde@32bit', 'chained parent is kde@32bit';
+    is $chained_child->get_text() =~ s/\s+\d+$//r, 'doc@64bit', 'chained child is doc@64bit';
+
+    # Restart chained parent job
+    update_last_job_id;
+    $driver->find_child_element($chained_parent, '.restart', 'css')->click();
+    wait_for_ajax(msg => 'restart chained parent job');
+
+    # Chained parent and its child should be marked as restarted
+    is $chained_parent->get_text(), 'kde@32bit (restarted)', 'chained parent is marked as restarted';
+    is $chained_child->get_text(), 'doc@64bit (restarted)', 'chained child is marked as restarted';
+
+    # Check if restart links are correct
+    my $parent_restart_link
+      = $driver->find_child_element($chained_parent, q{./a[@title='new test']}, 'xpath')->get_attribute('href');
+    my $child_restart_link
+      = $driver->find_child_element($chained_child, q{./a[@title='new test']}, 'xpath')->get_attribute('href');
+    like $parent_restart_link, expected_job_id_regex(1), 'restart link is correct';
+    like $child_restart_link, expected_job_id_regex(2), 'restart link is correct';
+
+    $check_restarted_tab->($parent_restart_link, qr/kde\@32bit/, 'restarted chained parent is correct');
+    $check_restarted_tab->($child_restart_link, qr/doc\@64bit/, 'restarted chained child is correct');
+    is $driver->get_title(), 'openQA: Test results', 'back to /tests page';
+
+    # Check parallel jobs restart in page 2 of finished jobs
+    $driver->find_element('#results_wrapper [aria-label="Next"]')->click;
+    wait_for_ajax(msg => '2nd page of finished jobs table');
+
+    my $master_node = $driver->find_element('#job_99902 td.test');
+    my $slave_node = $driver->find_element('#job_99903 td.test');
+    my $support_server = $driver->find_element('#job_99901 td.test');
+    is $master_node->get_text() =~ s/\s+\d+$//r, 'master_node@32bit', 'a parallel child is master_node@32bit';
+    is $slave_node->get_text() =~ s/\s+\d+$//r, 'slave_node@32bit', 'a parallel child is slave_node@32bit';
+    is $support_server->get_text() =~ s/\s+\d+$//r, 'support_server@32bit', 'a parallel parent is support_server@32bit';
+
+    # Restart a parallel job
+    update_last_job_id;
+    $driver->find_child_element($master_node, '.restart', 'css')->click();
+    wait_for_ajax(msg => 'restart parallel job');
+
+    # All parallel jobs and their parent job should be marked as restarted
+    is $master_node->get_text(), 'master_node@32bit (restarted)', 'parallel child master_node is marked as restarted';
+    is $slave_node->get_text(), 'slave_node@32bit (restarted)', 'parallel child slave_node is marked as restarted';
+    is
+      $support_server->get_text(),
+      'support_server@32bit (restarted)',
+      'parallel parent support_server is marked as restarted';
+
+    # Check if restart links are correct
+    my $master_node_link
+      = $driver->find_child_element($master_node, q{./a[@title='new test']}, 'xpath')->get_attribute('href');
+    my $slave_node_link
+      = $driver->find_child_element($slave_node, q{./a[@title='new test']}, 'xpath')->get_attribute('href');
+    my $support_server_link
+      = $driver->find_child_element($support_server, q{./a[@title='new test']}, 'xpath')->get_attribute('href');
+    like $master_node_link, expected_job_id_regex(2), 'restart link is correct';
+    like $slave_node_link, expected_job_id_regex(3), 'restart link is correct';
+    like $support_server_link, expected_job_id_regex(1), 'restart link is correct';
+
+    $check_restarted_tab->($master_node_link, qr/master_node\@32bit/, 'restarted parallel child is correct');
+    $check_restarted_tab->($slave_node_link, qr/slave_node\@32bit/, 'restarted parallel child is correct');
+    $check_restarted_tab->($support_server_link, qr/support_server\@32bit/, 'restarted parallel parent is correct');
+    is $driver->get_title(), 'openQA: Test results', 'back to /tests page';
+};
+
+subtest 'check cluster jobs restart in test overview page' => sub {
+    # Refresh /tests page and cancel all 6 restarted jobs in previous tests
+    ok $driver->get('/tests'), 'back on /tests page';
+    wait_for_ajax(msg => 'job tables loaded');
+    my @scheduled_tds = $driver->find_elements('#scheduled td.test');
+    $driver->find_child_element($scheduled_tds[$_], '.cancel', 'css')->click for (0 .. 5);
+
+    # Restart a parent job in test results overview page
+    is $driver->get('/tests/overview?distri=opensuse&version=13.1&build=0091&groupid=1001'),
+      1, 'go to test overview page';
+    update_last_job_id;
+    $driver->find_element('#res_DVD_i586_create_hdd .restart')->click();
+    wait_for_ajax(msg => 'restart parent job in test results overview page');
+
+    subtest 'all related cluster jobs marked as restarted' => sub {
+        my @cluster_jobs = qw(create_hdd support_server master_node slave_node);
+        is $driver->find_element("#res_DVD_i586_$_ .fa-solid.fa-circle")->get_attribute('title'), 'Scheduled',
+          "$_ is restarted"
+          for @cluster_jobs;
+        my $i = 0;
+        like
+          $driver->find_element("#res_DVD_i586_$_ .restarted")->get_attribute('href'),
+          expected_job_id_regex(++$i), "restarted link for $_ is correct"
+          for @cluster_jobs;
+    };
+
+    subtest 'no automatic redirect on restart parent skipping OK children and force restart' => sub {
+        my $cleanup = scope_guard sub {
+            $job_deps->search({parent_job_id => 99900, child_job_id => 99901})->update({dependency => CHAINED});
+            $jobs->search({id => [99900 .. 99903]})->update({clone_id => undef});
+            $jobs->search({id => {'>' => 99981}})->delete;
+        };
+
+        ensure_asset_exists('00099900-openSUSE-13.1-DVD-i586-Build0091-Media.iso');
+        $job_deps->search({parent_job_id => 99900, child_job_id => 99901})->update({dependency => DIRECTLY_CHAINED});
+        $jobs->search({id => [99900 .. 99903]})->update({clone_id => undef});
+        $jobs->search({id => {'>' => 99981}})->delete;
+
+        subtest 'restart parent skipping OK children shows flash notice without redirecting' => sub {
+            is $driver->get('/tests/overview?distri=opensuse&version=13.1&build=0091&groupid=1001'),
+              1, 'refresh test overview page';
+            update_last_job_id;
+            $driver->find_element('#res_DVD_i586_support_server .restart')->click();
+            wait_for_ajax(msg => 'fail to restart job because of directly chained parent');
+            wait_until(sub { flash_messages =~ m/Direct parent 99900 needs to be cloned as well/s },
+                'direct parent error shown', 20);
+            verify_parent_skip_ok_button(click => 1) or return;
+            wait_for_ajax(msg => 'parent job restarted skipping OK children');
+            like $driver->get_current_url, qr{/tests/overview}, 'stays on overview page without automatic redirect';
+            wait_until(sub { flash_messages =~ m/The job has been restarted/s }, 'notice flash message shown');
+            my $clone_id = $jobs->find(99900)->clone_id;
+            like
+              $driver->find_element_by_link_text('new job')->get_attribute('href'),
+              qr{/tests/$clone_id$},
+              'link to new job is correct in flash message';
+            is $driver->find_element('#res_DVD_i586_create_hdd .fa-solid.fa-circle')->get_attribute('title'),
+              'Scheduled',
+              'create_hdd is marked as restarted';
+        };
+
+        subtest 'force restart shows flash notice without redirecting' => sub {
+            $jobs->search({id => [99900 .. 99903]})->update({clone_id => undef});
+
+            is $driver->get('/tests/overview?distri=opensuse&version=13.1&build=0091&groupid=1001'),
+              1, 'refresh test overview page';
+            $driver->find_element('#res_DVD_i586_support_server .restart')->click();
+            wait_for_ajax(msg => 'fail to restart job because of directly chained parent');
+            wait_until(sub { flash_messages =~ m/Direct parent 99900 needs to be cloned as well/s },
+                'direct parent error shown', 20);
+            $driver->find_element('#flash-messages button.force-restart')->click();
+            wait_for_ajax(msg => 'forced job restart in overview page');
+            like $driver->get_current_url, qr{/tests/overview}, 'stays on overview page without automatic redirect';
+            wait_until(sub { flash_messages =~ m/The job has been restarted/s }, 'notice flash message shown');
+            my $clone_id = $jobs->find(99901)->clone_id;
+            like
+              $driver->find_element_by_link_text('new job')->get_attribute('href'),
+              qr{/tests/$clone_id$},
+              'link to new job is correct in flash message';
+            is $driver->find_element('#res_DVD_i586_support_server .fa-solid.fa-circle')->get_attribute('title'),
+              'Scheduled',
+              'support_server is marked as restarted';
+        };
+    };
+};
+
+subtest 'wait_for_element error handling' => sub {
+    throws_ok {
+        wait_for_element(
+            trigger_function => sub { die "simulated error\n" },
+            selector => '#info_box',
+        );
+    }
+    qr/simulated error/, 'wait_for_element re-throws exception from trigger function';
+};
+
+kill_driver();
+done_testing();

@@ -1,0 +1,649 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Test::Warnings qw(:report_warnings warning warnings);
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+use OpenQA::Test::TimeLimit '6';
+use Mojo::Base -signatures;
+use Test::Output qw(combined_like combined_unlike output_from);
+use Test::MockObject;
+use Test::MockModule;
+use OpenQA::Script::CloneJob
+  qw(clone_jobs clone_job_get_job clone_job_apply_settings clone_job_download_assets openqa_baseurl);
+use HTTP::Response;
+use Mojo::JSON qw(decode_json);
+use Mojo::URL;
+use Mojo::File 'tempdir';
+use Mojo::Transaction;
+use Scalar::Util qw(looks_like_number);
+
+package Test::FakeResult {
+    use Mojo::Base -base, -signatures;
+    has is_success => 1;
+    has code => 304;
+    has status_line => 'some status';
+    has json => undef;
+}    # uncoverable statement
+
+my $command_mock = Test::MockModule->new('OpenQA::Command');
+my $retry_tx_count = 0;
+$command_mock->redefine(retry_tx => sub ($self, $client, $tx, $retries) { ++$retry_tx_count; $tx });
+
+my @argv = (
+    qw(WORKER_CLASS=local HDD_1=new.qcow2 HDDSIZEGB=40 FOO=value:with:colon),
+    'WORKER_CLASS:cre:ate+hpc#foo@bar+=-parent'
+);
+my %options = ('parental-inheritance' => '');
+my %child_settings = (
+    NAME => '00000810-sle-15-Installer-DVD-x86_64-Build665.2-hpc_test@64bit',
+    TEST => 'hpc_test',
+    HDD_1 => 'sle-15-x86_64-Build665.2-with-hpc.qcow2',
+    HDDSIZEGB => 20,
+    WORKER_CLASS => 'qemu_x86_64',
+);
+my %parent_settings = (
+    NAME => '00000810-sle-15-Installer-DVD-x86_64-Build665.2-cre:ate+hpc#foo@bar@64bit',
+    TEST => 'cre:ate+hpc#foo@bar',
+    HDD_1 => 'sle-15-x86_64-Build665.2-with-hpc.qcow2',
+    HDDSIZEGB => 20,
+    WORKER_CLASS => 'qemu_x86_64',
+);
+
+subtest 'running command' => sub {
+    my $run = \&OpenQA::Script::CloneJob::_run_cmd;    ## no critic (Variables::ProtectPrivateVars)
+    combined_like {
+        like $run->('does-not-exist'), qr/Failed.*does-not-exist.*No such/i, 'error if command does not exist'
+    }
+    qr/can't exec/i, 'exec error logged';
+    like $run->('false'), qr/false.*exited.*1/i, 'error if command fails';
+    is $run->('true'), '', 'no error if command succeeds';
+
+    subtest 'get URL from command' => sub {
+        my $url_from_cmd = \&OpenQA::Script::CloneJob::_url_from_cmd;    ## no critic (Variables::ProtectPrivateVars)
+        my $res = $url_from_cmd->(echo => qw(-n http://foo/bar));
+        is $res, 'http://foo/bar', 'got URL';
+        is ref $res, 'Mojo::URL', 'URL returned as Mojo::URL ref';
+        combined_like { $res = $url_from_cmd->('does-not-exist') } qr/can't exec/i, 'exec error logged';
+        like $res, qr/Failed.*does-not-exist.*No such/i, 'got error via _url_from_cmd';
+        is ref $res, '', 'error returned as scalar';
+        $res = $url_from_cmd->('false');
+        like $res, qr/false.*exited.*status 1/i, 'got error via _url_from_cmd for non-zero return exit status';
+        is ref $res, '', 'error for non-zero exit status returned as scalar';
+    };
+};
+
+subtest 'getting job' => sub {
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    $clone_mock->redefine(_handle_unexpected_return_code => sub ($tx) { die 'unexpected return code' });
+    $clone_mock->redefine(
+        _get_with_retry => sub ($url_handler, $url, $jobid, $ctx, $options) {
+            return {job => {settings => {}}} if $ctx eq 'job';
+            return {FOO => 'bar'} if $ctx eq 'vars.json of job';
+            die "Unexpected ctx: $ctx";
+        });
+
+    my %fake_params = (host => 'host', from => 'from', apikey => 'key', apisecret => 'secret');
+    my $url_handler = OpenQA::Script::CloneJob::create_url_handler(\%fake_params);
+    $url_handler->{remote_url} = Mojo::URL->new('foo');
+    my $options = {'ignore-missing-assets' => 1, reproduce => 1};
+
+    my $job = clone_job_get_job(42, $url_handler, $options);
+    is_deeply $job, {settings => {}, vars => {FOO => 'bar'}}, 'vars assigned' or always_explain $job;
+    throws_ok { OpenQA::Script::CloneJob::_get_with_retry(undef, undef, undef, 'invalid', undef) }
+    qr/Unexpected ctx: invalid/, 'Mock throws on unexpected ctx';
+};
+
+subtest 'getting job with redacted secrets' => sub {
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    $clone_mock->redefine(
+        _get_with_retry => sub {
+            return {job => {id => 42, settings => {_SECRET_VAR => '[redacted]', NORMAL_VAR => 'visible'}}};
+        });
+    $clone_mock->redefine(_get_vars => sub { {} });
+
+    my $url_handler = {remote_url => Mojo::URL->new('http://remote')};
+    my $options = {'ignore-missing-assets' => 1};
+
+    my @w = warnings { clone_job_get_job(42, $url_handler, $options) };
+    like $w[0], qr/Job 42 has redacted secrets: _SECRET_VAR/,
+      'warning is emitted when settings contain redacted secrets'
+      or diag explain \@w;
+};
+
+subtest 'clone job apply settings tests' => sub {
+    my %test_settings = %child_settings;
+    $test_settings{HDD_1} = 'new.qcow2';
+    $test_settings{HDDSIZEGB} = 40;
+    $test_settings{WORKER_CLASS} = 'local';
+    $test_settings{FOO} = 'value:with:colon';
+    delete $test_settings{NAME};
+    clone_job_apply_settings(\@argv, 1, \%child_settings, \%options);
+    is_deeply \%child_settings, \%test_settings, 'cloned child job with correct global setting and new settings';
+
+    %test_settings = %parent_settings;
+    $test_settings{WORKER_CLASS} = 'local-parent';
+    delete $test_settings{NAME};
+    clone_job_apply_settings(\@argv, 2, \%parent_settings, \%options);
+    is_deeply \%parent_settings, \%test_settings, 'cloned parent job only take global setting';
+
+    subtest 'warning for invalid settings' => sub {
+        like warning { clone_job_apply_settings(['foo'], 1, {}, {}) },
+          qr/no valid setting/, 'no equal sign, lower case';
+        like warning { clone_job_apply_settings(['WORKER_CLASS:foo++=abc'], 1, {}, {}) },
+          qr/no valid setting/, 'multiple plus signs at the end';
+        like warning { clone_job_apply_settings(['WORKER_CLASS:foo-+=abc'], 1, {}, {}) },
+          qr/no valid setting/, 'minus sign at the end';
+        like warning { clone_job_apply_settings(['WORKER_CLASS:+foo=abc'], 1, {}, {}) },
+          qr/no valid setting/, 'plus sign at the beginning';
+        like warning { clone_job_apply_settings(['WORKER_CLASS:-foo=abc'], 1, {}, {}) },
+          qr/no valid setting/, 'minus sign at the beginning';
+    };
+};
+
+subtest '_GROUP and _GROUP_ID override each other' => sub {
+    my %settings = ();
+    clone_job_apply_settings([qw(_GROUP=foo _GROUP_ID=bar)], 0, \%settings, \%options);
+    is_deeply \%settings, {_GROUP_ID => 'bar'}, '_GROUP_ID overrides _GROUP';
+    %settings = ();
+    clone_job_apply_settings([qw(_GROUP_ID=bar _GROUP=foo)], 0, \%settings, \%options);
+    is_deeply \%settings, {_GROUP => 'foo'}, '_GROUP overrides _GROUP_ID';
+};
+
+subtest 'delete empty setting' => sub {
+    my %settings = ();
+    clone_job_apply_settings([qw(ISO_1= ADDONS=)], 0, \%settings, \%options);
+    is_deeply \%settings, {}, 'all empty settings removed';
+};
+
+subtest 'asset download' => sub {
+    my $temp_assetdir = tempdir;
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    my %url_handler = (remote_url => Mojo::URL->new('http://foo'), curl_args => []);
+    my %mirrored;
+    my $fake_download_error = 'fake-failure';
+    my %options = (dir => $temp_assetdir);
+    my $job_id = 1;
+    my @missing_assets;
+    my %job = (
+        id => $job_id,
+        parents => {Chained => [2]},
+        settings => {
+            ISO => 'foo.iso',
+            HDD_1 => 'some.qcow2',
+        },
+        assets => {
+            repo => 'supposed to be skipped',
+            iso => [qw(foo.iso bar.iso)],
+            # HDDs which are not downloaded because generated by (indirect) parent (which is cloned as well)
+            hdd => [qw(some.qcow2 uefi-vars.qcow2 another.qcow2)],
+        },
+        missing_assets => \@missing_assets
+    );
+    $temp_assetdir->child($_)->make_path->chmod(0555) for qw(iso hdd);    # test with unwritable asset folders
+    $clone_mock->redefine(mirror => sub ($url_handler, $from, $dst) { $mirrored{$from} = $dst; $fake_download_error });
+    $clone_mock->redefine(
+        clone_job_get_job => sub ($job_id, $url_handler, $options) {
+            return {id => 2, settings => {}, parents => {Chained => [3, 4]}} if $job_id eq 2;
+            return {id => 3, settings => {PUBLISH_HDD_1 => 'some.qcow2'}} if $job_id eq 3;
+            return {id => 4, settings => {UEFI => 1, PUBLISH_PFLASH_VARS => 'uefi-vars.qcow2'}} if $job_id eq 4;
+            return {id => 5, settings => {UEFI => 0, PUBLISH_PFLASH_VARS => 'uefi-vars.qcow2'}} if $job_id eq 5;
+            fail qq{clone_job_get_job called with unexpected job ID "$job_id"};    # uncoverable statement
+        });
+    my %expected_downloads = (
+        "http://foo/tests/$job_id/asset/iso/foo.iso" => "$temp_assetdir/iso/foo.iso",
+        "http://foo/tests/$job_id/asset/iso/bar.iso" => "$temp_assetdir/iso/bar.iso",
+        "http://foo/tests/$job_id/asset/hdd/another.qcow2" => "$temp_assetdir/hdd/another.qcow2",
+    );
+
+    throws_ok { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) }
+    qr/Cannot write $temp_assetdir/, 'error because folder is not writable';
+
+    # assume an asset download fails
+    $temp_assetdir->child($_)->remove_tree for qw(iso hdd);    # test with missing asset folders (will be created)
+    throws_ok {
+        combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) }
+        qr/downloading foobar/s, 'download logged';
+    }
+    qr|Cloning aborted during asset download:.*fake-failure|, 'error if asset does not exist';
+
+    # assume openQA reports that an asset is missing
+    @missing_assets = ('iso/foo.iso', 'hdd/some.qcow2');
+    throws_ok {
+        combined_unlike { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) }
+        qr|downloading|s, 'download not attempted if openQA reports missing assets';
+    }
+    qr|assets are missing.*iso/foo.iso|s, 'error about missing asset shown';
+    my $e = $@;
+    unlike $e, qr|hdd/some.qcow2|, 'no error about qcow2 image which is generated by parent job';
+
+    my %override_settings = %{$job{settings}};
+    delete $override_settings{ISO};
+    %mirrored = ();
+    lives_ok {
+        combined_unlike { clone_job_download_assets($job_id, \%job, \%url_handler, \%options, \%override_settings) }
+        qr/downloading/s, 'download not attempted when missing iso/foo.iso is cleared by ISO= override';
+    }
+    'no error when missing iso/foo.iso is cleared by ISO= override';
+    is_deeply \%mirrored, {}, 'no assets downloaded when missing asset is cleared by ISO= override';
+
+    $options{'skip-deps'} = 1;
+    throws_ok {
+        combined_unlike { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) }
+        qr|downloading|s, 'download not attempted if openQA reports missing assets with --skip-deps';
+    }
+    qr|assets are missing.*iso/foo.iso.*hdd/some.qcow2|s, 'error about missing qcow2 with --skip-deps';
+
+    $override_settings{ISO} = 'bar.iso';
+    throws_ok {
+        combined_unlike { clone_job_download_assets($job_id, \%job, \%url_handler, \%options, \%override_settings) }
+        qr|downloading|s, 'download not attempted if openQA reports missing assets with --skip-deps and ISO override';
+    }
+    qr|assets are missing.*hdd/some.qcow2|s,
+      'missing hdd/some.qcow2 still referenced continues to die with --skip-deps and ISO override';
+    $e = $@;
+    unlike $e, qr|iso/foo.iso|, 'no error for foo.iso when missing asset is overridden with ISO=bar.iso';
+
+    $options{'skip-deps'} = 0;
+    $options{'ignore-missing-assets'} = 1;
+    $job{settings} = {
+        ISO => 'foo.iso',
+        ISO_2 => 'bar.iso',
+        HDD_1 => 'some.qcow2',
+        HDD_2 => 'uefi-vars.qcow2',
+        HDD_3 => 'another.qcow2',
+    };
+    combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) }
+    qr/Cloning aborted during asset download:.*fake-failure/s, 'download error logged but ignored';
+
+    %mirrored = ();
+    combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) }
+    qr{downloading.*http://.*foo.iso.*to.*foo.iso.*downloading.*http://.*bar.iso.*to.*bar.iso}s, 'download logged';
+    is_deeply \%mirrored, \%expected_downloads,
+      'assets downloadeded except HDDs which are generated by parent job anyways'
+      or always_explain \%mirrored;
+    ok -f "$temp_assetdir/iso/foo.iso", 'foo touched';
+    ok -f "$temp_assetdir/iso/bar.iso", 'foo touched';
+
+    %mirrored = ();
+    # assets are always referenced by asset-typed settings (see register_assets_from_settings)
+    $job{settings} = {
+        ISO_1 => 'foo.iso',
+        ISO_2 => 'bar.iso',
+        HDD_1 => 'another.qcow2',
+        HDD_2 => 'some.qcow2',
+        HDD_3 => 'uefi-vars.qcow2',
+    };
+    $options{'skip-deps'} = 1;
+    $expected_downloads{"http://foo/tests/$job_id/asset/hdd/some.qcow2"} = "$temp_assetdir/hdd/some.qcow2";
+    $expected_downloads{"http://foo/tests/$job_id/asset/hdd/uefi-vars.qcow2"} = "$temp_assetdir/hdd/uefi-vars.qcow2";
+    combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) } qr/downloading/,
+      'downloading logged (1)';
+    is_deeply \%mirrored, \%expected_downloads,
+      'assets downloadeded including HDDs because we skip cloning the parent job'
+      or always_explain \%mirrored;
+
+    %mirrored = ();
+    $job{parents} = {Chained => [3, 5]};
+    delete $expected_downloads{"http://foo/tests/$job_id/asset/hdd/uefi-vars.qcow2"};
+    combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options) } qr/downloading/,
+      'downloading logged (2)';
+    is_deeply \%mirrored, \%expected_downloads,
+      'assets downloadeded except uefi-vars because no parent produces it anyways'
+      or always_explain \%mirrored;
+
+    %mirrored = ();
+    my %new_settings = %{$job{settings}};
+    delete $new_settings{ISO_1};    # assume overridden by command line `ISO_1=`
+    delete $expected_downloads{"http://foo/tests/$job_id/asset/iso/foo.iso"};
+    combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options, \%new_settings) }
+    qr/downloading/, 'downloading logged with overridden settings';
+    is_deeply \%mirrored, \%expected_downloads, 'foo.iso skipped because ISO_1 setting was removed'
+      or always_explain \%mirrored;
+
+    %mirrored = ();
+    delete $new_settings{ISO_2};    # asset setting removed …
+    $new_settings{UNRELATED} = 'bar.iso';    # … but an unrelated setting mentions the same file
+    delete $expected_downloads{"http://foo/tests/$job_id/asset/iso/bar.iso"};
+    combined_like { clone_job_download_assets($job_id, \%job, \%url_handler, \%options, \%new_settings) }
+    qr/downloading/, 'downloading logged with unrelated setting mentioning removed asset';
+    is_deeply \%mirrored, \%expected_downloads,
+      'bar.iso skipped: unrelated non-asset setting mentioning the file does not keep the download'
+      or always_explain \%mirrored;
+};
+
+subtest 'get 2 nodes HA cluster with get_deps' => sub {
+    my %node1_settings = (
+        NAME => '00007936-sle-15-SP3-Online-x86_64-Build67.1-sles4sap_hana_node01@64bit-sap',
+        TEST => 'sles4sap_hana_node01',
+        HDD_1 => 'SLE-15-SP3-x86_64-Build67.1-sles4sap-gnome.qcow2',
+        HDDSIZEGB => 60,
+        PARALLEL_WITH => 'sles4sap_hana_supportserver@64bit-2gbram',
+        NICTYPE => 'tap',
+        WORKER_CLASS => 'tap,qemu_x86_64',
+    );
+    my %node2_settings = (
+        NAME => '00007935-sle-15-SP3-Online-x86_64-Build67.1-sles4sap_hana_node02@64bit-sap',
+        TEST => 'sles4sap_hana_node02',
+        HDD_1 => 'SLE-15-SP3-x86_64-Build67.1-sles4sap-gnome.qcow2',
+        HDDSIZEGB => 60,
+        PARALLEL_WITH => 'sles4sap_hana_supportserver@64bit-2gbram',
+        NICTYPE => 'tap',
+        WORKER_CLASS => 'tap,qemu_x86_64',
+    );
+    my %supportserver_settings = (
+        NAME => '00007934-sle-15-SP3-Online-x86_64-Build67.1-sles4sap_hana_supportserver@64bit-2gbram',
+        TEST => 'sles4sap_hana_supportserver',
+        HDD_1 => 'openqa_support_server_sles12sp3.x86_64.qcow2',
+        HDDSIZEGB => 60,
+        NICTYPE => 'tap',
+        WORKER_CLASS => 'tap,qemu_x86_64',
+    );
+    my %node1_job = (
+        settings => \%node1_settings,
+        id => 7936,
+        parents => {
+            Parallel => [7934],
+        },
+    );
+    my %node2_job = (
+        settings => \%node2_settings,
+        id => 7935,
+        parents => {
+            Parallel => [7934],
+        },
+    );
+    my %supportserver_job = (
+        settings => \%supportserver_settings,
+        id => 7934,
+        children => {
+            Parallel => [7935, 7936],
+        },
+    );
+    my ($chained, $directly_chained, $parallel) = OpenQA::Script::CloneJob::get_deps(\%supportserver_job, 'children');
+    is_deeply $parallel, [7935, 7936], 'getting children nodes jobid from supportserver';
+    ($chained, $directly_chained, $parallel) = OpenQA::Script::CloneJob::get_deps(\%node1_job, 'parents');
+    is_deeply $parallel, [7934], 'getting supportserver jobid from node1';
+    ($chained, $directly_chained, $parallel) = OpenQA::Script::CloneJob::get_deps(\%node2_job, 'parents');
+    is_deeply $parallel, [7934], 'getting supportserver jobid from node2';
+};
+
+subtest 'error handling' => sub {
+    my $tx = Mojo::Transaction->new;
+    my %url_handler = (local_url => Mojo::URL->new('https://base-url/foo/bar'));
+    my $test = sub { OpenQA::Script::CloneJob::handle_tx($tx, \%url_handler, {}, {42 => {name => 'testjob'}}) };
+    throws_ok { $test->() } qr/Failed to create job, empty response/, 'empty response handled';
+    $tx->res->body('foobar');
+    throws_ok { $test->() } qr/Failed to create job, server replied: "foobar"/, 'unexpected non-JSON handled';
+    $tx->res->code(200)->body('{"foo": "bar"}');
+    throws_ok { $test->() } qr/Failed to create job, server replied: \{ foo => "bar" \}/, 'unexpected JSON handled';
+    ($tx = Mojo::Transaction->new)->res->code(200)->body('{"ids": {"42": 43}}');
+    combined_like { $test->() } qr|1 job has been created:.* - testjob -> https://base-url/tests/43|s,
+      'expected response';
+};
+
+subtest 'export command' => sub {
+    my %job_settings = (param => 'baz');
+    my %options = (host => 'foo', from => 'bar', map { $_ => 1 } qw(apikey apisecret skip-download export-command));
+    my $expected_params = "'CLONED_FROM:42=https://bar/tests/42' 'is_clone_job=1' 'param:42=baz'";
+    my $expected_cmd = qr{openqa-cli api --host 'https://foo' -X POST jobs $expected_params};
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    $clone_mock->redefine(clone_job_get_job => sub ($job_id, @args) { {id => $job_id, settings => \%job_settings} });
+    combined_like { clone_jobs(42, \%options) } $expected_cmd, 'openqa-cli command printed';
+};
+
+subtest 'cloning with repeat count' => sub {
+    my $ua_mock = Test::MockModule->new('Mojo::UserAgent');
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    my @post_args;
+    my $tx_handled = 0;
+    $ua_mock->redefine(
+        build_tx => sub ($ua, $method, @args) {
+            is $method, 'POST', 'post tx created';
+            push @post_args, [@args];
+            return $ua_mock->original('build_tx')->($ua, $method, @args);
+        });
+    $clone_mock->redefine(handle_tx => sub ($tx, $url_handler, $options, $jobs) { $tx_handled = 1 });
+    my %fake_jobs = (42 => {id => 42, name => 'myjob', settings => {TEST => 'myjob'}});
+    $clone_mock->redefine(clone_job_get_job => sub ($job_id, @args) { $fake_jobs{$job_id} });
+    my %options = (host => 'foo', from => 'bar', repeat => 100, apikey => 'bar', apisecret => 'bar');
+    $retry_tx_count = 0;
+    clone_jobs(42, \%options);
+    is $options{repeat}, undef, 'repeat count has been removed from options';
+    subtest 'post args' => sub {
+        is scalar @post_args, 100, 'exactly 100 post transactions created';
+        is $retry_tx_count, 100, 'exactly 100 transactions attempted';
+        # check Nth test name ends with -N
+        is $post_args[0]->[2]->{'TEST:42'}, 'myjob-001', 'first index has been appended to test name';
+        is $post_args[41]->[2]->{'TEST:42'}, 'myjob-042', 'random index has been appended to test name';
+        is $post_args[99]->[2]->{'TEST:42'}, 'myjob-100', 'last index has been appended to test name';
+    } or always_explain \@post_args;
+};
+
+subtest 'cloning with --reproduce flag' => sub {
+    my $ua_mock = Test::MockModule->new('Mojo::UserAgent');
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    my @post_args;
+    $ua_mock->redefine(build_tx => sub { push @post_args, [@_] });
+    $clone_mock->redefine(handle_tx => undef);
+    my %fake_vars;
+    my %fake_jobs = (42 => {id => 42, name => 'reproducer', settings => {TEST => 'reproducer'}, vars => \%fake_vars});
+    $clone_mock->redefine(clone_job_get_job => sub ($job_id, @args) { $fake_jobs{$job_id} });
+    my %options = (host => 'foo', from => 'bar', reproduce => 1, apikey => 'bar', apisecret => 'bar');
+    throws_ok { clone_jobs(42, \%options) } qr/unable to preserve CASEDIR.*lacks TEST_GIT_URL/,
+      'error if original job lacks variable';
+    %fake_vars = (
+        TEST_GIT_URL => 'https://…/os-autoinst-distri-opensuse.git',
+        TEST_GIT_HASH => '53df78e',
+        NEEDLES_GIT_URL => 'https://…/os-autoinst-needles-opensuse.git',
+        NEEDLES_GIT_HASH => 'c5a50cf',
+    );
+    clone_jobs(42, \%options);
+    subtest 'job posted with settings to use revision of original job' => sub {
+        is ref(my $settings = $post_args[0]->[4]), 'HASH', 'settings present' or return;
+        is $settings->{'TEST:42'}, 'reproducer', 'TEST';
+        is $settings->{'CASEDIR:42'}, 'https://…/os-autoinst-distri-opensuse.git', 'CASEDIR';
+        is $settings->{'TEST_GIT_REFSPEC:42'}, '53df78e', 'TEST_GIT_REFSPEC';
+        is $settings->{'NEEDLES_DIR:42'}, 'https://…/os-autoinst-needles-opensuse.git', 'NEEDLES_DIR';
+        is $settings->{'NEEDLES_GIT_REFSPEC:42'}, 'c5a50cf', 'NEEDLES_GIT_REFSPEC';
+    } or always_explain \@post_args;
+};
+
+subtest 'overall cloning with parallel and chained dependencies' => sub {
+    # do not actually post any jobs, assume jobs can be cloned (clone ID = original ID + 100)
+    my $ua_mock = Test::MockModule->new('Mojo::UserAgent');
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    my @post_args;
+    my $tx_handled = 0;
+    $ua_mock->redefine(build_tx => sub { push @post_args, [@_] });
+    $clone_mock->redefine(handle_tx => sub ($tx, $url_handler, $options, $jobs) { $tx_handled = 1 });
+
+    # fake the jobs to be cloned
+    my %fake_jobs = (
+        41 => {id => 41, name => 'parent', settings => {TEST => 'parent'}, children => {Parallel => [42]}},
+        42 => {
+            id => 42,
+            name => 'main',
+            settings => {TEST => 'main', group_id => 21},
+            parents => {Parallel => [41]},
+            children => {Chained => [43]}
+        },
+        43 => {id => 43, name => 'child', settings => {TEST => 'child'}, parents => {Chained => [42]}},
+    );
+    $clone_mock->redefine(clone_job_get_job => sub ($job_id, @args) { $fake_jobs{$job_id} });
+
+    my %options
+      = (host => 'foo', from => 'bar', 'clone-children' => 1, 'skip-download' => 1, verbose => 1, args => ['FOO=bar']);
+
+
+    my $check_common_post_args = sub ($test_suffix = '') {
+        is scalar @post_args, 1, 'exactly one post call made' or return undef;
+        my $params = $post_args[0]->[4] // {};
+        is delete $params->{is_clone_job}, 1, 'is_clone_job-flag set';
+        is delete $params->{'TEST:41'}, "parent$test_suffix", 'parent job 41 cloned';
+        is delete $params->{'TEST:42'}, "main$test_suffix", 'main job 42 cloned';
+        is delete $params->{'_PARALLEL:42'}, '41', 'main job cloned to start parallel with parent job 41';
+        is delete $params->{'group_id:42'}, 21, 'group of 42 preserved';
+        return $params;
+    };
+    subtest 'post args with no API key' => sub {
+        @post_args = ();
+        $options{apikey} = $options{apisecret} = 'bar';
+        combined_like { clone_jobs(42, \%options) } qr|parent.*main.*child|s, 'clone without API key';
+        ok $tx_handled, 'transaction handled';
+        my $params = $check_common_post_args->() or return;
+        is delete $params->{'FOO:42'}, 'bar', 'setting passed to main job';
+        is delete $params->{'TEST:43'}, 'child', 'child job 43 cloned';
+        is delete $params->{'FOO:43'}, 'bar', 'setting passed to child job';
+        is delete $params->{'_START_AFTER:43'}, '42', 'child job cloned to start after main job 42';
+        is delete $params->{"CLONED_FROM:$_"}, "https://bar/tests/$_", "CLONED_FROM set ($_)" for 41, 42, 43;
+        is scalar keys %$params, 0, 'exactly 3 jobs posted, so no further settings';
+    } or always_explain \@post_args;
+    subtest 'post args' => sub {
+        @post_args = ();
+        $options{apikey} = $options{apisecret} = 'bar';
+        combined_like { clone_jobs(42, \%options) } qr|parent.*main.*child|s, 'verbose output printed - with API key';
+        ok $tx_handled, 'transaction handled';
+        my $params = $check_common_post_args->() or return;
+        is delete $params->{'FOO:42'}, 'bar', 'setting passed to main job';
+        is delete $params->{'TEST:43'}, 'child', 'child job 43 cloned';
+        is delete $params->{'FOO:43'}, 'bar', 'setting passed to child job';
+        is delete $params->{'_START_AFTER:43'}, '42', 'child job cloned to start after main job 42';
+        is delete $params->{"CLONED_FROM:$_"}, "https://bar/tests/$_", "CLONED_FROM set ($_)" for 41, 42, 43;
+        is scalar keys %$params, 0, 'exactly 3 jobs posted, so no further settings';
+    } or always_explain \@post_args;
+
+    subtest 'clone with parential inheritance' => sub {
+        @post_args = ();
+        $options{'clone-children'} = undef;
+        $options{'parental-inheritance'} = 1;
+        combined_like { clone_jobs(42, \%options) } qr/cloning/i, 'output logged';
+        subtest 'post args' => sub {
+            my $params = $check_common_post_args->() or return;
+            is delete $params->{'FOO:41'}, 'bar', 'setting passed to parent job';
+            is delete $params->{'FOO:42'}, 'bar', 'setting passed to main job';
+            is delete $params->{"CLONED_FROM:$_"}, "https://bar/tests/$_", "CLONED_FROM set ($_)" for 41, 42;
+            is scalar keys %$params, 0, 'exactly 2 jobs posted, so no further settings';
+        } or always_explain \@post_args;
+    };
+
+    subtest 'clone only parallel children, enable json output' => sub {
+        # invoke handle_tx with fake data
+        $clone_mock->redefine(
+            handle_tx => sub ($orig_tx, $url_handler, $options, $jobs) {
+                my $res = Test::MockObject->new->set_always(json => {ids => {1 => 2}});
+                my $tx = Test::MockObject->new->set_false('error')->set_always(res => $res);
+                $clone_mock->original('handle_tx')->($tx, $url_handler, \%options, {1 => {name => 'testjob'}});
+            });
+
+        @post_args = ();
+        $fake_jobs{41}->{children}->{Chained} = [7];
+        $options{'parental-inheritance'} = undef;
+        local $options{'json-output'} = 1;
+        push @{$options{args}}, 'TEST+=:suffix';
+        my ($stdout, $stderr) = output_from { clone_jobs(41, \%options) };
+        my $json_output = decode_json $stdout;
+        unlike $stderr, qr/cloning/i, 'no extra logs end up in stderr';
+        is_deeply $json_output, {1 => 2}, 'fake response printed as JSON' or always_explain $json_output;
+        subtest 'post args' => sub {
+            my $params = $check_common_post_args->(':suffix') or return;
+            is delete $params->{'FOO:41'}, 'bar', 'setting passed to main job';
+            is delete $params->{'FOO:42'}, 'bar', 'setting passed to child job';
+            is delete $params->{"CLONED_FROM:$_"}, "https://bar/tests/$_", "CLONED_FROM set ($_)" for 41, 42;
+            is scalar keys %$params, 0, 'exactly 2 jobs posted, so no further settings';
+        } or always_explain \@post_args;
+    };
+
+    subtest 'skip-deps affects only parents' => sub {
+        @post_args = ();
+
+        local $options{'clone-children'} = 1;
+        local $options{'skip-deps'} = 1;
+
+        my ($stdout, $stderr) = output_from { clone_jobs(42, \%options) };
+        like $stdout, qr/1 job has been created/, 'Normal output on stdout';
+        like $stderr, qr/cloning/i, 'Extra output on stderr';
+        subtest 'post args' => sub {
+            my $params = $post_args[0]->[4] // {};
+            is $params->{'CLONED_FROM:42'}, 'https://bar/tests/42', 'main job has been cloned';
+            is $params->{'CLONED_FROM:43'}, 'https://bar/tests/43', 'child job has been clones';
+            is $params->{'_START_AFTER:43'}, '42', 'child job cloned to start after main job 42';
+            ok !$params->{'CLONED_FROM:41'}, 'parent job has not been cloned';
+        } or always_explain \@post_args;
+    };
+
+    subtest 'skip-chained-deps affects only parents' => sub {
+        @post_args = ();
+
+        # Replace parallel parent job with chained one for this test
+        local $fake_jobs{41}
+          = {id => 41, name => 'parent', settings => {TEST => 'parent'}, children => {Chained => [42]}};
+        local $fake_jobs{42} = {
+            id => 42,
+            name => 'main',
+            settings => {TEST => 'main', group_id => 21},
+            parents => {Chained => [41]},
+            children => {Chained => [43]}};
+
+        local $options{'clone-children'} = 1;
+        local $options{'skip-chained-deps'} = 1;
+
+        combined_like { clone_jobs(42, \%options) } qr/cloning/i, 'output logged';
+        subtest 'post args' => sub {
+            my $params = $post_args[0]->[4] // {};
+            is $params->{'CLONED_FROM:42'}, 'https://bar/tests/42', 'main job has been cloned';
+            is $params->{'CLONED_FROM:43'}, 'https://bar/tests/43', 'child job has been clones';
+            ok !$params->{'CLONED_FROM:41'}, 'parent job has not been cloned';
+        } or always_explain \@post_args;
+    };
+};
+
+subtest 'invoking curl passing auth headers' => sub {
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    my @invoked_cmds;
+    my $record_cmd = sub (@args) {
+        push @invoked_cmds, [map { m/(.*hash:|.*time:)/i ? "$1 ?" : "$_" } @args];
+    };
+    $clone_mock->redefine(_run_cmd => sub (@args) { $record_cmd->(@args); '' });
+    $clone_mock->redefine(_url_from_cmd => sub (@args) { $record_cmd->(@args); Mojo::URL->new('redirected-url') });
+    note 'config path: ' . ($ENV{OPENQA_CONFIG} = "$FindBin::Bin/data");
+
+    my $args = OpenQA::Script::CloneJob::make_curl_arguments({retry => 5});
+    my @expected_default_args = qw(--retry 5 --retry-connrefused --no-progress-meter);
+    is_deeply $args, \@expected_default_args, 'default arguments correct';
+    my $secrets = OpenQA::Script::CloneJob::read_secrets('testapi');
+    is_deeply $secrets, [qw(PERCIVALKEY02 PERCIVALSECRET02)], 'key and secret as expected for host "testapi"';
+
+    my %url_handler = (curl_args => $args, secrets => $secrets);
+    my $error = OpenQA::Script::CloneJob::mirror(\%url_handler, Mojo::URL->new('url'), 'path');
+    push @expected_default_args, map { -H => $_ } ('X-API-Hash: ?', 'X-API-Key: PERCIVALKEY02', 'X-API-Microtime: ?');
+    my @expected_cmds = (
+        [curl => @expected_default_args, qw(--silent --location --head --output /dev/null -w %{url_effective} url)],
+        [curl => @expected_default_args, qw(--continue-at - --output path redirected-url)],
+    );
+    is $error, '', 'no error returned';
+    is_deeply \@invoked_cmds, \@expected_cmds, 'invoked expected commands' or always_explain \@invoked_cmds;
+};
+
+subtest 'determining base URL' => sub {
+    is openqa_baseurl(Mojo::URL->new('http://foo:80/bar')), 'http://foo', 'default http port removed';
+    is openqa_baseurl(Mojo::URL->new('https://foo:443/bar')), 'https://foo', 'default https port removed';
+    is openqa_baseurl(Mojo::URL->new('http://foo:9526/bar')), 'http://foo:9526', 'custom port preserved';
+};
+
+subtest 'badge output' => sub {
+    my $clone_mock = Test::MockModule->new('OpenQA::Script::CloneJob');
+    $clone_mock->unmock_all;
+    my $res = Test::MockObject->new->set_always(json => {ids => {42 => 43}});
+    my $tx = Test::MockObject->new->set_false('error')->set_always(res => $res);
+    my %url_handler = (local_url => Mojo::URL->new('https://base-url/foo/bar'));
+    my $options = {badge => 1};
+    my $jobs = {42 => {name => 'testjob'}};
+    combined_like { OpenQA::Script::CloneJob::handle_tx($tx, \%url_handler, $options, $jobs) }
+    qr|^\* \[!\[testjob\]\(https://base-url/tests/43/badge\?label=testjob\)\]\(https://base-url/tests/43\)$|m,
+      'badge output format';
+};
+
+done_testing();

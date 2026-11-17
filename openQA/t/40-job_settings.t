@@ -1,0 +1,194 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Test::Warnings ':report_warnings';
+use Mojo::Base -signatures;
+use Test::MockObject;
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+use OpenQA::App;
+use OpenQA::JobSettings;
+use OpenQA::Test::TimeLimit '3';
+
+my $settings = {
+    BUILD_SDK => '%BUILD_HA%',
+    BETA => 1,
+    ISO_MAXSIZE => '4700372992',
+    SHUTDOWN_NEEDS_AUTH => 1,
+    HDD_1 => 'SLES-%VERSION%-%ARCH%-%BUILD%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed.qcow2',
+    PUBLISH_HDD_1 => 'SLES-%VERSION%-%ARCH%-%BUILD%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed.qcow2',
+    ANOTHER_JOB => 'SLES-%VERSION%-%ARCH%-%BUILD%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed.qcow2',
+    ARCH => 'x86_64',
+    BACKEND => 'qemu',
+    BUILD => '1234',
+    BUILD_SLE => '%BUILD%',
+    MACHINE => '64bit',
+    PATCH => 1,
+    UPGRADE => 1,
+    ISO => 'SLE-%VERSION%-%FLAVOR%-%MACHINE%-Build%BUILD%-Media1.iso',
+    WORKER_CLASS => 'qemu_x86_64',
+    VERSION => '15-SP1',
+    FLAVOR => 'Installer-DVD',
+    ADDONURL_SDK => 'ftp://openqa.suse.de/SLE-%VERSION%-SDK-POOL-%ARCH%-Build%BUILD_SDK%-Media1/',
+    DEPENDENCY_RESOLVER_FLAG => 1,
+    DESKTOP => 'textmode',
+    DEV_IMAGE => 1,
+    HDDSIZEGB => 50,
+    INSTALLONLY => 1,
+    PATTERNS => 'base,minimal',
+    PUBLISH_PFLASH_VARS =>
+      'SLES-%VERSION%-%ARCH%-%BUILD%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed-uefi-vars.qcow2',
+    SEPARATE_HOME => 0,
+    BUILD_HA => '%BUILD%',
+    BUILD_SES => '%BUILD%',
+    WORKAROUND_MODULES => 'base,desktop,serverapp,script,sdk',
+    CASEDIR => 'foo',
+    # %%CASEDIR%% will be preserved as %CASEDIR%, most simple case of escaping
+    # %%%%CASEDIR%%% will be preserved, number of surrounding % preserved except for outermost pair
+    # %CASEDIR% will still be substituted, despite other escaped occurrences in same value
+    NEEDLES_DIR => '%%CASEDIR%%/bar/%%%%CASEDIR%%%/%CASEDIR%',
+    ENCODED_URL => 'https://example.org/url%20with%20spaces%20unchanged',
+};
+
+subtest expand_placeholders => sub {
+    my ($error) = OpenQA::JobSettings::expand_placeholders($settings);
+    my $match_settings = {
+        BUILD_SDK => '1234',
+        BETA => 1,
+        ISO_MAXSIZE => '4700372992',
+        SHUTDOWN_NEEDS_AUTH => 1,
+        HDD_1 => 'SLES-15-SP1-x86_64-1234@64bit-minimal_with_sdk1234_installed.qcow2',
+        PUBLISH_HDD_1 => 'SLES-15-SP1-x86_64-1234@64bit-minimal_with_sdk1234_installed.qcow2',
+        ANOTHER_JOB => 'SLES-15-SP1-x86_64-1234@64bit-minimal_with_sdk1234_installed.qcow2',
+        ARCH => 'x86_64',
+        BACKEND => 'qemu',
+        BUILD => '1234',
+        BUILD_SLE => '1234',
+        MACHINE => '64bit',
+        PATCH => 1,
+        UPGRADE => 1,
+        ISO => 'SLE-15-SP1-Installer-DVD-64bit-Build1234-Media1.iso',
+        WORKER_CLASS => 'qemu_x86_64',
+        VERSION => '15-SP1',
+        FLAVOR => 'Installer-DVD',
+        ADDONURL_SDK => 'ftp://openqa.suse.de/SLE-15-SP1-SDK-POOL-x86_64-Build1234-Media1/',
+        DEPENDENCY_RESOLVER_FLAG => 1,
+        DESKTOP => 'textmode',
+        DEV_IMAGE => 1,
+        HDDSIZEGB => 50,
+        INSTALLONLY => 1,
+        PATTERNS => 'base,minimal',
+        PUBLISH_PFLASH_VARS => 'SLES-15-SP1-x86_64-1234@64bit-minimal_with_sdk1234_installed-uefi-vars.qcow2',
+        SEPARATE_HOME => 0,
+        BUILD_HA => '1234',
+        BUILD_SES => '1234',
+        WORKAROUND_MODULES => 'base,desktop,serverapp,script,sdk',
+        CASEDIR => 'foo',
+        NEEDLES_DIR => '%CASEDIR%/bar/%%%CASEDIR%%/foo',
+        ENCODED_URL => 'https://example.org/url%20with%20spaces%20unchanged',
+    };
+    is $error, undef, 'no error returned';
+    is_deeply $settings, $match_settings, 'Settings replaced';
+};
+
+subtest circular_reference => sub {
+    my $circular_settings = {
+        BUILD_SDK => '%BUILD_HA%',
+        ISO_MAXSIZE => '4700372992',
+        HDD_1 => 'SLES-%VERSION%-%ARCH%-%BUILD_HA%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed.qcow2',
+        PUBLISH_HDD_1 => 'SLES-%VERSION%-%ARCH%-%BUILD_HA%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed.qcow2',
+        ANOTHER_JOB => 'SLES-%VERSION%-%ARCH%-%BUILD_HA%@%MACHINE%-minimal_with_sdk%BUILD_SDK%_installed.qcow2',
+        ARCH => 'x86_64',
+        BACKEND => 'qemu',
+        BUILD => '%BUILD_HA%',
+        BUILD_HA => '%BUILD%',
+        VERSION => '15-SP1',
+        MACHINE => '64bit',
+    };
+    my ($circular_error) = OpenQA::JobSettings::expand_placeholders($circular_settings);
+    like
+      $circular_error,
+      qr/The key (\w+) contains a circular reference, its value is %\w+%/,
+      'circular reference exit successfully';
+};
+
+subtest 'handle_plus_in_settings' => sub {
+    my $settings = {
+        'ISO' => 'foo.iso',
+        '+ISO' => 'bar.iso',
+        '+ARCH' => 'x86_64',
+        'DISTRI' => 'opensuse',
+    };
+    OpenQA::JobSettings::handle_plus_in_settings($settings);
+    is_deeply $settings, {ISO => 'bar.iso', ARCH => 'x86_64', DISTRI => 'opensuse'}, 'handle the plus correctly';
+};
+
+subtest 'two-pass variable expansion' => sub {
+    my %settings = (FOO => 'http://%BAR%/', NEEDLES_DIR => '%%CASEDIR%%/needles');
+
+    my ($web_ui_error) = OpenQA::JobSettings::expand_placeholders(\%settings);
+    is $web_ui_error, undef, 'web UI pass of expand_placeholders';
+    is $settings{FOO}, 'http://%BAR%/', 'placeholder referring to non-existing key not removed during web UI pass';
+    is $settings{NEEDLES_DIR}, '%CASEDIR%/needles', 'one level of %-signs stripped during web UI pass';
+
+    my ($worker_error) = OpenQA::JobSettings::expand_placeholders(\%settings, 0);
+    is $worker_error, undef, 'worker pass of expand_placeholders';
+    is $settings{FOO}, 'http:///', 'placeholder referring to non-existing key finally removed by worker';
+    is $settings{NEEDLES_DIR}, '%CASEDIR%/needles',
+      '%CASEDIR% preserved during worker pass, handled instead by _engine_workit_step_2';
+};
+
+subtest 'unexpanded variables' => sub {
+    my %settings = (URL => 'http://%MIRROR%/repo/%VERSION%', VERSION => '15-SP1');
+    my ($error, $unexpanded) = OpenQA::JobSettings::expand_placeholders(\%settings);
+    is $error, undef, 'no error';
+    is_deeply $unexpanded, ['MIRROR'], 'MIRROR detected as unexpanded';
+};
+
+sub mock_setting ($key, $val) { Test::MockObject->new->set_always(key => $key)->set_always(value => $val) }
+
+subtest 'generate_settings with global test settings' => sub {
+    my $mock_app = Test::MockObject->new->set_always(
+        config => {
+            test_settings => {
+                pretty_serial_marker => '1',
+                worker_class => 'global_worker',
+                test_setting_var => 'global_val',
+                '+overridden_var' => 'global_plus',
+                overridden_by_plus => 'global_normal',
+            }});
+    my $orig_app = OpenQA::App->singleton;
+    OpenQA::App->set_singleton($mock_app);
+    my $mock_product = Test::MockObject->new->set_list(
+        settings => (
+            mock_setting('PRODUCT_VAR', 'prod_val'),
+            mock_setting('OVERRIDDEN_VAR', 'prod_overwrites_global'),
+            mock_setting('WORKER_CLASS', 'product_worker'),
+            mock_setting('+OVERRIDDEN_BY_PLUS', 'prod_plus_overwrites_global_normal'),
+        ));
+    my $params = {
+        settings => {},
+        product => $mock_product,
+        input_args => {
+            input_var => 'input_val',
+        }};
+    my $error = OpenQA::JobSettings::generate_settings($params);
+    is $error, undef, 'no error during generate_settings';
+    my $expected_settings = {
+        PRETTY_SERIAL_MARKER => '1',
+        WORKER_CLASS => 'global_worker,product_worker',
+        TEST_SETTING_VAR => 'global_val',
+        OVERRIDDEN_VAR => 'global_plus',
+        OVERRIDDEN_BY_PLUS => 'prod_plus_overwrites_global_normal',
+        PRODUCT_VAR => 'prod_val',
+        INPUT_VAR => 'input_val',
+    };
+    is_deeply $params->{settings}, $expected_settings,
+'generate_settings correctly applies lowest-precedence global test settings, respects +, and combines WORKER_CLASS';
+    OpenQA::App->set_singleton($orig_app);
+};
+
+done_testing;

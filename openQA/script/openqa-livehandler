@@ -1,0 +1,20 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Mojo::Base -strict;
+
+use FindBin;
+use lib "$FindBin::RealBin/../lib";
+
+use OpenQA::LiveHandler;
+use OpenQA::Utils qw(set_listen_address fix_top_level_help);
+
+fix_top_level_help;
+
+# ensure the web socket connection won't timeout
+$ENV{MOJO_INACTIVITY_TIMEOUT} ||= 15 * 60;
+
+set_listen_address('livehandler');
+OpenQA::LiveHandler::run;

@@ -1,0 +1,358 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::WebAPI::Controller::Main;
+use Mojo::Base 'Mojolicious::Controller', -signatures;
+use Feature::Compat::Try;
+
+use Date::Format;
+use Mojo::File qw(path);
+use Mojo::Util qw(trim);
+use Time::Seconds;
+use List::Util qw(any);
+use OpenQA::Constants qw(BUILD_SORT_BY_NAME BUILD_SORT_BY_NEWEST_JOB BUILD_SORT_BY_OLDEST_JOB);
+use OpenQA::Jobs::Constants;
+use OpenQA::Schema::Result::Jobs;
+use OpenQA::BuildResults;
+use OpenQA::Utils;
+
+use constant OPENQA_WEBUI_OVERVIEW_INACTIVITY_TIMEOUT => $ENV{OPENQA_WEBUI_OVERVIEW_INACTIVITY_TIMEOUT} // 90;
+use constant LIMIT_BUILDS => (10, 20, 50, 100, 400);
+use constant INTERVAL => (30, 60, 90, 120, 180);
+
+sub dashboard_build_results ($self) {
+    my $validation = $self->validation;
+    $validation->optional('limit_builds')->num;
+    $validation->optional('time_limit_days')->like(qr/^[0-9.]+$/);
+    $validation->optional('only_tagged');
+    $validation->optional('default_expanded');
+    $validation->optional('show_tags');
+    $validation->optional('group');
+    return $self->reply->validation_error({format => $self->accepts('html', 'json')}) if $validation->has_error;
+
+    my $config = $self->app->config->{global};
+    my $limit_builds = $validation->param('limit_builds') // $config->{frontpage_builds};
+    my $time_limit_days = $validation->param('time_limit_days') // $config->{frontpage_time_limit_days};
+    my $only_tagged = $validation->param('only_tagged') // 0;
+    my $default_expanded = $validation->param('default_expanded') // 0;
+    my $show_tags = $validation->param('show_tags') // $only_tagged;
+    my $group_params = $validation->every_param('group');
+    my $regex_problem = $self->regex_problem($group_params, 'group parameter is invalid');
+    return $self->render(json => {error => $regex_problem}, status => 400) if $regex_problem;
+
+    my $groups = $self->stash('job_groups_and_parents')
+      // $self->schema->resultset('JobGroupParents')->job_groups_and_parents;
+    my $ignored_groups = $self->app->ignored_groups;
+
+    my $max_jobs_limit = $self->app->config->{misc_limits}->{job_groups_overview_max_jobs};
+    my $total_jobs_seen = 0;
+    my $limit_reached = 0;
+    my @results;
+    try {
+        for my $group (@$groups) {
+            next if $ignored_groups->{$group->name} || $group->ignore_on_dashboard;
+            if (@$group_params) {
+                next unless grep { $_ eq '' || $group->matches_nested($_) } @$group_params;
+            }
+            if (defined $max_jobs_limit && $total_jobs_seen >= $max_jobs_limit) {
+                $limit_reached = 1;
+                last;
+            }
+            my $tags = $show_tags || $only_tagged ? $group->tags : undef;
+            my $build_results = OpenQA::BuildResults::compute_build_results(
+                $group, $limit_builds, $time_limit_days, $only_tagged ? $tags : undef,
+                $group_params,
+                $show_tags ? $tags : undef,
+                defined $max_jobs_limit ? $max_jobs_limit - $total_jobs_seen : undef,
+                $ignored_groups
+            );
+
+            my $build_results_for_group = $build_results->{build_results};
+            if (@{$build_results_for_group}) {
+                push @results, $build_results;
+                $total_jobs_seen += $build_results->{total_jobs};
+            }
+            if ($build_results->{limit_exceeded}) {
+                $limit_reached = 1;
+                last;
+            }
+        }
+    }
+    catch ($e) {
+        die $e unless $e =~ qr/^invalid regex: /;
+        return $self->render(json => {error => $e}, status => 400);
+    }
+
+    $self->stash(
+        default_expanded => $default_expanded,
+        results => \@results,
+        limit_exceeded => $limit_reached ? $max_jobs_limit : 0,
+    );
+
+    $self->respond_to(
+        json => {json => {results => \@results, limit_exceeded => $limit_reached ? $max_jobs_limit : 0}},
+        html => {template => 'main/dashboard_build_results'});
+}
+
+sub _respond_error_for_group_overview ($self, $error) {
+    $self->stash(error_message => $error);
+    $self->respond_to(
+        json => {json => {error => $error}, status => 400},
+        any => sub ($self) { $self->render(template => 'main/specific_not_found', format => 'html', status => 400) },
+    );
+}
+
+sub _render_group_feed ($self, $group, $build_results, $children = []) {
+    my $group_id = $group->{id};
+    my @group_ids = @$children ? (map { $_->{id} } @$children) : ($group_id);
+    my @items;
+    for my $build_res (@$build_results) {
+        my ($version, $build) = ($build_res->{version}, $build_res->{build});
+        my $label
+          = ($build_res->{version_count} > 1 || $group->{always_show_version})
+          ? "$version-Build$build"
+          : "Build$build";
+        # Build the link for the result. A single Build can contain multiple distris, but only one version
+        my $link = $self->url_for('tests_overview')->query(
+            distri => [sort keys %{$build_res->{distris}}],
+            version => $version,
+            build => $build,
+            groupid => \@group_ids,
+        )->to_abs->to_string;
+
+        push @items,
+          {
+            title => $label,
+            link => $link,
+            guid => "$group_id-$build_res->{key}",
+            date => time2str('%a, %d %b %Y %T +0000', $build_res->{date}->epoch, 'UTC'),
+          };
+    }
+    my $route = $group->{is_parent} ? 'parent_group_overview' : 'group_overview';
+    $self->render(
+        template => 'main/group_feed',
+        format => 'rss',
+        feed_items => \@items,
+        feed_link => $self->url_for($route, groupid => $group_id)->to_abs->to_string,
+        feed_self_link => $self->url_for($route, groupid => $group_id, format => 'rss')->to_abs->to_string,
+    );
+}
+
+sub _sort_info_time ($new_old) { "Builds are sorted by the creation time of the <em>$new_old</em> job." }
+
+sub _sort_help_timestamps ($new_old) {
+"This means the timestamps are the creation time of the <em>$new_old</em> job in that build (accross all architectures).";
+}
+
+my %SORTING_NOTE = (
+    BUILD_SORT_BY_NAME() => {info => 'Builds are sorted by <em>name</em>.', help => _sort_help_timestamps('oldest')},
+    BUILD_SORT_BY_NEWEST_JOB() => {info => _sort_info_time('newest'), help => _sort_help_timestamps('newest')},
+    BUILD_SORT_BY_OLDEST_JOB() => {info => _sort_info_time('oldest'), help => _sort_help_timestamps('oldest')},
+);
+
+sub _group_overview ($self, $resultset, $template) {
+    my $validation = $self->validation;
+    $validation->optional('limit_builds')->num;
+    $validation->optional('time_limit_days')->like(qr/^[0-9.]+$/);
+    $validation->optional('only_tagged')->num;
+    $validation->optional('fullscreen')->num;
+    $validation->optional('interval')->num;
+    $validation->optional('comments_page')->num;
+    $validation->optional('comments_limit')->num;
+    return $self->reply->validation_error({format => $self->accepts('html', 'json')}) if $validation->has_error;
+    my $group_params = $self->every_param('group');
+    if (my $regex_problem = $self->regex_problem($group_params, 'group parameter is invalid')) {
+        return $self->_respond_error_for_group_overview($regex_problem);
+    }
+
+    my $limit_builds = $validation->param('limit_builds') // 10;
+    my $time_limit_days = $validation->param('time_limit_days') // 0;
+    $self->app->log->debug("Retrieving results for up to $limit_builds builds up to $time_limit_days days old");
+    my $only_tagged = $validation->param('only_tagged') // 0;
+    my $fullscreen = $validation->param('fullscreen') // 0;
+    my $interval = $validation->param('interval') // ONE_MINUTE;
+
+    my $current_user = $self->current_user;
+    my $max_unauth_builds_limit = $self->app->config->{misc_limits}->{job_group_overview_max_unauth_builds_limit};
+    my @limit_builds_preset = ($current_user) ? LIMIT_BUILDS : grep { $_ <= $max_unauth_builds_limit } LIMIT_BUILDS;
+    push @limit_builds_preset, $max_unauth_builds_limit
+      if (!$current_user && !any { $_ == $max_unauth_builds_limit } @limit_builds_preset);
+    if ($current_user && !any { $_ == $limit_builds } @limit_builds_preset) {
+        push @limit_builds_preset, $limit_builds;
+        @limit_builds_preset = (sort { $a <=> $b } @limit_builds_preset);
+    }
+    $validation->optional('limit_builds')->in(@limit_builds_preset);
+
+    my @interval_preset = INTERVAL;
+    if ($current_user && !any { $_ == $interval } @interval_preset) {
+        push @interval_preset, $interval;
+        @interval_preset = (sort { $a <=> $b } @interval_preset);
+    }
+    $validation->optional('interval')->in(@interval_preset);
+    $self->stash(fullscreen => $fullscreen, interval => $interval, interval_preset => \@interval_preset);
+
+    return $self->reply->validation_error({format => $self->accepts('html', 'json')}) if $validation->has_error;
+
+    my $group_id = $self->stash('groupid');
+    return $self->reply->not_found unless my $group = $self->schema->resultset($resultset)->find($group_id);
+
+    $self->inactivity_timeout(OPENQA_WEBUI_OVERVIEW_INACTIVITY_TIMEOUT);
+
+    my $tags = $group->tags;
+
+    my $max_jobs_limit = $self->app->config->{misc_limits}->{job_groups_overview_max_jobs};
+    my $ignored_groups = $self->app->ignored_groups;
+    my $build_results = [];
+    my $max_jobs = 0;
+    my $limit_exceeded = 0;
+    my $children = undef;
+
+    my $cbr;
+    try {
+        $cbr
+          = OpenQA::BuildResults::compute_build_results($group, $limit_builds,
+            $time_limit_days, $only_tagged ? $tags : undef,
+            $group_params, $tags, $max_jobs_limit, $ignored_groups);
+    }
+    catch ($e) {
+        die $e unless $e =~ qr/^invalid regex: /;
+        return $self->_respond_error_for_group_overview($e);
+    }
+    $build_results = $cbr->{build_results};
+    $max_jobs = $cbr->{max_jobs};
+    $limit_exceeded = $cbr->{limit_exceeded};
+    $children = $cbr->{children};
+
+    $self->stash(children => $children);
+    $self->stash(
+        build_results => $build_results,
+        max_jobs => $max_jobs,
+        limit_exceeded => $limit_exceeded ? $max_jobs_limit : 0
+    );
+
+    my $is_parent_group = $group->can('children');
+    my $comment_context = $is_parent_group ? 'parent_group' : 'group';
+    my $comment_context_route_suffix = $comment_context . '_comment';
+    my $comments = $group->comments;
+    my @pinned_comments = $comments->pinned_descriptions->all;
+
+    my $group_hash = {
+        id => $group->id,
+        name => $group->name,
+        full_name => $group->name,
+        is_parent => $is_parent_group,
+        rendered_description => $group->rendered_description,
+        limit_exceeded => $limit_exceeded ? $max_jobs_limit : 0,
+        always_show_version => $group->always_show_version,
+    };
+    if (!$is_parent_group && (my $parent = $group->parent)) {
+        $group_hash->{parent_id} = $parent->id;
+        $group_hash->{parent_name} = $parent->name;
+        $group_hash->{full_name} = $group->full_name;
+    }
+    $self->stash(
+        group => $group_hash,
+        sorting_note => $SORTING_NOTE{$group->build_version_sort},
+        limit_builds => $limit_builds,
+        limit_builds_preset => \@limit_builds_preset,
+        only_tagged => $only_tagged,
+        pinned_comments => \@pinned_comments,
+        comment_context => $comment_context,
+        comment_post_action => 'apiv1_post_' . $comment_context_route_suffix,
+        comment_put_action => 'apiv1_put_' . $comment_context_route_suffix,
+        comment_delete_action => 'apiv1_delete_' . $comment_context_route_suffix
+    );
+    $self->respond_to(
+        json => sub ($self) {
+            my $page = $validation->param('comments_page') // 1;
+            my $page_limit = $validation->param('comments_limit') // 5;
+            my $ordered_comments = $group->comments->search(
+                undef,
+                {
+                    page => $page,
+                    rows => $page_limit,
+                    order_by => {-desc => 't_created'},
+                });
+            my @comments_hashes = map { $_->hash } $ordered_comments->all;
+            my @pinned_comments_hashes = map { $_->hash } @pinned_comments;
+            $self->render(
+                json => {
+                    group => $group_hash,
+                    build_results => $build_results,
+                    max_jobs => $max_jobs,
+                    limit_exceeded => $limit_exceeded ? $max_jobs_limit : 0,
+                    description => $group->description,
+                    children => $self->stash('children'),
+                    comments => \@comments_hashes,
+                    pinned_comments => \@pinned_comments_hashes,
+                });
+        },
+        rss => sub ($self) {
+            $self->_render_group_feed($group_hash, $build_results, $children);
+        },
+        html => sub ($self) {
+            $self->render(template => $template);
+        });
+}
+
+sub _group_comments_ajax ($self, $resultset, $pagination_route) {
+    my $validation = $self->validation;
+    $validation->optional('comments_page')->num;
+    $validation->optional('comments_limit')->num;
+    return $self->reply->validation_error({format => $self->accepts('html')}) if $validation->has_error;
+
+    my $group_id = $self->stash('groupid');
+    return $self->reply->not_found unless my $group = $self->schema->resultset($resultset)->find($group_id);
+
+    my $page = $validation->param('comments_page') // 1;
+    my $page_limit = $validation->param('comments_limit') // 5;
+
+    $self->inactivity_timeout(OPENQA_WEBUI_OVERVIEW_INACTIVITY_TIMEOUT);
+    # find comments
+    my $comments = $group->comments;
+    my $ordered_comments = $comments->search(
+        undef,
+        {
+            page => $page,
+            rows => $page_limit,
+            order_by => {-desc => 't_created'},
+        });
+    $self->stash('comments_pager', $ordered_comments->pager());
+    my @comments = $ordered_comments->all;
+
+    my $is_parent_group = $group->can('children');
+    my $comment_context = $is_parent_group ? 'parent_group' : 'group';
+    my $comment_context_route_suffix = $comment_context . '_comment';
+
+    $self->stash(
+        group => {id => $group->id, name => $group->name},
+        comments => \@comments,
+        comment_context => $comment_context,
+        pagination_route => $pagination_route,
+        build_results => [],
+        is_ajax => 1,
+        comment_post_action => 'apiv1_post_' . $comment_context_route_suffix,
+        comment_put_action => 'apiv1_put_' . $comment_context_route_suffix,
+        comment_delete_action => 'apiv1_delete_' . $comment_context_route_suffix
+    );
+
+    $self->render(template => 'main/comment_area', layout => undef);
+}
+
+sub job_group_overview ($self) { $self->_group_overview('JobGroups', 'main/group_overview') }
+sub job_group_comments_ajax ($self) { $self->_group_comments_ajax('JobGroups', 'group_overview') }
+sub parent_group_overview ($self) { $self->_group_overview('JobGroupParents', 'main/parent_group_overview') }
+sub parent_group_comments_ajax ($self) { $self->_group_comments_ajax('JobGroupParents', 'parent_group_overview') }
+
+sub changelog ($self) {
+    my $file = path($self->app->config->{global}->{changelog_file});
+    my $changelog = -r $file ? $file->slurp : 'No changelog available.';
+    $self->render(changelog => $changelog);
+}
+
+# Inspired by https://testfully.io/blog/api-health-check-monitoring/
+sub health ($self) {
+    $self->render(text => 'ok');
+}
+
+1;

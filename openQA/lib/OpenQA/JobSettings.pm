@@ -1,0 +1,168 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::JobSettings;
+
+use Mojo::Base -strict, -signatures;
+
+use File::Basename;
+use Mojo::URL;
+use Mojo::Util 'url_unescape';
+use OpenQA::App;
+use OpenQA::Log 'log_debug';
+use OpenQA::Utils qw(asset_type_from_setting get_url_short);
+use Feature::Compat::Try;
+
+my $PLACEHOLDER_RE = qr/(%+)(\w+)(%+)/;
+
+sub apply_global_test_settings ($settings, $worker_classes) {
+    if (my $app = OpenQA::App->singleton) {
+        if (my $global_test_settings = $app->config->{test_settings}) {
+            for my $k (keys %$global_test_settings) {
+                my $uc_k = uc $k;
+                if ($uc_k eq 'WORKER_CLASS') {
+                    push @$worker_classes, $global_test_settings->{$k};
+                }
+                else {
+                    $settings->{$uc_k} = $global_test_settings->{$k};
+                }
+            }
+        }
+    }
+}
+
+sub finalize_job_settings ($settings, $worker_classes) {
+    $settings->{WORKER_CLASS} = join ',', sort @$worker_classes if @$worker_classes > 0;
+
+    # make sure that the DISTRI is lowercase
+    $settings->{DISTRI} = lc($settings->{DISTRI}) if $settings->{DISTRI};
+
+    parse_url_settings($settings);
+    handle_plus_in_settings($settings);
+    return expand_placeholders($settings);
+}
+
+sub generate_settings ($params) {
+    my $settings = $params->{settings};
+    my @worker_class;
+
+    apply_global_test_settings($settings, \@worker_class);
+
+    for my $entity (qw (product machine test_suite job_template)) {
+        next unless $params->{$entity};
+        my @entity_settings = $params->{$entity}->settings;
+        for my $setting (@entity_settings) {
+            if ($setting->key eq 'WORKER_CLASS') {
+                push @worker_class, $setting->value;
+                next;
+            }
+            $settings->{$setting->key} = $setting->value;
+        }
+    }
+    if (my $input_args = $params->{input_args}) {
+        $settings->{+uc} = $input_args->{$_} for keys %$input_args;
+    }
+
+    # Prevent the MACHINE from being overridden by input args when doing isos post
+    if (my $machine = $params->{machine}) {
+        $settings->{BACKEND} = $machine->backend;
+        $settings->{MACHINE} = $machine->name;
+    }
+
+    # add properties from dedicated database columns to settings
+    if (my $job_template = $params->{job_template}) {
+        $settings->{TEST} = $job_template->name || $job_template->test_suite->name;
+        $settings->{TEST_SUITE_NAME} = $job_template->test_suite->name;
+        $settings->{JOB_DESCRIPTION} = $job_template->description if length $job_template->description;
+    }
+
+    my ($error) = finalize_job_settings($settings, \@worker_class);
+    return $error;
+}
+
+# replace %NAME% with $settings{NAME} (but not %%NAME%%)
+sub expand_placeholders ($settings, $on_web_ui = 1) {
+    my %unexpanded;
+    my $err;
+    try {
+        for (grep { defined } values %$settings) {
+            my %visited;
+            s/$PLACEHOLDER_RE/_expand_placeholder($settings, $2, $1, $3, \%visited, $on_web_ui, \%unexpanded)/eg;
+        }
+    }
+    catch ($e) {
+        $err = "Error: $e";
+    }
+    return ($err, [sort keys %unexpanded]);
+}
+
+sub _expand_placeholder ($settings, $key, $start, $end, $visited, $on_web_ui, $unexpanded) {
+    # handle %CASEDIR% only on web UI; on the worker it is handled by _engine_workit_step_2 separately
+    return "$start$key$end" if !$on_web_ui && $key eq 'CASEDIR';
+
+    # return the key itself and strip one level of % if the key is surrounded by more than one % on any side
+    return (substr $start, 1) . ($key) . (substr $end, 0, -1) unless $start eq '%' && $end eq '%';
+
+    # do not replace non-existing keys on web UI level to leave them to the worker
+    my $value = $settings->{$key};
+    unless (defined $value) {
+        $unexpanded->{$key}++;
+        return $on_web_ui ? "$start$key$end" : '';
+    }
+
+    # substitute the whole %…% expression with the value of the other setting
+    my %visited_branch = %$visited;
+    die "The key $key contains a circular reference, its value is $value.\n" if $visited_branch{$key}++;
+    $value
+      =~ s/$PLACEHOLDER_RE/_expand_placeholder($settings, $2, $1, $3, \%visited_branch, $on_web_ui, $unexpanded)/eg;
+    return $value;
+}
+
+# allow some messing with the usual precedence order. If anything
+# sets +VARIABLE, that setting will be used as VARIABLE regardless
+# (so a product or template +VARIABLE beats a post'ed VARIABLE).
+# if *multiple* things set +VARIABLE, whichever comes highest in
+# the usual precedence order wins.
+sub handle_plus_in_settings ($settings) {
+    for (keys %$settings) {
+        if (substr($_, 0, 1) eq '+') {
+            $settings->{substr $_, 1} = delete $settings->{$_};
+        }
+    }
+}
+
+# Given a hashref of settings, parse any whose names end in _URL
+# to the short name, then if there is not already a setting with
+# the short name and the setting is an asset type, set it to the
+# filename from the URL (with the compression extension removed
+# in the case of _DECOMPRESS_URL).
+sub parse_url_settings ($settings) {
+    for my $setting (keys %$settings) {
+        my ($short, $do_extract) = get_url_short($setting);
+        next unless ($short);
+        next if defined($settings->{$short});
+        # As this comes in from an API call, URL will be URI-encoded
+        # This obviously creates a vuln if untrusted users can POST
+        $settings->{$setting} = url_unescape($settings->{$setting});
+        my $url = $settings->{$setting};
+        my $filename = Mojo::URL->new($url)->path->parts->[-1];
+        if ($do_extract) {
+            # if user wants to extract downloaded file, final filename
+            # will have last extension removed
+            $filename = fileparse($filename, qr/\.[^.]*/);
+        }
+        if (!$filename) {
+            log_debug("Unable to get filename from $url. Ignoring $setting");
+            next;
+        }
+        # We shouldn't set the short setting for non-asset types
+        unless (asset_type_from_setting($short, $filename)) {
+            log_debug("_URL downloading only allowed for asset types! $short is not an asset type");
+            next;
+        }
+        $settings->{$short} = $filename;
+    }
+    return undef;
+}
+
+1;

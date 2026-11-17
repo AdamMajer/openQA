@@ -1,0 +1,444 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::WebAPI::Controller::API::V1::Worker;
+use Mojo::Base 'Mojolicious::Controller', -signatures;
+
+use OpenQA::App;
+use OpenQA::Log 'log_warning';
+use OpenQA::Utils;
+use OpenQA::Jobs::Constants;
+use OpenQA::Schema::Result::Jobs;
+use DBIx::Class::Timestamps 'now';
+use List::Util qw(min);
+use Feature::Compat::Try;
+use OpenQA::Constants 'WEBSOCKET_API_VERSION';
+use OpenQA::WorkerReservation qw(reservation_error_status reservation_active RESERVATION_PROPERTIES);
+
+=pod
+
+=head1 NAME
+
+OpenQA::WebAPI::Controller::API::V1::Worker
+
+=head1 SYNOPSIS
+
+  use OpenQA::WebAPI::Controller::API::V1::Worker;
+
+=head1 DESCRIPTION
+
+Implements API methods relating to OpenQA Workers.
+
+=head1 METHODS
+
+=over 4
+
+=item list()
+
+Returns a list of workers with useful information for each including its ID, the host
+where the worker is located, the worker instance, the worker status and the worker's
+websocket status.
+
+=back
+
+=cut
+
+sub list ($self) {
+    my $validation = $self->validation;
+    $validation->optional('limit')->num;
+    $validation->optional('offset')->num;
+    $validation->optional('reserved')->num(0, 1);
+    return $self->reply->validation_error({format => 'json'}) if $validation->has_error;
+
+    my $limits = OpenQA::App->singleton->config->{misc_limits};
+    my $limit
+      = min($limits->{admin_table_max_limit}, $validation->param('limit') // $limits->{admin_table_default_limit});
+    my $offset = $validation->param('offset') // 0;
+
+    my $workers = $self->schema->resultset('Workers');
+    my $reserved_param = $validation->param('reserved');
+    my $condition
+      = defined $reserved_param
+      ? {id => {($reserved_param ? '-in' : '-not_in') => [keys %{$workers->active_reservations}]}}
+      : {};
+    my @paged = $workers->search($condition, {rows => $limit + 1, offset => $offset, order_by => 'id'})->all;
+    pop @paged if my $has_more = @paged > $limit;
+    $self->pagination_links_header($limit, $offset, $has_more);
+
+    $self->render(json => {workers => [map { $_->info } @paged]});
+}
+
+=over 4
+
+=item _register()
+
+Register a worker instance on the database or update its information if it
+was already registered.
+
+B<TODO>: this function exists purely for unit tests to be able to register
+workers without fixtures so usage elsewhere should be avoided
+
+B<NOTE>: currently this function is used in create (API entry point)
+
+=back
+
+=cut
+
+sub _register ($self, $schema, $host, $instance, $caps, $jobs_worker_says_it_works_on = []) {
+    die 'Incompatible websocket API version'
+      if WEBSOCKET_API_VERSION != ($caps->{websocket_api_version} // 0);
+
+    my $workers = $schema->resultset('Workers');
+    my $worker = $workers->find({host => $host, instance => int $instance});
+
+    # update or create database entry for worker
+    if ($worker) {
+        $worker->update({t_seen => now(), error => undef});
+    }
+    else {
+        $worker = $workers->create(
+            {
+                host => $host,
+                instance => $instance,
+                job_id => undef,
+                t_seen => now()});
+    }
+
+    # store worker's capabilities to database
+    $worker->update_caps($caps) if $caps;
+
+    if (!$worker->is_reserved) {
+        my $siblings = $workers->search({host => $host, id => {'!=' => $worker->id}});
+        while (my $sibling = $siblings->next) {
+            my $properties = $sibling->_reservation_properties;
+            if (reservation_active($properties->{RESERVED_BY_ID}, $properties->{RESERVED_T_EXPIRES})
+                && ($properties->{RESERVED_SCOPE} // '') eq 'host')
+            {
+                $schema->txn_do(
+                    sub {
+                        $worker->set_property($_ => $properties->{$_}) for RESERVATION_PROPERTIES;
+                    });
+                last;
+            }
+        }
+    }
+
+    # mark the jobs the worker is currently supposed to run as incomplete unless the worker claims
+    # to still work on these jobs (which might be the case when the worker hasn't actually crashed but
+    # just re-registered due to network issues)
+    # note: Using a transaction here so we don't end up with an inconsistent state when an error occurs.
+    my %jobs_worker_says_it_works_on = map { ($_ => 1) } @$jobs_worker_says_it_works_on;
+    my $worker_id = $worker->id;
+    try {
+        $schema->txn_do(
+            sub {
+                $worker->update({job_id => undef})
+                  if _incomplete_previous_job(\%jobs_worker_says_it_works_on, $worker->job);
+                _incomplete_previous_job(\%jobs_worker_says_it_works_on, $_) for $worker->unfinished_jobs->all;
+            });
+    }
+    catch ($e) {
+        log_warning("Unable to incomplete/duplicate or reschedule jobs abandoned by worker $worker_id: $e");
+    }
+
+    return $worker_id;
+}
+
+sub _incomplete_previous_job ($jobs_worker_says_it_works_on, $job) {
+    return 0 unless defined $job;
+
+    my $job_id = $job->id;
+    return 0 if $jobs_worker_says_it_works_on->{$job_id};
+    my $job_state = $job->state;
+    return 1 if $job_state eq OpenQA::Jobs::Constants::SCHEDULED;
+
+    # set jobs which were only assigned anyways back to scheduled
+    if ($job_state eq OpenQA::Jobs::Constants::ASSIGNED) {
+        $job->reschedule_state;
+        return 1;
+    }
+
+    # mark jobs which were already beyond assigned as incomplete and duplicate it
+    my $worker = $job->assigned_worker // $job->worker;
+    my $worker_info = defined $worker ? ('worker ' . $worker->name) : 'worker';
+    $job->set_property('JOBTOKEN');
+    try { $job->auto_duplicate }
+    catch ($e) { log_warning("Unable to duplicate job $job_id after being abandoned by $worker_info: $e") }
+    my $reason = "abandoned: associated $worker_info re-connected but abandoned the job";
+    try { $job->done(result => INCOMPLETE, reason => $reason) }
+    catch ($e) { log_warning("Unable to incomplete job $job_id after being abandoned by $worker_info: $e") }
+    return 1;
+}
+
+
+=over 4
+
+=item create()
+
+Initializes and registers a worker.
+
+=back
+
+=cut
+
+sub create ($self) {
+    my $validation = $self->validation;
+    my @validation_params
+      = qw(cpu_arch cpu_modelname cpu_opmode cpu_flags mem_max isotovideo_interface_version websocket_api_version worker_class parallel_one_host_only developer_connection_hint);
+    $validation->required($_) for qw(host instance cpu_arch mem_max worker_class);
+    $validation->optional($_) for qw(cpu_modelname cpu_opmode cpu_flags isotovideo_interface_version job_id
+      websocket_api_version parallel_one_host_only developer_connection_hint);
+    return $self->reply->validation_error({format => 'json'}) if $validation->has_error;
+
+    my $host = $validation->param('host');
+    my $instance = $validation->param('instance');
+    my $job_ids = $validation->every_param('job_id');
+    my $caps = {};
+    $caps->{$_} = $validation->param($_) for @validation_params;
+    my $id;
+    try {
+        $id = $self->_register($self->schema, $host, $instance, $caps, $job_ids);
+    }
+    catch ($e) {
+        if ($e =~ /Incompatible/) {
+            $self->render(status => 426, json => {error => $e});
+        }
+        else {
+            $self->render(status => 500, json => {error => "Failed: $e"});
+        }
+        return undef;
+    }
+    return undef unless defined $id;
+
+    my %event_data = (id => $id, host => $host, instance => $instance);
+    $self->emit_event('openqa_worker_register', \%event_data);
+    $self->render(
+        json => {
+            id => $id,
+            service_port_delta => $self->config->{global}->{service_port_delta}});
+}
+
+=over 4
+
+=item show()
+
+Prints information from a worker given its ID. Each entry contains the "hostname"
+and the field "status" which can be "dead", "idle", "running" and "broken".
+A worker can be considered online when the status is not "dead". Broken means that
+the worker is able to connect but there is some setup problem on the worker host
+preventing it from taking jobs.
+
+=back
+
+=cut
+
+sub show ($self) {
+    my $worker = $self->schema->resultset('Workers')->find($self->param('workerid'));
+    if ($worker) {
+        $self->render(json => {worker => $worker->info});
+    }
+    else {
+        $self->reply->not_found;
+    }
+}
+
+=over 4
+
+=item delete()
+
+Deletes a worker which currently has the status "dead" and no job assigned to it. 
+An error is returned if the worker doesn't exist or has a different status.
+
+=back
+
+=cut
+
+sub delete ($self) {
+    my $message;
+    my $worker_id = $self->param('worker_id');
+    my $worker = $self->schema->resultset('Workers')->find($worker_id);
+
+    if (!$worker) {
+        return $self->render(json => {error => 'Worker not found.'}, status => 404);
+    }
+    if ($worker->is_reserved) {
+        return $self->render(
+            json => {error => 'Cannot delete a worker covered by active host reservation.'},
+            status => 400
+        ) if ($worker->reservation->{scope} // '') eq 'host' && !$self->param('force');
+        return $self->render(json => {error => 'Cannot delete a reserved worker.'}, status => 400)
+          unless $self->param('force') && $self->current_user->is_admin;
+    }
+    if ($worker->status ne 'dead' || $worker->unfinished_jobs->count) {
+        $message = 'Worker ' . $worker->name . ' status is not offline.';
+        return $self->render(json => {error => $message}, status => 400);
+    }
+
+    try { $worker->delete }
+    catch ($e) { return $self->render(json => {error => $e}, status => 409) }
+    $message = 'Delete worker ' . $worker->name . ' successfully.';
+    $self->emit_event('openqa_worker_delete', {id => $worker->id, name => $worker->name});
+    $self->render(json => {message => $message});
+}
+
+# returns the addressed worker or renders a 404, the routes are already restricted to operators
+sub _reservation_worker ($self) {
+    my $workerid = $self->param('workerid');
+    my $workers = $self->schema->resultset('Workers');
+    my $worker
+      = $workerid =~ /^\d+$/ ? $workers->find($workerid)
+      : $workerid =~ /^(.*):(\d+)$/ ? $workers->find({host => $1, instance => int $2})
+      : undef;
+    $self->render(json => {error => 'Worker not found.'}, status => 404) unless $worker;
+    return $worker;
+}
+
+# runs $action, renders the error of a failed reservation operation and returns whether it succeeded
+sub _apply_reservation ($self, $action) {
+    try { $action->() }
+    catch ($e) {
+        $self->render(json => {error => "$e"}, status => reservation_error_status($e));
+        return 0;
+    }
+    return 1;
+}
+
+=over 4
+
+=item reserve()
+
+Reserves a worker instance with a comment and a specified duration.
+Optionally accepts a C<worker_class> for verification jobs.
+
+=back
+
+=cut
+
+sub reserve ($self) {
+    return undef unless my $worker = $self->_reservation_worker;
+    my $user = $self->current_user;
+    my $comment = $self->param('comment');
+    my $worker_class = $self->param('worker_class');
+    return undef
+      unless $self->_apply_reservation(
+        sub { $worker->reserve($user, $comment, $self->param('duration'), $self->param('force'), $worker_class) });
+
+    my $reservation = $worker->reservation;
+    $self->emit_event(
+        'openqa_worker_reserve',
+        {
+            id => $worker->id,
+            name => $worker->name,
+            user => $user->username,
+            comment => $comment,
+            expires => $reservation->{t_expires},
+            (defined $worker_class && length $worker_class ? (worker_class => $worker_class) : ()),
+        });
+    $self->render(
+        json => {message => 'Worker ' . $worker->name . ' reserved successfully.', reservation => $reservation});
+}
+
+=over 4
+
+=item release()
+
+Releases an existing worker reservation.
+
+=back
+
+=cut
+
+sub release ($self) {
+    return undef unless my $worker = $self->_reservation_worker;
+    my $user = $self->current_user;
+    return undef unless $self->_apply_reservation(sub { $worker->release($user) });
+
+    $self->emit_event('openqa_worker_release', {id => $worker->id, name => $worker->name, user => $user->username});
+    $self->render(json => {message => 'Worker ' . $worker->name . ' reservation released successfully.'});
+}
+
+=over 4
+
+=item reserve_host()
+
+Reserves all worker instances on a host with a comment and a specified duration.
+Optionally accepts a C<worker_class> for verification jobs.
+
+=back
+
+=cut
+
+sub reserve_host ($self) {
+    my $host = $self->param('host');
+    my $user = $self->current_user;
+    my $comment = $self->param('comment');
+    my $worker_class = $self->param('worker_class');
+    my $workers = $self->schema->resultset('Workers');
+
+    my $worker_list;
+    return undef
+      unless $self->_apply_reservation(
+        sub {
+            $worker_list = $workers->reserve_host(
+                $host, $user,
+                comment => $comment,
+                duration => $self->param('duration'),
+                force => $self->param('force'),
+                worker_class => $worker_class,
+            );
+        });
+
+    # Emit openqa_worker_host_reserve audit event
+    my $worker_ids = [map { $_->id } @$worker_list];
+    my $first_worker = $worker_list->[0];
+    my $reservation = $first_worker->reservation;
+    $self->emit_event(
+        'openqa_worker_host_reserve',
+        {
+            host => $host,
+            worker_ids => $worker_ids,
+            user => $user->username,
+            comment => $comment,
+            expires => $reservation->{t_expires},
+            (defined $worker_class && length $worker_class ? (worker_class => $worker_class) : ()),
+        });
+
+    $self->render(
+        json => {
+            message => "Worker host '$host' reserved successfully.",
+            worker_ids => $worker_ids,
+        });
+}
+
+=over 4
+
+=item release_host()
+
+Releases reservations across all worker instances on a host.
+
+=back
+
+=cut
+
+sub release_host ($self) {
+    my $host = $self->param('host');
+    my $user = $self->current_user;
+    my $workers = $self->schema->resultset('Workers');
+
+    my $worker_list;
+    return undef unless $self->_apply_reservation(sub { $worker_list = $workers->release_host($host, $user) });
+
+    # Emit openqa_worker_host_release audit event
+    my $worker_ids = [map { $_->id } @$worker_list];
+    $self->emit_event(
+        'openqa_worker_host_release',
+        {
+            host => $host,
+            worker_ids => $worker_ids,
+            user => $user->username,
+        });
+
+    $self->render(json => {message => "Worker host '$host' reservation released successfully."});
+}
+
+1;

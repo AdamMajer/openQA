@@ -1,0 +1,107 @@
+root /usr/share/openqa/public;
+
+client_max_body_size 0;
+
+# The "client_body_buffer_size" value should usually be larger
+# than the UPLOAD_CHUNK_SIZE used by openQA workers, so there is
+# no excessive buffering to disk
+client_body_buffer_size 12m;
+
+# Default is exact which would need an exact match of Last-Modified
+if_modified_since before;
+
+# Default proxy settings inherited by locations forwarding to Mojolicious
+tcp_nodelay        on;
+proxy_read_timeout 900;
+proxy_send_timeout 900;
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Host $host:$server_port;
+proxy_set_header X-Forwarded-Server $host;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+
+## Optional to make use of auth_request to require authentication for asset downloads
+#location /api/v1/auth {
+#    internal;
+#    proxy_pass http://webui;
+#    tcp_nodelay        on;
+#    proxy_read_timeout 900;
+#    proxy_send_timeout 900;
+#    proxy_pass_request_body off;
+#    proxy_set_header Content-Length "";
+#    proxy_set_header Host $host;
+#    proxy_set_header X-Original-URI $request_uri;
+#    proxy_set_header X-Forwarded-Host $host:$server_port;
+#    proxy_set_header X-Forwarded-Server $host;
+#    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#    proxy_set_header X-Forwarded-Proto $scheme;
+#}
+
+## Optional faster image downloads for large deployments
+#location /image {
+#    alias /var/lib/openqa/images/;
+#    tcp_nopush         on;
+#    sendfile           on;
+#    sendfile_max_chunk 1m;
+#}
+
+location /api/v1/ws/ {
+    proxy_pass http://websocket;
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600;
+    proxy_send_timeout 3600;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+
+location /liveviewhandler/ {
+    proxy_pass http://livehandler;
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600;
+    proxy_send_timeout 3600;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_buffering off;
+}
+
+location / {
+#    # Apply optional rate limiting (needs zone definition, see `openqa-limiting.inc`)
+#    # Limit regular requests via webui_limit
+#    limit_req zone=webui_limit burst=100 nodelay;
+#    # Limit modifying requests via webui_light_limit so many worker slots can do uploads in parallel
+#    limit_req zone=webui_light_limit burst=500 nodelay;
+#    limit_req_status 429;
+#    add_header Retry-After 1 always;
+
+    proxy_pass "http://webui";
+}
+
+location ~ /tests/[0-9]+/(livelog|liveterminal)$ {
+    # Default settings inherited from server block; only buffering needs tuning here
+    proxy_pass "http://webui";
+    proxy_buffering off;
+}
+
+# Optional more restrictive rate limiting for heavy routes
+#location ~ ^(/search|/tests/[0-9]+/(investigation|dependencies)_ajax)/?$ {
+#    # Apply rate limiting (needs zone definition, see `openqa-limiting.inc`)
+#    limit_req zone=webui_heavy_limit burst=10 nodelay;
+#    limit_req_status 429;
+#    add_header Retry-After 5 always;
+#
+#    # Backend settings are inherited from the server block
+#    proxy_pass "http://webui";
+#}
+
+# Optional less restrictive rate limiting for lightweight routes that potentially need to be queried frequently
+#location ~ ^(/api/v1/jobs/[0-9]+/(mutex|barrier|artefact)) {
+#    # Apply rate limiting (needs zone definition, see `openqa-limiting.inc`)
+#    limit_req zone=webui_light_limit burst=500 nodelay;
+#    limit_req_status 429;
+#    add_header Retry-After 1 always;
+#
+#    # Backend settings are inherited from the server block
+#    proxy_pass "http://webui";
+#}

@@ -1,0 +1,196 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Schema;
+
+use Mojo::Base -strict, -signatures;
+
+use parent 'DBIx::Class::Schema';
+
+use DBIx::Class::DeploymentHandler;
+use Config::IniFiles;
+use Cwd 'abs_path';
+use Feature::Compat::Try;
+use FindBin '$Bin';
+use Fcntl ':flock';
+use File::Spec::Functions 'catfile';
+use OpenQA::App;
+use OpenQA::Config;
+use OpenQA::Utils qw(:DEFAULT prjdir);
+use Mojo::File qw(path);
+use POSIX qw(setuid setgid);
+
+# after bumping the version please look at the instructions in the docs/Contributing.md file
+# on what scripts should be run and how
+our $VERSION = $ENV{OPENQA_SCHEMA_VERSION_OVERRIDE} // 108;
+
+__PACKAGE__->load_namespaces;
+
+my $SINGLETON;
+
+use constant DEADLOCK_RETRIES => $ENV{OPENQA_DEADLOCK_RETRIES} // 3;
+use constant DEADLOCK_REGEX => qr/deadlock detected/;
+
+sub set_user ($user) {
+    return undef unless $user;
+    my $uid = getpwnam $user or die "No such login $user";
+    my $gid = getgrnam $user;
+    setgid($gid) or die "can't sgid to $user group" if $gid;
+    setuid($uid) or die "can't suid to $user";
+}
+
+sub set_search_path ($self, $search_path) {
+    my $storage = $self->storage;
+    $storage->dbh->do(qq{SET search_path TO "$search_path"});
+    $storage->on_connect_do(qq{SET search_path TO "$search_path"});    # handle reconnects
+}
+
+sub connect_db (%args) {
+    my $check_deploy = $args{deploy};
+    $check_deploy //= 1;
+    return $SINGLETON if $SINGLETON;
+
+    set_user($args{user});
+
+    my $mode = $args{mode} || $ENV{OPENQA_DATABASE} || 'production';
+    if ($mode eq 'test') {
+        $SINGLETON = __PACKAGE__->connect($ENV{TEST_PG} // 'DBI:Pg:dbname=openqa_test;host=/dev/shm/tpg');
+    }
+    else {
+        my $home_dir = $args{from_script} ? path($Bin, '..') : OpenQA::App->singleton->home;
+        my $home_config_dir = config_dir_within_app_home($home_dir);
+        my $database_config_paths = lookup_config_files($home_config_dir, 'database.ini', $args{silent});
+        my $database_config = parse_config_files_as_hash($database_config_paths);
+        my $database_config_for_mode = $database_config ? $database_config->{$mode} : {dsn => 'DBI:Pg:dbname=openqa'};
+        die "Could not find database section '$mode' in @$database_config_paths\n" unless $database_config_for_mode;
+        my $app = OpenQA::App->singleton;
+        my $app_name = ($app ? $app->defaults('appname') : '') || 'openQA';
+        $app_name = ";application_name='$app_name'";
+        ref $database_config_for_mode eq 'HASH'
+          ? ($database_config_for_mode->{dsn} .= $app_name)
+          : ($database_config_for_mode .= $app_name);
+        $SINGLETON = __PACKAGE__->connect($database_config_for_mode);
+    }
+    if (defined(my $search_path = $ENV{OPENQA_DATABASE_SEARCH_PATH})) {
+        $SINGLETON->set_search_path($search_path);
+    }
+    deploy $SINGLETON if $check_deploy;
+    return $SINGLETON;
+}
+
+sub disconnect_db () {
+    return undef unless $SINGLETON;
+    $SINGLETON->storage->disconnect;
+    $SINGLETON = undef;
+}
+
+sub deploy ($self, $force_overwrite = 0) {
+    # lock config file to ensure only one thing will deploy/upgrade DB at once
+    # we use a file in prjdir/db as the lock file as the install process and
+    # packages make this directory writeable by openQA user by default
+    my $dblockfile = catfile(prjdir(), 'db', 'db.lock');
+    my $dblock;
+
+    # LOCK_EX works most reliably if the file is open with write intent
+    open $dblock, '>>', $dblockfile or die "Cannot open database lock file ${dblockfile}: $!";
+    flock $dblock, LOCK_EX or die "Cannot lock database lock file ${dblockfile}: $!";
+    my $dir = $FindBin::Bin;
+    while (abs_path($dir) ne '/') {
+        last if (-d "$dir/dbicdh");
+        $dir = "$dir/..";
+    }
+    $dir = "$dir/dbicdh";
+    die 'Cannot find database schema files' if (!-d $dir);
+
+    my $dh = DBIx::Class::DeploymentHandler->new(
+        {
+            schema => $self,
+            script_directory => $dir,
+            databases => ['PostgreSQL'],
+            sql_translator_args => {add_drop_table => 0},
+            force_overwrite => $force_overwrite
+        });
+    my $ret = 0;
+    $ret = 2 if _try_deploy_db($dh);
+    $ret = 1 if (!$ret && _try_upgrade_db($dh));
+    close $dblock or die "Can't close database lock file ${dblockfile}!";
+    return $ret;
+}
+
+# Class attribute used for testing with OpenQA::Test::Database
+sub search_path_for_tests ($class, @args) {
+    state $search_path;
+    $search_path = shift @args if @args;
+    return $search_path;
+}
+
+# Class method everyone should use to access the schema
+sub singleton ($class = undef) { $SINGLETON || connect_db() }
+
+sub _try_deploy_db ($dh) {
+    my $schema = $dh->schema;
+    my $version;
+    try {
+        $version = $dh->version_storage->database_version;
+    }
+    catch ($e) {
+        # If the table does not exist, we want to deploy, and the error
+        # is expected. If we get other errors like "Permission denied" in case
+        # the database is not readable by the current user, we print the
+        # error message
+        warn "Error when trying to get the database version: $e"
+          unless $e =~ m/relation "dbix_class_deploymenthandler_versions" does not exist/;
+        $dh->install;
+        $schema->create_system_user;    # create system user right away
+    }
+
+    return !$version;
+}
+
+sub _try_upgrade_db ($dh) {
+    my $schema = $dh->schema;
+    return 0 if $dh->schema_version <= $dh->version_storage->database_version;
+    $dh->upgrade;
+    return 1;
+}
+
+sub create_system_user ($self) {
+    $self->resultset('Users')->create(
+        {
+            username => 'system',
+            email => 'noemail@open.qa',
+            fullname => 'openQA system user',
+            nickname => 'system'
+        });
+}
+
+# read application secret from database
+sub read_application_secrets ($self) {
+    # we cannot use our own schema here as we must not actually
+    # initialize the db connection here. Would break for prefork.
+    my $secrets = $self->resultset('Secrets');
+    my @secrets = $secrets->all();
+    if (!@secrets) {
+
+        # create one if it doesn't exist
+        $secrets->create({});
+        @secrets = $secrets->all();
+    }
+    die "couldn't create secrets\n" unless @secrets;
+
+    return [map { $_->secret } @secrets];
+}
+
+sub is_deadlock ($self, $error) { $error =~ DEADLOCK_REGEX }
+
+sub txn_do_retry_on_deadlock ($self, $sub, $deadlock_cb = undef) {
+    for (my $tries = 0;; ++$tries) {
+        try { return $self->txn_do($sub) }
+        catch ($e) {
+            die $e if $tries >= DEADLOCK_RETRIES || !$self->is_deadlock($e);    # uncoverable statement
+            $deadlock_cb->($e) if $deadlock_cb;    # uncoverable statement
+        }
+    }
+}
+
+1;

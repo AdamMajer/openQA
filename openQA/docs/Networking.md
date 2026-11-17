@@ -1,0 +1,506 @@
+<a id="networking"></a>
+
+# Networking
+
+For tests using the QEMU backend the networking type used is controlled by the
+`NICTYPE` variable. If unset or empty `NICTYPE` defaults to `user`, i.e.
+[QEMU User Networking](#qemu-user-networking) which requires no further configuration.
+
+For more advanced setups or tests that require multiple jobs to be in the same
+networking the [TAP](#tap-based-network) or [VDE](#vde-based-network) based
+modes can be used.
+
+Other backends can be treated just the same as bare-metal setups. Tests can be
+triggered in parallel same as for QEMU based ones and synchronization
+primitives can be used. For the physical network according separation needs to
+be ensured externally where needed as means for machines to be able to access
+each other.
+
+<a id="qemu-user-networking"></a>
+
+## QEMU User Networking
+
+With QEMU [user networking](http://wiki.qemu.org/Documentation/Networking#User_Networking_.28SLIRP.29) each jobs gets its own isolated network with
+TCP and UDP routed to the outside. DHCP is provided by QEMU. The MAC address of
+the machine can be controlled with the `NICMAC` variable. If not set, it is
+`52:54:00:12:34:56`.
+
+<a id="tap-based-network"></a>
+
+## TAP Based Network
+
+os-autoinst can connect QEMU to TAP devices of the host system to
+leverage advanced network setups provided by the host by setting `NICTYPE=tap`. The TAP device to use can be configured with the `TAPDEV` variable. If not
+defined, it is automatically set to "tap" + (\$worker_instance - 1), i.e.
+worker1 uses tap0, worker 2 uses tap1 and so on.
+
+For multiple networks per job (see `NETWORKS` variable), the following numbering
+scheme is used:
+
+```sh
+worker1: tap0 tap64 tap128 ...
+worker2: tap1 tap65 tap129 ...
+worker3: tap2 tap66 tap130 ...
+...
+```
+
+The MAC address of each virtual NIC is controlled by the `NICMAC` variable or automatically computed from `$worker_id` if not set.
+
+In TAP mode the system administrator is expected to configure the network,
+required internet access, etc. on the host as described in the next section.
+
+### Multi-machine test setup
+
+The complete multi-machine test setup can be provided from the script
+`os-autoinst-setup-multi-machine` provided by "os-autoinst". The script can be
+also found online on
+<https://github.com/os-autoinst/os-autoinst/blob/master/script/os-autoinst-setup-multi-machine>
+
+The configuration is applicable for openSUSE and will use _Open
+vSwitch_ for virtual switch, _firewalld_ (or _SuSEfirewall2_ for older
+versions) for NAT and _wicked_ or _NetworkManager_ as network manager. Keep in
+mind that a firewall is not strictly necessary for operation. The operation
+without firewall is not covered in all necessary details in this documentation.
+
+> **NOTE:**
+> Another way to setup the environment with _iptables_ and _firewalld_ is
+> described on the
+> [Fedora wiki](https://fedoraproject.org/wiki/OpenQA_advanced_network_guide).
+
+> **NOTE:**
+> Alternatively
+> [salt-states-openqa](https://github.com/os-autoinst/salt-states-openqa) contains
+> necessities to establish such a setup and configure it for all workers with the
+> `tap` worker class. They also cover GRE tunnels (that are explained in the next
+> section).
+
+The script `os-autoinst-setup-multi-machine` can be run like this:
+
+```sh
+# specify the number of test VMs to run on this host
+instances=30 bash -x $(which os-autoinst-setup-multi-machine)
+```
+
+#### What os-autoinst-setup-multi-machine does
+
+##### Set up Open vSwitch
+
+The script will install and configure Open vSwitch as well as
+a service called _os-autoinst-openvswitch.service_.
+
+> **NOTE:**
+> _os-autoinst-openvswitch.service_ is a support service that sets the
+> vlan number of Open vSwitch ports based on `NICVLAN` variable - this separates the groups of tests from each other. The `NICVLAN` variable is dynamically
+> assigned by the openQA scheduler.
+
+The name of the bridge (default: `br1`) will be set in
+`/etc/sysconfig/os-autoinst-openvswitch`.
+
+A huge part of the magic happens in os-autoinst-openvswitch. On startup this
+daemon will create flow rules in the OVS bridge that allow the SUT VMs to talk
+to upstream networks despite being in a VLAN to isolate from other tests.
+These flow rules implement an address translation from the SUT IPs to
+intermediate IPs so that it doesn't matter if multiple tests are running at
+the same time with conflicting IP addresses. These intermediate IP addresses
+can then be NATed (again) to upstream networks by regular iptables/NFT
+masquerading rules.
+
+##### Configure virtual interfaces
+
+The script will add the bridge device and the tap devices for every
+multi-machine worker instance.
+
+> **NOTE:**
+> The bridge device will also call a script at
+> `/etc/wicked/scripts/gre_tunnel_preup.sh` on _PRE_UP_.
+> This script needs **manual** touch if you want to set up multiple
+> multi-machine worker hosts. Refer to the [GRE tunnels](#gre-tunnels) section
+> below for further information.
+
+##### Configure NAT with firewalld
+
+> **NOTE:**
+> `os-autoinst-setup-multi-machine` can set this up for you, but using
+> plain NFT instead of firewalld (which `os-autoinst-setup-multi-machine` can
+> setup as well) is recommended due to firewalld's suboptimal performance with
+> many tap interfaces present.
+
+The required firewall rules for masquerading (NAT) and zone configuration
+for the trusted zone will be set up. The bridge devices will be added to
+the zone.
+IP-Forwarding will be enabled.
+
+```sh
+# show the firewall configuration
+firewall-cmd --list-all-zones
+```
+
+#### What is left to do after running os-autoinst-setup-multi-machine
+
+<a id="gre-tunnels"></a>
+
+##### GRE tunnels
+
+By default all multi-machine workers have to be on a single physical machine.
+You can join multiple physical machines and its OVS bridges together by a GRE
+tunnel.
+
+If the workers with TAP capability are spread across multiple hosts, the
+network must be connected. See Open vSwitch
+[documentation](http://openvswitch.org/support/config-cookbooks/port-tunneling/)
+for details.
+
+Create a gre_tunnel_preup script (change the `remote_ip` value correspondingly
+on both hosts):
+
+```sh
+cat > /etc/wicked/scripts/gre_tunnel_preup.sh <<EOF
+#!/bin/sh
+action="$1"
+bridge="$2"
+ovs-vsctl set bridge $bridge rstp_enable=true
+ovs-vsctl --may-exist add-port $bridge gre1 -- set interface gre1 type=gre options:remote_ip=<IP address of other host>
+EOF
+```
+
+And call it by PRE_UP_SCRIPT="wicked:gre_tunnel_preup.sh" entry:
+
+```sh
+# /etc/sysconfig/network/ifcfg-br1
+<..>
+PRE_UP_SCRIPT="wicked:gre_tunnel_preup.sh"
+```
+
+Ensure to make gre_tunnel_preup.sh executable.
+
+> **NOTE:**
+> When using GRE tunnels keep in mind that virtual machines inside the ovs
+> bridges have to use MTU=1458 for their physical interfaces (eth0, eth1). If
+> you are using support_server/setup.pm the MTU will be set automatically to
+> that value on support_server itself and it does MTU advertisement for DHCP
+> clients as well.
+
+##### Configure openQA workers
+
+Allow worker instances to run multi-machine jobs by modifying
+[the worker configuration](GettingStarted.md#webui-configuration):
+
+```sh
+[global]
+WORKER_CLASS = qemu_x86_64,tap
+```
+
+> **NOTE:**
+> The number of tap devices should correspond to the number of the running
+> worker instances. For example, if you have set up 3 worker instances, the same
+> number of tap devices should be configured.
+
+While idle, each worker instance with the `tap` worker class checks via
+os-autoinst-openvswitch whether VLAN tags can be assigned to the tap devices it
+would use, as computed from `TAPDEV`, `NICOFFSET` and the instance number. If
+the check fails, the worker is reported as broken. Set `REQUIRED_TAP_DEVS` to a
+comma-separated list (e.g. `REQUIRED_TAP_DEVS = tap0,tap64`) to check
+different devices instead, preferably in the section of the specific worker
+instance.
+
+Enable worker instances to be started on system boot:
+
+```sh
+systemctl enable openqa-worker@{1..3}
+```
+
+### Verify the setup
+
+Simply run a MM test scenario. For openSUSE, you can find many relevant tests on
+[o3](https://openqa.opensuse.org), e.g. look for networking-related tests like
+`ping_server`/`ping_client` or `wicked_basic_ref`/`wicked_basic_sut`.
+
+To test GRE tunnels, you may want to change the jobs worker classes so the
+different jobs are executed on different workers. So you could call
+`openqa-clone-job` like this:
+
+```sh
+openqa-clone-job \
+--skip-chained-deps \
+--max-depth 0 \
+--within-instance \
+https://openqa.opensuse.org/tests/3886213 \
+_GROUP=0 BUILD+=test-mm-setup \
+WORKER_CLASS:wicked_basic_ref+=,worker_foo \
+WORKER_CLASS:wicked_basic_sut+=,worker_bar
+```
+
+Also be sure to reboot the worker host to make sure the setup is actually
+persistent.
+
+#### Start test VMs manually
+
+You may also start VMs manually to verify the setup.
+
+First, download a suitable image and launch a VM in the same way `os-autoinst`
+would do for MM jobs:
+
+```sh
+wget https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-Cloud.qcow2
+qemu-system-x86_64 -m 2048 -enable-kvm -vnc :42 -snapshot \
+-netdev tap,id=qanet0,ifname=tap40,script=no,downscript=no \
+-device virtio-net,netdev=qanet0,mac=52:54:00:13:0b:4a \
+openSUSE-Tumbleweed-Minimal-VM.x86_64-Cloud.qcow2
+```
+
+The image used here is of course just an example. You need to make sure to
+assign a unique MAC address (e.g. by adjusting the last two figures in the
+example; this will not conflict with MAC addresses used by os-autoinst) and use
+a tap device not used at the same time by a SUT-VM.
+
+> **NOTE:**
+> Different from the qemu user mode network setup there is no DHCP or
+> router advertisement on the multi machine network. IP addresses, routes and DNS
+> needs to be set up by test scripts. By default IP ranges are similar to the
+> ones used by qemu usermode networking - except for the IPv6 default route which
+> is via `fec0::2` for MM networks instead of `fe80::2` for usermode networks.
+
+> **NOTE:**
+> There is no default/builtin DNS server on MM networks - if you need DNS,
+> use an upstream dns server on the local network of the worker host or the internet.
+
+Within the VM configure the network **like** this (you may need to adjust concrete
+IP addresses, subnets and interface names):
+
+    ip link set dev eth0 up mtu 1380
+
+    # for ipv4
+    ip a add dev eth0 10.0.2.15/24
+    ip r add default via 10.0.2.2
+    echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+
+    # for ipv6
+    ip a add dev eth0 fec0::15/64
+    ip r add default via fec0::2
+    echo 'nameserver 2606:4700:4700::1111' > /etc/resolv.conf
+
+The MTU is chosen in accordance with what the openSUSE test distribution uses
+for MM tests and should be below the MTU set on the Open vSwitch bridge device
+(e.g. via `os-autoinst-setup-multi-machine`).
+
+After this it should be possible to reach other hosts. You may also launch a 2nd
+VM to see whether the VMs can talk to each other. You may conduct ping tests
+similar to the `ping_client` test mentioned in the previous section (see the
+[utility function in openSUSE tests](https://github.com/os-autoinst/os-autoinst-distri-opensuse/blob/cc3a5b32527c4c8bb810c8bce9b1449a891ef74b/lib/utils.pm#L2901)
+for details). When running ping you can add/remove machines to/from the GRE
+network to bisect problematic hosts/connections (via `ovs-vsctl add-port …` and
+`ovs-vsctl del-port …`).
+
+### Debugging Open vSwitch Configuration
+
+Boot sequence with wicked (version 0.6.23 and newer):
+
+1.  openvswitch (as above)
+2.  wicked - creates the bridge `br1` and tap devices, adds tap devices to the
+    bridge,
+3.  firewalld (or SuSEfirewall2 in older setups)
+4.  os-autoinst-openvswitch - installs openflow rules, handles vlan assignment
+
+The configuration and operation can be checked with the following commands:
+
+```sh
+cat /proc/sys/net/ipv4/conf/{br1,eth0}/forwarding # check whether IP forwarding is enabled
+ovs-vsctl show # shows the bridge br1, the tap devices are assigned to it
+ovs-ofctl dump-flows br1 # shows the rules installed by os-autoinst-openvswitch in table=0
+ovs-dpctl show # show basic info on all datapaths
+ovs-dpctl dump-flows # displays flows in datapaths
+ovs-appctl rstp/show # show rstp information
+ovs-appctl fdb/show br1 # show MAC address table
+```
+
+When everything is ok and the machines are able to communicate, the ovs-vsctl
+should show something like the following:
+
+```sh
+Bridge "br0"
+    Port "br0"
+        Interface "br0"
+            type: internal
+    Port "tap0"
+        Interface "tap0"
+    Port "tap1"
+        tag: 1
+        Interface "tap1"
+    Port "tap2"
+        tag: 1
+        Interface "tap2"
+  ovs_version: "2.11.1"
+```
+
+> **NOTE:**
+> Notice the tag numbers are assigned to tap1 and tap2. They should have the
+> same number.
+
+> **NOTE:**
+> If the balance of the tap devices is wrong in
+> [the worker configuration](GettingStarted.md#worker-configuration), the tag
+> cannot be assigned and the communication will be broken.
+
+To list the rules which are effectively configured in the underlying netfilter
+(`nftables` or `iptables`) use one of the following commands depending on which
+netfilter is used.
+
+> **NOTE:**
+> Whether firewalld is using `nftables` or `iptables` is determined by the
+> setting `FirewallBackend` in `/etc/firewalld/firewalld.conf`. SuSEfirewall2 is
+> always using `iptables`.
+
+```sh
+nft list tables           # list all tables
+nft list table firewalld  # list all rules in the specified table
+```
+
+```sh
+iptables --list --verbose # list all rules with package counts
+```
+
+Check the flow of packets over the network:
+
+- packets from tapX to br1 create additional rules in table=1
+- packets from br1 to tapX increase packet counts in table=1
+- empty output indicates a problem with os-autoinst-openvswitch service
+- zero packet count or missing rules in table=1 indicate problem with tap
+  devices
+
+As long as the SUT has access to external network, there should be a non-zero
+packet count in the forward chain between the br1 and external interface.
+
+> **NOTE:**
+> To list the package count when `nftables` is used one needed to use
+> [counters](https://wiki.nftables.org/wiki-nftables/index.php/Counters) (which can
+> be [added to existing rules](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/configuring_and_managing_networking/getting-started-with-nftables_configuring-and-managing-networking#adding-a-counter-to-an-existing-rule_debugging-nftables-rules)).
+
+### Debugging GRE tunnels and MTU sizes
+
+#### Initial setup for all experiments
+
+```sh
+# Enable ip forwarding
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1
+# Install and enable openvswitch
+zypper in openvswitch3
+systemctl enable --now openvswitch
+```
+
+| Host | Network address | Bridge address  | Remote IP |
+| ---- | --------------- | --------------- | --------- |
+| A    | 192.0.2.1/24    | 192.168.42.1/24 | 192.0.2.2 |
+| B    | 192.0.2.2/24    | 192.168.43.1/24 | 192.0.2.1 |
+
+> **NOTE:**
+> instead of having two /24 networks, it is also possible to assign addresses
+> from one bigger network (which have the benefit of not needing explicit route
+> assignment).
+
+#### Simple scenario
+
+Two servers with a single bridge on each side connected with GRE tunnel.
+
+```sh
+# Create bridge and tunnel
+nmcli con add type bridge con.int br0 bridge.stp yes ipv4.method manual ipv4.address "$bridge_address" ipv4.routes 192.168.42.0/23
+nmcli con add type ip-tunnel mode gretap con.int gre1 master br0 remote "$remote_ip"
+
+# Test the tunnel with ping
+#   -M do   -- prohibit fragmentation
+#   -s xxxx -- set packet size
+
+ping -c 3 -M do -s 1300 192.168.42.1
+ping -c 3 -M do -s 1300 192.168.43.1
+```
+
+#### Scenario with openvswitch
+
+Two servers with a one virtual bridge connected with GRE tunnel.
+
+```sh
+# Create bridge, port and interface
+nmcli con add type ovs-bridge con.int br0 ovs-bridge.rstp-enable yes
+nmcli con add type ovs-port con.int br0 con.master br0
+nmcli con add type ovs-interface con.int br0 con.master br0 ipv4.method manual ipv4.address "$bridge_address" ipv4.routes 192.168.42.0/23
+
+# Create GRE tunnel
+nmcli con add type ovs-port con.int gre1 con.master br0
+nmcli con add type ip-tunnel mode gretap con.int gre1 master gre1 remote "$remote_ip"
+
+# Test the tunnel
+ping -c 3 -M do -s 1300 192.168.42.1
+ping -c 3 -M do -s 1300 192.168.43.1
+```
+
+    #  ovs-vsctl show
+    de1f31e9-1b51-4cc3-954a-4e037191ac07
+        Bridge br0
+            Port br0
+                Interface br0
+                    type: internal
+            Port gre1
+                Interface gre1
+                    type: system
+        ovs_version: "3.1.0"
+
+#### GRE tunnel made in openvswitch
+
+openvswitch uses flow-based GRE tunneling, i.e. one interface `gre_sys` for all tunnels, the tunnel can be created by `ovs-vsctl`. After that, everything works as expected.
+
+```sh
+# Create bridge, port and interface
+nmcli con add type ovs-bridge con.int br0 ovs-bridge.rstp-enable yes
+nmcli con add type ovs-port con.int br0 con.master br0
+nmcli con add type ovs-interface con.int br0 con.master br0 ipv4.method manual ipv4.address "$bridge_address" ipv4.routes 192.168.42.0/23
+
+# Create GRE tunnel
+ovs-vsctl add-port br0 gre1 -- set interface gre1 type=gre options:remote_ip="$remote_ip"
+
+# Test the tunnel
+ping -c 3 -M do -s 1300 192.168.42.1
+ping -c 3 -M do -s 1300 192.168.43.1
+```
+
+    #  ovs-vsctl show
+    de1f31e9-1b51-4cc3-954a-4e037191ac07
+        Bridge br0
+            Port br0
+                Interface br0
+                    type: internal
+            Port gre1
+                Interface gre1
+                    type: gre
+                    options: {remote_ip="192.0.2.2"}
+        ovs_version: "3.1.0"
+
+## VDE Based Network
+
+Virtual Distributed Ethernet provides a software switch that runs in
+user space. It allows to connect several QEMU instances without
+affecting the system's network configuration.
+
+The openQA workers need a vde_switch instance running. The workers
+reconfigure the switch as needed by the job.
+
+### Basic, Single Machine Tests
+
+To start with a basic configuration like QEMU user mode networking,
+create a machine with the following settings:
+
+- `VDE_SOCKETDIR=/run/openqa`
+
+- `NICTYPE=vde`
+
+- `NICVLAN=0`
+
+Start the switch and user mode networking:
+
+```sh
+systemctl enable --now openqa-vde_switch
+systemctl enable --now openqa-slirpvde
+```
+
+With this setting all jobs on the same host would be in the same network and
+share the same SLIRP instance.

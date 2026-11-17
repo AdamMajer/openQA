@@ -1,0 +1,44 @@
+% use OpenQA::Utils;
+<table id="results_<%= $type %>" class="overview fixedheader table table-striped table-hover">
+    <thead>
+        <tr>
+            <th>Test</th>
+            % my @archs = sort @$type_archs;
+            % for my $arch (@archs) {
+                <th id="flavor_<%= $type %>_arch_<%= $arch %>"><%= $arch %></th>
+            % }
+        </tr>
+    </thead>
+    <tbody>
+        % my @configs = sort { $a =~ s/@/ /r cmp $b =~ s/@/ /r } keys %$type_results;
+        % for my $config (@configs) {
+            % my $config_results = $type_results->{$config};
+            % next unless $config_results;
+            <tr>
+                <td class="name">
+                    % my $test_label = text_with_title($config);
+                    % if (my $description = $config_results->{description}) {
+                        <a data-bs-content="<p><%= href_to_bugref(render_escaped_refs($description)) %></p>"
+                        data-bs-title="<%= $config %>" data-bs-toggle="popover" data-bs-placement="left" data-bs-trigger="focus" role="button" tabindex="0"><%= $test_label %></a>
+                    % }
+                    % else {
+                        <%= $test_label %>
+                    % }
+                </td>
+
+                % for my $arch (@archs) {
+                    % my $res = $config_results->{$arch};
+                    % my $jobid = $res->{jobid};
+                    % my $state = $res->{state};
+
+                    % if (!$state) {
+                        <td>-</td>
+                        % next;
+                    % }
+                    % my $resultid = join('_', $type, $arch, $config) =~ tr/ #/_/r;
+                    %= include 'test/tr_job_result', resultid => $resultid, res => $res, state => $state, jobid => $jobid
+                % }
+            </tr>
+        % }
+    </tbody>
+</table>

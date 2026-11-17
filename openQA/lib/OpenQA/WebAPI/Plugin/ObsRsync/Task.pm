@@ -1,0 +1,126 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::WebAPI::Plugin::ObsRsync::Task;
+use Mojo::Base 'Mojolicious::Plugin', -signatures;
+use Mojo::File;
+use IPC::Run;
+use OpenQA::Task::SignalGuard;
+use Feature::Compat::Try;
+
+use constant RETRY_INTERVAL_ON_EXCEPTION => 120;
+use constant RETRY_MAX_COUNT_ON_EXCEPTION => 200;
+
+sub register ($self, $app, $conf) {
+    $app->minion->add_task(obs_rsync_run => \&run);
+    $app->minion->add_task(obs_rsync_update_dirty_status => \&update_dirty_status);
+    $app->minion->add_task(obs_rsync_update_builds_text => \&update_obs_builds_text);
+}
+
+sub _retry_or_finish ($job, $helper, $project = undef, $retry_interval = undef, $retry_max_count = undef) {
+    $retry_interval ||= $helper->retry_interval;
+    $retry_max_count ||= $helper->retry_max_count;
+
+    return $job->retry({delay => $retry_interval})
+      if !$retry_max_count || $job->retries < $retry_max_count;
+
+    return $job->finish(
+        {code => 2, message => "Exceeded retry count $retry_max_count. Consider job will be re-triggered later"});
+}
+
+# runs script/rsync.sh from the OBS rsync home directory for a specific project
+# note: The "project" is the first argument to script/rsync.sh and has a corresponding project on OBS and a corresponding
+#       subdirectory in the OBS rsync home directory. This subdirectory contains many generated scripts/commands which will be
+#       invoked by script/rsync.sh in a certain sequence. This Minion task merely does the top-level invocation and implements
+#       a retry but is otherwise not concerned with any details (such as invoking rsync or creating openQA jobs).
+#       Jobs of this task are enqueued by the "/obs_rsync/#project/runs" route (POST request) which can be triggered via the
+#       "Sync now" button on the web UI (e.g. on a page like "/admin/obs_rsync/openSUSE:Factory:Staging:C").
+# note: Retrying this task in case it is interrupted is ok because script/rsync.sh skips folders which have already been
+#       handled via the symlink `.run_last`. So no duplicate openQA jobs will be created. The caveat is that the folder the
+#       script was processing when it was interrupted will end up synced/scheduled incompletely without a failing Minion job.
+sub run ($job, $args) {
+    my $ensure_task_retry_on_termination_signal_guard = OpenQA::Task::SignalGuard->new($job);
+    my $app = $job->app;
+    my $project = $args->{project};
+    my $helper = $app->obs_rsync;
+    my $home = $helper->home;
+
+    return _retry_or_finish($job, $helper)
+      unless my $project_guard = $helper->guard($project);
+    $job->note(project_lock => 1);
+
+    my $dirty = 0;
+    try { $dirty = $helper->is_status_dirty($project, 1) }
+    catch ($e) {
+        return _retry_or_finish($job, $helper, undef, RETRY_INTERVAL_ON_EXCEPTION, RETRY_MAX_COUNT_ON_EXCEPTION);
+    }
+    return _retry_or_finish($job, $helper) if $dirty;
+
+    return _retry_or_finish($job, $helper)
+      unless my $concurrency_guard = $helper->concurrency_guard();
+
+    $helper->log_job_id($project, $job->id);
+    my @cmd = (Mojo::File->new($home, 'script', 'rsync.sh')->to_string, $project);
+    my ($stdin, $stdout, $error);
+    my $exit_code = -1;
+    my $error_from_exception;
+    try { IPC::Run::run(\@cmd, \$stdin, \$stdout, \$error); $exit_code = $?; }
+    catch ($e) { $error_from_exception = $e }
+
+    return $job->finish(0) if (!$exit_code);
+
+    $error ||= $error_from_exception;
+    $error ||= 'No message';
+    $error =~ s/\s+$//;
+    $app->log->error('ObsRsync#_run failed (' . $exit_code . '): ' . $error);
+    $helper->log_failure($project, $job->id);
+    return $job->finish({code => $exit_code, message => $error});
+}
+
+sub update_dirty_status ($job, $args) {
+    my $ensure_task_retry_on_termination_signal_guard = OpenQA::Task::SignalGuard->new($job);
+    my $app = $job->app;
+    my $project = $args->{project};
+    my $helper = $app->obs_rsync;
+    eval { $helper->is_status_dirty($project, 1); 1 };    ## no critic (ErrorHandling::RequireCheckingReturnValueOfEval)
+    return $job->finish(0);
+}
+
+sub update_obs_builds_text ($job, $args) {
+    my $ensure_task_retry_on_termination_signal_guard = OpenQA::Task::SignalGuard->new($job);
+    my $app = $job->app;
+    my $alias = $args->{alias};
+    my $helper = $app->obs_rsync;
+
+    my ($project, undef) = $helper->split_alias($alias);
+    # this lock indicates that rsync.sh have started - it is dangerous to call read_files.sh
+    my $project_lock = Mojo::File->new($helper->home, $project, 'rsync.lock');
+    return $job->finish("File exists $project_lock") if -f $project_lock;
+
+    # this lock indicates that Gru job for project is active - it is dangerous to call read_files.sh
+    my $guard = $helper->guard($project);
+    return $job->finish('Gru lock exists') unless $guard;
+
+    my $sub = sub {
+        my (undef, $batch) = @_;
+        my $read_files = Mojo::File->new($helper->home, $project, $batch, 'read_files.sh');
+        return $job->finish("Cannot find $read_files") unless -f $read_files;
+
+        my @cmd = ('bash', $read_files);
+        my ($stdin, $stdout, $error);
+        my $exit_code = -1;
+        try {
+            IPC::Run::run(\@cmd, \$stdin, \$stdout, \$error);
+            $exit_code = $?;
+            return ($exit_code, $error);
+        }
+        catch ($e) { return ($exit_code, $error // $e); }    # uncoverable statement
+    };
+
+    my ($exit_code, $error) = $helper->for_every_batch($alias, $sub);
+
+    return $job->finish({code => $exit_code, message => $error}) if $exit_code;
+    return $job->finish('Success');
+}
+
+1;

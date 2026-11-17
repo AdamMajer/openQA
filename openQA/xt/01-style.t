@@ -1,0 +1,48 @@
+#!/usr/bin/perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+ok system(qq{git grep -I -l 'Copyright \((C)\|(c)\|©\)' ':!COPYING' ':!external/'}) != 0,
+  'No redundant copyright character';
+ok
+  system(
+qq{git grep -I -l 'This program is free software.*if not, see <http://www.gnu.org/licenses/' ':!COPYING' ':!external/' ':!xt/01-style.t'}
+  ) != 0, 'No verbatim licenses in source files';
+ok system(qq{git grep -I -l '[#/ ]*SPDX-License-Identifier ' ':!COPYING' ':!external/' ':!xt/01-style.t'}) != 0,
+  'SPDX-License-Identifier correctly terminated';
+is qx{git grep -I -L '^use Test::Most' {t,xt}/**.t}, '', 'All tests use Test::Most';
+is qx{git grep --all-match -e '^use Mojo::Base' -e 'use base'}, '', 'No redundant Mojo::Base+base';
+is qx{git grep -I --all-match -e '^use Mojo::Base' -e 'use \\(strict\\|warnings\\);' ':!docs' ':!external'}, '',
+  'Only combined Mojo::Base+strict+warnings';
+is qx{git grep -I -L '^use Test::Warnings' {t,xt}/**.t ':!xt/01-style.t'}, '', 'All tests use Test::Warnings';
+is qx{git grep -I -l '^use Test::\\(Exception\\|Fatal\\)' {t,xt}/**.t}, '',
+  'Test::Most already includes Test::Exception, no need to use Test::Exception or Test::Fatal';
+is qx{git grep -I -l '^\\(throws\\|dies\\|lives\\)_ok.*\<sub\>' {t,xt}/**.t}, '',
+  'Only use simplified prototyped Test::Exception functions';
+is qx{git grep -I -l 'like.*\$\@' {t,xt}/**.t}, '', 'Use throws_ok instead of manual checks of exceptions';
+is qx{git grep -I -l ' \\(if\\|unless\\) \$\@'}, '', 'Use try/catch instead of manual \$\@ checks';
+is qx{git grep -I -l '^use \\(Try::Tiny\\|TryCatch\\)'}, '',
+  'No Try::Tiny or TryCatch necessary, use Feature::Compat::Try and later native Perl';
+
+is qx{git grep -I -l '<script' templates/ ':!templates/webapi/layouts/bootstrap.html.ep' ':!templates/webapi/layouts/js_editor.html.ep' ':!templates/webapi/main/comment_area.html.ep' ':!templates/webapi/test/comments.html.ep'}, '',
+  'No inline scripts in templates except for legacy templates';
+
+is qx{git grep -I -lw 'var' assets/javascripts/ ':!assets/javascripts/shapes.js'}, '',
+  'No legacy "var" keyword in modern JavaScript files (use const or let)';
+is qx{git grep -I -lw 'sr-only' templates/ assets/javascripts/}, '',
+  'No Font Awesome sr-only helper, Bootstrap 5 defines only visually-hidden';
+is
+qx{git grep -l -e '^sub \\S\\+ [^(]\\+' --and --not -e 'sub [(\{]' --and --not -e 'sub \\S\\+(' --and --not -e 'sub \\S\\+;' --and --not -e '# no:style:signatures' ':!contrib/' ':!external/' ':!docs/'},
+  '', 'All files use sub signatures everywhere (nameless and in-place definitions still allowed)';
+is qx{git grep -I -l 'sub [a-z_A-Z0-9]\\+()' ':!docs/'}, '',
+  'Consistent space before function signatures (this is not ensured by perltidy)';
+is
+qx{git grep -Pr "(?<!->)(?<!sub )(?<!\\#.{,254})\\b(ok|is|isnt|like|unlike|cmp_ok|can_ok|isa_ok|subtest|diag|note|explain|pass|fail|new_ok|is_deeply)\\s*\\(" {t,xt}/ | grep -vE "(t|xt)/(lib|testresults)/"},
+  '',
+  'Consistent Test::More call format (no parentheses)';
+
+is qx{git grep -I -l -E 'Copyright [0-9]{4}(-?[0-9]{4})? SUSE LLC' ':!external/'}, '', "No files using 'Copyright <year> SUSE LLC'";
+
+done_testing;

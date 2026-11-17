@@ -1,0 +1,17 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Mojo::Base -strict;
+
+use FindBin;
+use lib "$FindBin::RealBin/../lib";
+
+use OpenQA::CacheService;
+use OpenQA::Utils qw(set_listen_address fix_top_level_help);
+
+fix_top_level_help;
+
+set_listen_address('cache_service');
+exit OpenQA::CacheService::run(@ARGV);

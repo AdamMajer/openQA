@@ -1,0 +1,21 @@
+<div class="details-filter-toggle">
+    <a href="#" class="nav-link" title="Expand all rows" id="expand-all-rows">
+        <i class="fa-solid fa-expand"></i>
+    </a>
+    <a href="#" class="nav-link" title="Collapse all rows" id="collapse-all-rows">
+        <i class="fa-solid fa-compress"></i>
+    </a>
+    <a href="#" aria-controls="next_previous" class="nav-link" title="Filter" id="details-filter-toggle">
+        <i class="fa-solid fa-filter"></i>
+    </a>
+</div>
+<form class="row details-filter hidden" id="details-filter">
+    <div class="col-sm-12 col-md-6">
+        Name:
+        <input type="search" class="form-control form-control-sm" placeholder="Filter by name" aria-controls="results" id="details-name-filter">
+    </div>
+    <div class="col-sm-12 col-md-6 result-filter-container">
+        <input id="details-only-failed-filter" name="relevant" type="checkbox" value="1">
+        <label class="form-label" for="details-only-failed-filter">Show only failures</label>
+    </div>
+</form>

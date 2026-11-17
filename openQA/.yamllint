@@ -1,0 +1,33 @@
+extends: default
+ignore: |
+  t/data/job-templates/invalid-yaml-schema.yaml
+  t/data/job-templates/duplicate-key.yaml
+  t/data/08-opensuse-test.yaml
+  t/data/08-opensuse.yaml
+  container/helm/**
+  dbicdh
+  node_modules
+
+
+rules:
+  line-length:
+    max: 160
+  document-start: disable
+  indentation:
+    indent-sequences: true
+    spaces: 2
+
+  # Allows aligning subsequent lines with [] sequences
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: -1
+  commas:
+    max-spaces-after: -1
+
+  # Allows aligning key value pairs
+  colons:
+    max-spaces-after: -1
+
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false

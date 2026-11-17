@@ -1,0 +1,202 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Test::Warnings ':report_warnings';
+use Mojo::Base -signatures;
+use utf8;
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+
+use OpenQA::Downloader;
+use Mojo::Server::Daemon;
+use Mojo::Log;
+use POSIX '_exit';
+use Mojo::IOLoop::ReadWriteProcess 'process';
+use Mojo::IOLoop::ReadWriteProcess::Session 'session';
+use OpenQA::Utils qw(make_listen_url make_access_url to_plain_service_port);
+use OpenQA::Test::Utils qw(fake_asset_server wait_for_or_bail_out);
+use OpenQA::Test::TimeLimit '10';
+use Mojo::File qw(tempdir);
+use Test::MockModule;
+
+# Capture logs
+my $log = Mojo::Log->new;
+$log->unsubscribe('message');
+my $cache_log = '';
+$log->on(
+    message => sub {
+        my ($log, $level, @lines) = @_;
+        $cache_log .= "[$level] " . join "\n", @lines, '';
+    });
+
+$SIG{INT} = sub { session->clean };
+
+END { session->clean }
+
+
+my $mojo_tmpdir = tempdir;
+my $downloader = OpenQA::Downloader->new(log => $log, sleep_time => 0.05, attempts => 3, tmpdir => $mojo_tmpdir);
+my $ua = $downloader->ua;
+my $tempdir = tempdir;
+my $to = $tempdir->child('test.qcow');
+$ua->connect_timeout(0.25)->inactivity_timeout(0.25);
+
+subtest 'Unable to create temporary directory' => sub {
+    my $file_mock = Test::MockModule->new('Mojo::File');
+    $file_mock->redefine(make_path => sub ($self) { die 'fake error' });
+    like $downloader->download('from', 'to'), qr/temp.*dir.*fake error/, 'error returned';
+};
+
+subtest 'Connection refused' => sub {
+    my $from = 'http://127.0.0.1:0/tests/922756/asset/hdd/sle-12-SP3-x86_64-0368-textmode@64bit.qcow2';
+    like $downloader->download($from, $to), qr/Download of "$to" failed: Connection refused/, 'Failed';
+
+    ok !-e $to, 'File not downloaded';
+
+    like $cache_log, qr/Downloading "test.qcow" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Download of "$to" failed: Connection refused/, 'Real error is logged';
+    like $cache_log, qr/Download error, waiting .* seconds for next try \(2 remaining\)/, '2 tries remaining';
+    like $cache_log, qr/Download error, waiting .* seconds for next try \(1 remaining\)/, '1 tries remaining';
+    unlike $cache_log, qr/Download error, waiting .* seconds for next try \(3 remaining\)/, 'only 3 attempts';
+    $cache_log = '';
+};
+
+my $port = OpenQA::Utils::reserve_ports(['test'])->sockport;
+my $host = make_access_url($port);
+my $server_instance = process sub {
+    # uncoverable statement
+    Mojo::Server::Daemon->new(
+        app => fake_asset_server,
+        listen => [make_listen_url($port)],
+        silent => $ENV{HARNESS_IS_VERBOSE} ? 0 : 1
+    )->run;
+    Devel::Cover::report() if Devel::Cover->can('report');
+    _exit(0);    # uncoverable statement to ensure proper exit code of complete test at cleanup
+  },
+  max_kill_attempts => 0,
+  blocking_stop => 1,
+  _default_blocking_signal => POSIX::SIGTERM,
+  kill_sleeptime => 0;
+$server_instance->set_pipes(0)->start;
+wait_for_or_bail_out { defined $ua->get($host)->res->code } 'worker';
+sub stop_server () { $server_instance->stop() }
+
+subtest 'Not found' => sub {
+    my $from = qq{$host/tests/922756/asset/hdd/sle-12-SP3-x86_64-0368-404\@64bit.qcow2};
+    like $downloader->download($from, $to), qr/Download of "$to" failed: 404 Not Found/, 'Failed';
+
+    ok !-e $to, 'File not downloaded';
+
+    like $cache_log, qr/Downloading "test.qcow" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Download of "$to" failed: 404 Not Found/, 'Real error is logged';
+    unlike $cache_log, qr/waiting .* seconds for next try/, 'No retries';
+    $cache_log = '';
+};
+
+subtest 'Success' => sub {
+    my $from = qq{$host/tests/922756/asset/hdd/sle-12-SP3-x86_64-0368-200\@64bit.qcow2};
+    is $downloader->download($from, $to), undef, 'Success';
+
+    ok -e $to, 'File downloaded';
+    is -s $to, 1024, 'File size is 1024 bytes';
+    unlink $to;
+
+    like $cache_log, qr/Downloading "test.qcow" from "$from"/, 'Download attempt';
+    unlike $cache_log, qr/waiting .* seconds for next try/, 'No retries';
+    $cache_log = '';
+};
+
+subtest 'Connection closed early' => sub {
+    my $from = qq{$host/tests/922756/asset/hdd/sle-12-SP3-x86_64-0368-200_close\@64bit.qcow2};
+    like $downloader->download($from, $to), qr/Download of "$to" failed: Premature connection close/, 'Failed';
+
+    ok !-e $to, 'File not downloaded';
+
+    like $cache_log, qr/Downloading "test.qcow" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Download of "$to" failed: Premature connection close/, 'Real error is logged';
+    like $cache_log, qr/Download error, waiting .* seconds for next try \(2 remaining\)/, '2 tries remaining';
+    like $cache_log, qr/Download error, waiting .* seconds for next try \(1 remaining\)/, '1 tries remaining';
+    $cache_log = '';
+};
+
+subtest 'Server error' => sub {
+    my $from = qq{$host/tests/922756/asset/hdd/sle-12-SP3-x86_64-0368-200_server_error\@64bit.qcow2};
+    like $downloader->download($from, $to), qr/Download of "$to" failed: 500 Internal Server Error/, 'Failed';
+
+    ok !-e $to, 'File not downloaded';
+
+    like $cache_log, qr/Downloading "test.qcow" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Download of "$to" failed: 500 Internal Server Error/, 'Real error is logged';
+    like $cache_log, qr/Download error 500, waiting .* seconds for next try \(2 remaining\)/, '2 tries remaining';
+    like $cache_log, qr/Download error 500, waiting .* seconds for next try \(1 remaining\)/, '1 tries remaining';
+    $cache_log = '';
+};
+
+subtest 'Size differs' => sub {
+    my $from = qq{$host/tests/922756/asset/hdd/sle-12-SP3-x86_64-0368-589\@64bit.qcow2};
+    like $downloader->download($from, $to), qr/Size of .* differs, expected \d+ Byte but downloaded \d+ Byte/, 'Failed';
+
+    ok !-e $to, 'File not downloaded';
+
+    like $cache_log, qr/Downloading "test.qcow" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Size of .+ differs, expected 10 Byte but downloaded 6 Byte/, 'Incomplete download logged';
+    like $cache_log, qr/Download error, waiting .* seconds for next try \(2 remaining\)/, '2 tries remaining';
+    like $cache_log, qr/Download error, waiting .* seconds for next try \(1 remaining\)/, '1 tries remaining';
+    $cache_log = '';
+};
+
+subtest 'Non-compressed files kept as-is - no complaint about unknown archive format' => sub {
+    $to = $tempdir->child('test.txt');
+    my $from = "$host/test";
+    # don't check the error message as it is not interesting
+    # (it's a generic error message that the archive is invalid)
+    is $downloader->download($from, $to, {extract => 1}), undef, 'Success';
+    ok -e $to, 'File downloaded';
+    like $cache_log, qr/Downloading "test.txt" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Extracting ".*test" to ".*test.txt"/, 'Extracting download';
+    is $to->slurp, 'This file was not compressed!', 'Contents extracted even though file was not compressed';
+    $cache_log = '';
+};
+
+subtest 'Decompressing file' => sub {
+    $to = $tempdir->child('test');
+    my $from = "$host/test.gz";
+    is $downloader->download($from, $to, {extract => 1}), undef, 'Success';
+    ok -e $to, 'File downloaded and decompressed';
+    is $to->slurp, 'This file was compressed!', 'File was decompressed';
+    like $cache_log, qr/Downloading "test" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Extracting ".*test.gz" to ".*test"/, 'Extracting download';
+    unlike $cache_log, qr/Extracting ".*test.*" failed:/, 'Extracting did not fail';
+    $cache_log = '';
+};
+
+subtest 'Decompressing archive' => sub {
+    $to = $tempdir->child('test');
+    my $from = "$host/test.tar.xz";
+    is $downloader->download($from, $to, {extract => 1}), undef, 'Success';
+    ok -d $to, 'File downloaded, uncompressed and extracted';
+    is $to->child('test-file')->slurp, "Archived file!\n", 'File was extracted';
+    like $cache_log, qr/Downloading "test" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Extracting ".*test\.tar\.xz" to ".*test"/, 'Extracting download';
+    unlike $cache_log, qr/Extracting ".*test.*" failed:/, 'Extracting did not fail';
+    $cache_log = '';
+};
+
+subtest 'Error when decompressing archive' => sub {
+    $to = $tempdir->child('fake-archive');
+    my $from = "$host/fake-archive.tar.xz";
+    like $downloader->download($from, $to, {extract => 1}), qr/Unrecognized archive format/, 'Failed';
+    ok !-e $to, 'Target not created';
+    like $cache_log, qr/Downloading "fake-archive" from "$from"/, 'Download attempt';
+    like $cache_log, qr/Extracting ".*fake-archive\.tar\.xz" to ".*fake-archive"/, 'Extracting download';
+    like $cache_log, qr/Extracting ".*fake-archive\.tar\.xz" failed:.*Unrecognized archive format.*/,
+      'Extracting failed';
+    $cache_log = '';
+};
+
+stop_server;
+
+done_testing();

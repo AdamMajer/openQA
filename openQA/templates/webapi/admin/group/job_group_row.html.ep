@@ -1,0 +1,28 @@
+<li
+    id="job_group_<%= $group->id %>"
+    data-initial-index="<%= $index %>"
+    data-initial-parent="<%= $parent_id %>"
+>
+    <div
+        % if (is_admin) {
+            ondrop="insertGroup(event, this);" ondragover="checkDrop(event, this);"
+            ondragstart="dragGroup(event, this);"
+            ondragleave="leaveDrag(event, this);" draggable="true"
+        % }
+    >
+        % if (is_admin) {
+            <div
+                class="enforce-parent-drop"
+                ondrop="insertParentGroup(event, this.parentElement);"
+                ondragover="checkParentDrop(event, this.parentElement, true, true);"
+                ondragstart="dragParentGroup(event, this.parentElement);"
+            >
+            </div>
+            <a href="#" onclick="return deleteGroup(this, false);" class="fa-solid fa-trash" title="Delete job group <%= $group->name %>"></a>
+        % }
+        <i class="fa-solid fa-bars"></i>
+        <span>
+            %= link_to $group->name => url_for('admin_job_templates', groupid => $group->id)
+        </span>
+    </div>
+</li>

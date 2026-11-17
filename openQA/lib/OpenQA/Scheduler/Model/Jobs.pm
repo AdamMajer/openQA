@@ -1,0 +1,807 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Scheduler::Model::Jobs;
+use Mojo::Base 'Mojo::EventEmitter', -signatures;
+
+use Data::Dump 'pp';
+use DateTime;
+use File::Temp 'tempdir';
+use Feature::Compat::Try;
+use OpenQA::Jobs::Constants;
+use OpenQA::Events;
+use OpenQA::Log qw(log_debug log_info log_warning);
+use OpenQA::Utils qw(random_string storage_below_threshold);
+use OpenQA::Constants qw(WEBSOCKET_API_VERSION WORKER_CLASS_LIMIT_REGEX);
+use OpenQA::Schema;
+use OpenQA::Scheduler::DynamicLimit;
+use OpenQA::Scheduler::WorkerSlotPicker;
+use Time::HiRes 'time';
+use List::Util qw(all any shuffle min sum);
+
+# How many jobs to allocate in one tick. Defaults to 80 ( set it to 0 for as much as possible)
+use constant MAX_JOB_ALLOCATION => $ENV{OPENQA_SCHEDULER_MAX_JOB_ALLOCATION} // 80;
+use constant MAX_REPORT_MISSING_WORKER_CLASSES => $ENV{OPENQA_SCHEDULER_MAX_REPORT_MISSING_WORKER_CLASSES} // 30;
+
+# How much the priority should be increased (the priority value decreased) to protect a parallel cluster from starvation
+use constant STARVATION_PROTECTION_PRIORITY_OFFSET => $ENV{OPENQA_SCHEDULER_STARVATION_PROTECTION_PRIORITY_OFFSET} // 1;
+use constant WAITING_FOR_CLUSTER_SIBLINGS_REASON =>
+  'no matching worker for all other jobs in the parallel cluster is free';
+
+has scheduled_jobs => sub { {} };
+has shuffle_workers => 1;
+has dynamic_limit => sub { OpenQA::Scheduler::DynamicLimit->new };
+
+sub determine_online_workers ($shuffle = 0) {
+    my $workers = OpenQA::Schema->singleton->resultset('Workers');
+    # reserved workers without a tag are taken out of the scheduling rotation
+    my $reserved = $workers->active_reservations;
+    my @online_workers = grep {
+        my $res = $reserved->{$_->id};
+        !$_->dead && (!$res || defined $res->{worker_class});
+    } $workers->search(
+        {
+            error => undef,
+            'properties.key' => 'WEBSOCKET_API_VERSION',
+            'properties.value' => WEBSOCKET_API_VERSION
+        },
+        {join => 'properties'})->all;
+    return $shuffle ? shuffle(\@online_workers) : \@online_workers;
+}
+
+sub determine_free_workers ($online_workers) {
+    return [grep { !$_->job_id } @$online_workers];
+}
+
+sub determine_scheduled_jobs ($self) {
+    $self->_update_scheduled_jobs;
+    return $self->scheduled_jobs;
+}
+
+sub effective_job_limit ($self) {
+    my $config = OpenQA::App->singleton->config->{scheduler};
+    return $config->{max_running_jobs} unless $config->{dynamic_job_limit_enabled};
+    return $self->dynamic_limit->current_limit($config);
+}
+
+sub _allocate_jobs ($self, $online_workers = undef, $free_workers = undef) {
+    $online_workers //= determine_online_workers($self->shuffle_workers);
+    $free_workers //= determine_free_workers($online_workers);
+    my ($allocated_workers, $allocated_jobs) = ({}, {});
+    my $scheduled_jobs = $self->scheduled_jobs;
+    $scheduled_jobs->{$_}->{current_reason} = undef for keys %$scheduled_jobs;
+
+    my $schema = OpenQA::Schema->singleton;
+    my $running = $schema->resultset('Jobs')->count({state => [OpenQA::Jobs::Constants::EXECUTION_STATES]});
+    my $limit = $self->effective_job_limit;
+    if (storage_below_threshold()) {
+        log_debug('Skipping job scheduling: free storage space in results directory below threshold');
+        $_->{current_reason} = 'storage space below threshold' for values %$scheduled_jobs;
+        return ({}, {});
+    }
+    if ($limit >= 0 && $running >= $limit) {
+        log_debug("job limit ($limit) exceeded, scheduling no additional jobs");
+        $_->{current_reason} = "job limit reached (max_running_jobs=$limit)" for values %$scheduled_jobs;
+        return ({}, {});
+    }
+    my $max_allocate = $limit >= 0 ? min(MAX_JOB_ALLOCATION, $limit - $running) : MAX_JOB_ALLOCATION;
+    my $active_reservations = OpenQA::Schema->singleton->resultset('Workers')->active_reservations;
+
+    # update the matching workers to the current free
+    my %rejected;
+    for my $id (keys %$scheduled_jobs) {
+        my $jobinfo = $scheduled_jobs->{$id};
+        my $has_matching_online = 0;
+        $jobinfo->{matching_workers}
+          = _matching_workers($jobinfo, $online_workers, \%rejected, \$has_matching_online, $active_reservations);
+        if (!@{$jobinfo->{matching_workers}}) {
+            my @needed = sort @{$jobinfo->{worker_classes}};
+            $jobinfo->{current_reason}
+              = !@needed ? 'job has no worker class'
+              : $has_matching_online ? "no free workers for class @needed"
+              : "no workers online for requested class @needed at all";
+        }
+    }
+    if (keys %rejected) {
+        my @rejected = sort { $rejected{$b} <=> $rejected{$a} || $a cmp $b } keys %rejected;
+        splice @rejected, MAX_REPORT_MISSING_WORKER_CLASSES;
+        my $stats = join ',', map { "$_:$rejected{$_}" } @rejected;
+        my $info = sprintf 'Skipping %d jobs because of no free workers for requested worker classes (%s)',
+          sum(values %rejected), $stats;
+        log_debug($info);
+    }
+
+    # before we start looking at sorted jobs, we try to repair half scheduled clusters
+    # note: This can happen e.g. with workers connected to multiple web UIs or when jobs are scheduled
+    #       non-atomically via openqa-clone-job or if a worker simply does not pick up the job (e.g. goes
+    #       instead into the broken state for some reason).
+    $self->_pick_siblings_of_running($allocated_jobs, $allocated_workers);
+
+    # Parse class limits from online workers
+    my ($class_limits, $executing_class_counts, $allocated_class_counts)
+      = _parse_class_limits_and_counts($schema, $online_workers, $allocated_jobs);
+
+    my @sorted = sort { $a->{priority} <=> $b->{priority} || $a->{id} <=> $b->{id} } values %$scheduled_jobs;
+    my %checked_jobs;
+    for my $j (@sorted) {
+        my $job_id = $j->{id};
+        if ($checked_jobs{$job_id} || defined $allocated_jobs->{$job_id} || !@{$j->{matching_workers}}) {
+            $checked_jobs{$job_id} = 1;
+            next;
+        }
+        my $tobescheduled = _to_be_scheduled($j, $scheduled_jobs);
+        if (!defined $tobescheduled) {
+            log_debug "Skipping job $job_id because dependent jobs are not ready";
+            $j->{current_reason} = 'parallel dependencies not ready';
+            next;
+        }
+        my $slots = OpenQA::Scheduler::WorkerSlotPicker->new($tobescheduled)->pick_slots_with_common_worker_host;
+        my @tobescheduled = grep { $_->{id} } @$tobescheduled;
+        my $parallel_count = scalar @tobescheduled;
+        log_debug "Need to schedule $parallel_count parallel jobs for job $job_id (with priority $j->{priority})";
+        next unless @tobescheduled;
+        if (defined $slots && !@$slots) {
+            $_->{current_reason} = 'no matching worker is free on a single host for parallel cluster'
+              for @tobescheduled;
+            $checked_jobs{$_->{id}} = 1 for @tobescheduled;
+            next;
+        }
+        my %taken;
+        my %temp_taken_class_counts;
+        for my $sub_job (sort { $a->{id} <=> $b->{id} } @tobescheduled) {
+            $checked_jobs{$sub_job->{id}} = 1;
+            my ($picked_worker, $matched_but_limit, $limit_class_name)
+              = _pick_worker_for_sub_job($sub_job, $allocated_workers, \%taken, $class_limits,
+                $executing_class_counts, $allocated_class_counts, \%temp_taken_class_counts);
+            if (!$picked_worker) {
+                # we failed to allocate a worker for all jobs in the
+                # cluster, so discard all of them. But as it would be
+                # their turn, give the jobs which already got a worker
+                # a bonus on their priority
+                my $prio = $j->{priority};    # we only consider the priority of the main job
+                for my $worker (keys %taken) {
+                    my ($picked_worker, $job_info) = @{$taken{$worker}};
+                    $self->_allocate_worker_with_priority($prio, $job_info, $j, $allocated_workers, $picked_worker);
+                }
+                _set_allocation_failure_reasons(
+                    {
+                        sub_job => $sub_job,
+                        tobescheduled => \@tobescheduled,
+                        parallel_count => $parallel_count,
+                        matched_but_limit => $matched_but_limit,
+                        limit_class_name => $limit_class_name,
+                        class_limits => $class_limits,
+                    });
+                %taken = ();
+                last;
+            }
+            $taken{$picked_worker->id} = [$picked_worker, $sub_job];
+            _update_temp_taken_class_counts($picked_worker, $class_limits, \%temp_taken_class_counts);
+        }
+        for my $picked_worker_id (keys %taken) {
+            my ($picked_worker, $job_info) = @{$taken{$picked_worker_id}};
+            my $job_id = $job_info->{id};
+            $allocated_workers->{$picked_worker_id} = $job_id;
+            $allocated_jobs->{$job_id}
+              = {job => $job_id, worker => $picked_worker_id, priority_offset => \$j->{priority_offset}};
+        }
+        # Update allocated class counts
+        $allocated_class_counts->{$_} += $temp_taken_class_counts{$_} for keys %temp_taken_class_counts;
+        # we make sure we schedule clusters no matter what,
+        # but we stop if we're over the limit
+        my $busy = keys %$allocated_workers;
+        if ($busy >= $max_allocate || $busy >= @$free_workers) {
+            my $free_worker_count = @$free_workers;
+            log_debug('limit reached, scheduling no additional jobs'
+                  . " (job_limit=$limit, free workers=$free_worker_count, running=$running, allocated=$busy)");
+            for my $id (keys %$scheduled_jobs) {
+                next if defined $allocated_jobs->{$id} || $checked_jobs{$id};
+                $scheduled_jobs->{$id}->{current_reason} //= "scheduling limit reached (max_running_jobs=$limit)";
+            }
+            last;
+        }
+    }
+    return ($allocated_workers, $allocated_jobs);
+}
+
+sub _allocate_worker_with_priority ($self, $prio, $job_info, $j, $allocated_workers, $worker) {
+    if ($prio > 0) {
+        # this means we will by default increase the offset per half-assigned job,
+        # so if we miss 1/25 jobs, we'll bump by +24
+        log_debug "Discarding job $job_info->{id} (with priority $prio) due to incomplete parallel cluster"
+          . ', reducing priority by '
+          . STARVATION_PROTECTION_PRIORITY_OFFSET;
+        $j->{priority_offset} += STARVATION_PROTECTION_PRIORITY_OFFSET;
+    }
+    else {
+        # don't "take" the worker, but make sure it's not
+        # used for another job and stays around
+        my ($worker_id, $job_id) = ($worker->id, $job_info->{id});
+        log_debug "Holding worker $worker_id for job $job_id to avoid starvation";
+        $allocated_workers->{$worker_id} = $job_id;
+    }
+    $j->{current_reason} //= WAITING_FOR_CLUSTER_SIBLINGS_REASON;
+    $job_info->{current_reason} //= WAITING_FOR_CLUSTER_SIBLINGS_REASON;
+}
+
+sub _set_allocation_failure_reasons ($args) {
+    my ($sub_job, $tobescheduled) = @{$args}{qw(sub_job tobescheduled)};
+    my ($parallel_count, $matched_but_limit) = @{$args}{qw(parallel_count matched_but_limit)};
+    my ($limit_class_name, $class_limits) = @{$args}{qw(limit_class_name class_limits)};
+    my @sub_needed = sort @{$sub_job->{worker_classes} // []};
+    my $limit_reason = $matched_but_limit ? _class_limit_reason($limit_class_name, $class_limits) : undef;
+    if ($parallel_count > 1) {
+        $sub_job->{current_reason} //= $limit_reason // (
+            @sub_needed
+            ? "no matching worker for class @sub_needed is free in parallel cluster"
+            : 'no matching worker is free in parallel cluster'
+        );
+        $_->{current_reason} //= WAITING_FOR_CLUSTER_SIBLINGS_REASON for @$tobescheduled;
+    }
+    else {
+        $sub_job->{current_reason} = $limit_reason
+          // (@sub_needed ? "no free workers for class @sub_needed" : 'no matching worker is free');
+    }
+}
+
+sub _class_limit_reason ($class_name, $class_limits) {
+    return "class limit reached ($class_name limit is $class_limits->{$class_name})";
+}
+
+sub _assign_single_job ($self, $schema, $worker, $job) {
+    $schema->txn_do(
+        sub {
+            $job->set_assigned_worker($worker);
+            $worker->set_current_job($job);
+        });
+    $job->ws_send($worker);
+}
+
+sub _assign_multiple_jobs ($self, $schema, $worker, $worker_id, $jobs, $directly_chained_job_sequence, $job_ids) {
+    # note: The $worker->update(...) is also done when the worker sends a status update. That is
+    #       required to track the worker's current job when assigning multiple jobs to it. We still
+    #       need to set it here immediately to be sure the scheduler does not consider the worker
+    #       free anymore.
+    return $self->_assign_single_job($schema, $worker, $jobs->[0]) if @$jobs == 1;
+    my %worker_assignment = (state => ASSIGNED, t_started => undef, assigned_worker_id => $worker_id, reason => undef);
+    $schema->txn_do(
+        sub {
+            $_->update(\%worker_assignment) for @$jobs;
+            $worker->set_current_job($jobs->[0]);
+        });
+    $self->_assign_multiple_jobs_to_worker($jobs, $worker, $directly_chained_job_sequence, $job_ids);
+}
+
+sub _assign_jobs ($self, @args) {
+    my $res = $self->_assign_multiple_jobs(@args);
+    ref $res eq 'HASH' && exists $res->{state} and return $res;
+    die 'Failed contacting websocket server over HTTP';
+}
+
+sub schedule ($self) {
+    my $start_time = time;
+    my $schema = OpenQA::Schema->singleton;
+    my $online_workers = determine_online_workers($self->shuffle_workers);
+    my $free_workers = determine_free_workers($online_workers);
+    my $worker_count = $schema->resultset('Workers')->count;
+    my $free_worker_count = @$free_workers;
+
+    my $scheduled_jobs = $self->determine_scheduled_jobs;
+    log_debug("Scheduling: Free workers: $free_worker_count/$worker_count; Scheduled jobs: "
+          . (scalar keys %$scheduled_jobs));
+
+    my ($allocated_workers, $allocated_jobs) = $self->_allocate_jobs($online_workers, $free_workers);
+
+    $self->_update_job_reasons_in_db($schema, $scheduled_jobs);
+    my @successfully_allocated;
+
+    # assign the allocated job-worker pairs
+    for my $allocated (values %$allocated_jobs) {
+        # find worker
+        my $worker_id = $allocated->{worker};
+        my $worker;
+        try {
+            $worker = $schema->resultset('Workers')->find({id => $worker_id});
+        }
+        catch ($e) {
+            log_debug("Failed to retrieve worker ($worker_id) in the DB, reason: $e");    # uncoverable statement
+        }
+        next unless $worker;
+        if ($worker->unfinished_jobs->count) {
+            log_debug 'Worker already got jobs, skipping';
+            next;
+        }
+
+        # take directly chained jobs into account
+        # note: That these jobs have a matching WORKER_CLASS is enforced on dependency creation.
+        my $first_job_id = $allocated->{job};
+        my $cluster_info = $scheduled_jobs->{$first_job_id}->{cluster_jobs};
+        my $jobs_resultset = $schema->resultset('Jobs');
+        my %sort_criteria;
+        for my $job_id (keys %$cluster_info) {
+            my $sort_criteria;
+            if (my $scheduled_job = $scheduled_jobs->{$job_id}) {
+                $sort_criteria = $scheduled_job->{test};
+            }
+            elsif (my $job = $jobs_resultset->find($job_id)) {
+                $sort_criteria = $job->TEST;
+            }
+            $sort_criteria{$job_id} = $sort_criteria || $job_id;
+        }
+        my $sort_function = sub ($job_ids) {
+            [sort { $sort_criteria{$a} cmp $sort_criteria{$b} } @$job_ids]
+        };
+        my ($directly_chained_job_sequence, $job_ids);
+        try {
+            ($directly_chained_job_sequence, $job_ids)
+              = _serialize_directly_chained_job_sequence($first_job_id, $cluster_info, $sort_function);
+        }
+        catch ($e) {
+            chomp $e;
+            log_info("Unable to serialize directly chained job sequence of $first_job_id: $e");
+            # deprioritize jobs with broken directly chained dependencies so they don't prevent other jobs from
+            # being assigned
+            ${$allocated->{priority_offset}} -= 1;
+        }
+        next unless $job_ids;
+
+        # find jobs
+        my @jobs = $schema->resultset('Jobs')->search({id => {-in => $job_ids}});
+        my $actual_job_count = scalar @jobs;
+        my $job_ids_str = join ', ', @$job_ids;
+        if ($actual_job_count != scalar @$job_ids) {
+            log_debug("Failed to retrieve jobs ($job_ids_str) in the DB, reason: only got $actual_job_count jobs");
+            next;
+        }
+
+        # check whether the jobs are still scheduled
+        if (my @skipped_jobs = grep { $_->state ne SCHEDULED } @jobs) {
+            log_debug('Job ' . $_->id . ' no longer scheduled, skipping') for @skipped_jobs;
+            next;
+        }
+
+        # check whether the jobs have no worker assigned yet (so jobs already pulled as chained children are not
+        # scheduled twice)
+        if (my @skipped_jobs = grep { defined $_->assigned_worker_id } @jobs) {
+            log_debug('Job ' . $_->id . ' has already a worker assigned, skipping') for @skipped_jobs;
+            next;
+        }
+
+        # assign the jobs to the worker and then send the jobs to the worker
+        my $res;
+        try {
+            $res = $self->_assign_jobs($schema, $worker, $worker_id, \@jobs, $directly_chained_job_sequence, $job_ids);
+        }
+        catch ($e) {
+            log_warning "Failed to send data to websocket server, reason: $e";
+        }
+
+        my $state = (ref $res eq 'HASH' && ref $res->{state} eq 'HASH') ? $res->{state} : {};
+        if ($state->{msg_sent}) {
+            # note: That only means the websocket server could *start* sending the message but not that the message
+            #       has been received and acknowledged by the worker.
+            log_debug("Sent job(s) '$job_ids_str' to worker '$worker_id'");
+            push @successfully_allocated, map { {job => $_, worker => $worker_id} } @$job_ids;
+            next;
+        }
+
+        # reset worker and jobs on failure
+        my $error = $state->{error} // 'unknown error';
+        log_warning "Failed sending job(s) '$job_ids_str' to worker '$worker_id': $error";
+        try {
+            $schema->txn_do(sub { $worker->unprepare_for_work; });
+        }
+        catch ($e) {
+            log_warning "Failed resetting unprepare worker, reason: $e";    # uncoverable statement
+        }
+        for my $job (@jobs) {
+            try {
+                # remove the associated worker and be sure to be in scheduled state.
+                $schema->txn_do(sub { $job->reschedule_state; });
+            }
+            catch ($e) {
+                # if we see this, we are in a really bad state
+                my $job_id = $job->id;    # uncoverable statement
+                log_warning "Failed resetting job '$job_id' to scheduled state, reason: $e";    # uncoverable statement
+            }
+        }
+    }
+
+    my $elapsed_rounded = sprintf '%.5f', (time - $start_time);
+    log_debug "Scheduler took ${elapsed_rounded}s to perform operations and allocated "
+      . scalar(@successfully_allocated) . ' jobs';
+    log_debug 'Allocated: ' . pp($_) for @successfully_allocated;
+    $self->emit('conclude');
+
+    return (\@successfully_allocated);
+}
+
+sub _update_job_reasons_in_db ($self, $schema, $scheduled_jobs) {
+    # batch update job reasons if they changed
+    my %reasons_to_update;
+    for my $id (keys %$scheduled_jobs) {
+        my $info = $scheduled_jobs->{$id};
+        my $curr = $info->{current_reason};
+        my $last = $info->{last_reason};
+        if (($curr // '') ne ($last // '')) {
+            push @{$reasons_to_update{$curr // 'NULL'}}, $id;
+            $info->{last_reason} = $curr;
+        }
+    }
+    my $jobs = $schema->resultset('Jobs');
+    for my $reason (keys %reasons_to_update) {
+        my $ids = $reasons_to_update{$reason};
+        my $val = $reason eq 'NULL' ? undef : $reason;
+        $jobs->search({id => {-in => $ids}})->update({reason => $val});
+    }
+}
+
+sub singleton ($class = undef) { state $jobs ||= ($class // __PACKAGE__)->new }
+
+sub _matching_workers (
+    $jobinfo, $online_workers,
+    $rejected = {},
+    $has_matching_online_ref = undef,
+    $active_reservations = {})
+{
+    my @free_matching;
+    my @needed = sort @{$jobinfo->{worker_classes}};
+    for my $worker (@$online_workers) {
+        my $res = $active_reservations->{$worker->id};
+        my $matches_effective = $worker->accepts_classes(\@needed, $res ? $res->{worker_class} : undef);
+        my $matches_base = $worker->accepts_classes(\@needed, undef);
+        $$has_matching_online_ref = 1 if $has_matching_online_ref && ($matches_effective || $matches_base);
+        push @free_matching, $worker if $matches_effective && !$worker->job_id;
+    }
+    $rejected->{join ',', @needed}++ unless @free_matching;
+    return \@free_matching;
+}
+
+sub _jobs_in_execution ($need) {
+    my $jobs_rs = OpenQA::Schema->singleton->resultset('Jobs');
+    $jobs_rs->search({id => {-in => $need}, state => [OpenQA::Jobs::Constants::EXECUTION_STATES]})->all;
+}
+
+sub _worker_info_of_job ($job) {
+    return undef unless my $assigned_worker = $job->assigned_worker;
+    return {host => $assigned_worker->host, one_host_only => $assigned_worker->get_property('PARALLEL_ONE_HOST_ONLY')};
+}
+
+sub _worker_info_of_cluster ($jobinfo, $running_cluster_jobs) {
+    my $worker_info;
+    my $worker_one_host_only = 0;
+    for my $j (keys %{$jobinfo->{cluster_jobs}}) {
+        if (my $worker_info_for_cluster_job = $running_cluster_jobs->{$j}) {
+            $worker_one_host_only = 1 if $worker_info_for_cluster_job->{one_host_only};
+            $worker_info //= $worker_info_for_cluster_job;
+        }
+        last if $worker_one_host_only;
+    }
+    return ($worker_info, $worker_one_host_only);
+}
+
+sub _pick_siblings_of_running ($self, $allocated_jobs, $allocated_workers) {
+    my $scheduled_jobs = $self->scheduled_jobs;
+    my @need;
+    # determine the IDs of unallocated jobs in parallel clusters of currently scheduled jobs
+    for my $jobinfo (values %$scheduled_jobs) {
+        for my $j (keys %{$jobinfo->{cluster_jobs}}) {
+            push @need, $j unless defined $scheduled_jobs->{$j};
+        }
+    }
+
+    # determine all running jobs in parallel clusters of currently scheduled jobs and their worker host
+    my %running_cluster_jobs = map { ($_->id => _worker_info_of_job $_) } _jobs_in_execution(\@need);
+
+    # pick jobs with running parallel siblings (prio doesn't matter)
+    for my $jobinfo (values %$scheduled_jobs) {
+        # check on what host the cluster is running and whether the cluster is pinned to one host only
+        my ($worker_info, $worker_one_host_only) = _worker_info_of_cluster($jobinfo, \%running_cluster_jobs);
+        next unless $worker_info;
+
+        #  allocate job on a matching worker ensuring it is on the same host if "one_host_only" is enabled
+        my $job_id = $jobinfo->{id};
+        my $worker_host = $worker_info->{host};
+        for my $matching_worker (@{$jobinfo->{matching_workers}}) {
+            my $matching_worker_id = $matching_worker->id;
+            next if $allocated_workers->{$matching_worker_id};
+            if (
+                (
+                       $worker_one_host_only
+                    || $jobinfo->{one_host_only}
+                    || $matching_worker->get_property('PARALLEL_ONE_HOST_ONLY'))
+                && ($matching_worker->host ne $worker_host))
+            {
+                log_debug "Cannot assign job $job_id on $matching_worker_id, cluster already runs on host $worker_host";
+                next;
+            }
+            $allocated_workers->{$matching_worker_id} = $job_id;
+            $allocated_jobs->{$job_id} = {job => $job_id, worker => $matching_worker_id};
+            last;
+        }
+
+        # skip $jobinfo in _allocate_jobs, it would lead to "Skipping job … because dependent jobs are not ready"
+        $jobinfo->{matching_workers} = [];
+    }
+}
+
+sub _to_be_scheduled_recurse ($job_info, $scheduled, $visited) {
+    # return falsy value if the cluster is not fully scheduled (e.g. blocked_by is set or there are Gru dependencies)
+    return 0 unless defined($job_info) && defined(my $job_id = $job_info->{id});
+
+    # keep track of visited jobs; return early if already visited
+    return 1 if $visited->{$job_id};
+    $visited->{$job_id} = $job_info;
+
+    # traverse further through the dependency tree
+    return 0 unless defined(my $ci = $job_info->{cluster_jobs}->{$job_id});
+    _to_be_scheduled_recurse($scheduled->{$_}, $scheduled, $visited) or return 0 for @{$ci->{parallel_children}};
+    _to_be_scheduled_recurse($scheduled->{$_}, $scheduled, $visited) or return 0 for @{$ci->{parallel_parents}};
+    return 1;
+}
+
+sub _to_be_scheduled ($job_info, $scheduled) {
+    my %visited;
+    _to_be_scheduled_recurse($job_info, $scheduled, \%visited) ? [values %visited] : undef;
+}
+
+sub _update_scheduled_jobs ($self) {
+    my $cur_time = DateTime->now(time_zone => 'UTC');
+    my $max_job_scheduled_time = OpenQA::App->singleton->config->{scheduler}->{max_job_scheduled_time};
+
+    # consider all scheduled jobs not being blocked by a parent job or Gru task
+    my $schema = OpenQA::Schema->singleton;
+    my $waiting_jobs = $schema->resultset('GruDependencies')->get_column('job_id')->as_query;
+    my $jobs = $schema->resultset('Jobs')
+      ->search({id => {-not_in => $waiting_jobs}, blocked_by_id => undef, state => SCHEDULED});
+
+    my $scheduled_jobs = $self->scheduled_jobs;
+    my %currently_scheduled;
+    my %cluster_infos;
+    my @missing_worker_class;
+    while (my $job = $jobs->next) {
+        # cancel jobs exceeding the max. time a job may be scheduled
+        if (($cur_time - $job->t_created)->delta_days > $max_job_scheduled_time) {
+            my $reason = "scheduled for more than $max_job_scheduled_time days";
+            $job->cancel(OpenQA::Jobs::Constants::TIMEOUT_EXCEEDED, $reason);
+            OpenQA::Events->singleton->emit_event('openqa_job_cancel', data => {id => $job->id, reason => $reason});
+            next;
+        }
+
+        # the priority_offset stays in the hash for the next round
+        # and is increased whenever a cluster job has to give up its
+        # worker because its siblings failed to find a worker on their
+        # own. Once the combined priority reaches 0, the worker pick is sticky
+        my $info = $scheduled_jobs->{$job->id} || {priority_offset => 0};
+        $currently_scheduled{$job->id} = 1;
+        # for easier access
+        $info->{id} = $job->id;
+        $info->{priority} = $job->priority - $info->{priority_offset};
+        $info->{state} = $job->state;
+        $info->{test} = $job->TEST;
+        if (!$info->{worker_classes}) {
+            push @missing_worker_class, $job->id;
+            $info->{worker_classes} = [];
+        }
+
+        my $cluster_jobs = $info->{cluster_jobs} ||= $cluster_infos{$job->id};
+        if (!$cluster_jobs) {
+            $cluster_jobs = $info->{cluster_jobs} = $job->cluster_jobs;
+            # it's the same cluster for all, so share
+            $cluster_infos{$_} = $cluster_jobs for keys %$cluster_jobs;
+        }
+        $info->{one_host_only} = any { $_->{one_host_only} } values %$cluster_jobs;
+        $scheduled_jobs->{$job->id} = $info;
+    }
+    # fetch worker classes
+    my $settings
+      = $schema->resultset('JobSettings')->search({key => 'WORKER_CLASS', job_id => {-in => \@missing_worker_class}});
+    while (my $line = $settings->next) {
+        push @{$scheduled_jobs->{$line->job_id}->{worker_classes}}, $line->value;
+    }
+    # delete stale entries
+    for my $id (keys %$scheduled_jobs) {
+        delete $scheduled_jobs->{$id} unless $currently_scheduled{$id};
+    }
+}
+
+# serializes the sequence of directly chained jobs inside the specified $cluster_info starting from $first_job_id
+# remarks:
+#  * Direct dependency chains might be interrupted by regularly chained dependencies. Jobs not reachable from $first_job_id
+#    via directly chained dependencies nodes are not included.
+#  * Stops following a direct (sub)chain when a job has been encountered which is not SCHEDULED anymore.
+#  * Provides a 'flat' list of involved job IDs as 2nd return value.
+#  * See subtest 'serialize sequence of directly chained dependencies' in
+#    t/05-scheduler-serialize-directly-chained-dependencies.t for examples.
+sub _serialize_directly_chained_job_sequence ($first_job_id, $cluster_info, $sort_function = undef) {
+    my %visited = ($first_job_id => 1);
+    my $sequence
+      = _serialize_directly_chained_job_sub_sequence([$first_job_id], \%visited,
+        $cluster_info->{$first_job_id}->{directly_chained_children},
+        $cluster_info, $sort_function // sub { return shift });
+    return ($sequence, [keys %visited]);
+}
+
+sub _serialize_directly_chained_job_sub_sequence ($output_array, $visited, $child_job_ids, $cluster_info,
+    $sort_function)
+{
+    for my $current_job_id (@{$sort_function->($child_job_ids)}) {
+        my $current_job_info = $cluster_info->{$current_job_id};
+        next unless $current_job_info->{state} eq SCHEDULED;
+        die "detected cycle at $current_job_id\n" if $visited->{$current_job_id}++;
+        my $sub_sequence
+          = _serialize_directly_chained_job_sub_sequence([$current_job_id], $visited,
+            $current_job_info->{directly_chained_children},
+            $cluster_info, $sort_function);
+        push @$output_array, scalar @$sub_sequence > 1 ? $sub_sequence : $sub_sequence->[0] if @$sub_sequence;
+    }
+    return $output_array;
+}
+
+sub _assign_multiple_jobs_to_worker ($self, $jobs, $worker, $directly_chained_job_sequence, $job_ids) {
+    # prepare job data for the worker
+    my $worker_id = $worker->id;
+    my %job_data;
+    my %job_info = (
+        ids => $job_ids,
+        data => \%job_data,
+        sequence => $directly_chained_job_sequence,
+        assigned_worker_id => $worker_id,
+    );
+    my $first_job = $directly_chained_job_sequence->[0];
+    if (my $tmpdir = $worker->get_property('WORKER_TMPDIR')) {
+        File::Path::rmtree($tmpdir);
+    }
+    my %worker_properties = (
+        JOBTOKEN => random_string(),
+        WORKER_TMPDIR => tempdir(sprintf('scheduler.worker-%d.XXXXXXXX', $worker_id), TMPDIR => 1));
+    $worker->set_property(WORKER_TMPDIR => $worker_properties{WORKER_TMPDIR});
+    $job_data{$_->id} = $_->prepare_for_work($worker, \%worker_properties) for @$jobs;
+    return OpenQA::WebSockets::Client->singleton->send_jobs(\%job_info);
+}
+
+sub incomplete_and_duplicate_stale_jobs ($self) {
+    try {
+        my $schema = OpenQA::Schema->singleton;
+        for my $job ($schema->resultset('Jobs')->stale_ones) {
+            $schema->txn_do(
+                sub {
+                    # skip if the worker meanwhile showed up
+                    my $worker = $job->assigned_worker // $job->worker;
+                    return if $worker && !$worker->dead;
+
+                    # set jobs not touched by the worker so far back to scheduled
+                    return if $job->state eq ASSIGNED && $job->reschedule_state;
+
+                    # consider other jobs incomplete
+                    my $worker_info = defined $worker ? ('worker ' . $worker->name) : 'worker';
+                    $job->done(
+                        result => OpenQA::Jobs::Constants::INCOMPLETE,
+                        reason => "abandoned: associated $worker_info has not sent any status updates for too long",
+                    );
+                    my $res;
+                    $res = $job->auto_duplicate
+                      if OpenQA::App->singleton->config->{global}->{auto_duplicate_stale_jobs};
+                    if (ref $res) {
+                        log_warning(sprintf 'Dead job %d aborted and duplicated %d', $job->id, $res->id);
+                    }
+                    else {
+                        log_warning(sprintf 'Dead job %d aborted as incomplete', $job->id);
+                    }
+                });
+        }
+    }
+    catch ($e) {
+        log_info("Failed stale job detection: $e");
+    }
+}
+
+sub _parse_class_limits ($online_workers) {
+    my %class_limits;
+    for my $worker (@$online_workers) {
+        my $worker_class_prop = $worker->get_property('WORKER_CLASS') || '';
+        for my $k (split /,/, $worker_class_prop) {
+            if ($k =~ WORKER_CLASS_LIMIT_REGEX) {
+                my ($class, $limit) = ($1, $2);
+                if (!exists $class_limits{$class} || $limit < $class_limits{$class}) {
+                    $class_limits{$class} = $limit;
+                }
+            }
+        }
+    }
+    return \%class_limits;
+}
+
+sub _worker_classes ($worker, $class_limits) {
+    my $worker_class_prop = $worker->get_property('WORKER_CLASS') || '';
+    my %seen_class;
+    return grep { exists $class_limits->{$_} }
+      grep { !$seen_class{$_}++ }
+      map { s/${\WORKER_CLASS_LIMIT_REGEX}/$1/r }
+      split /,/, $worker_class_prop;
+}
+
+sub _calculate_class_counts ($schema, $online_workers, $allocated_jobs, $class_limits) {
+    my %executing_class_counts;
+    my %allocated_class_counts;
+    return (\%executing_class_counts, \%allocated_class_counts) unless %$class_limits;
+
+    my @executing_jobs = $schema->resultset('Jobs')
+      ->search({state => [OpenQA::Jobs::Constants::EXECUTION_STATES]}, {prefetch => 'assigned_worker'})->all;
+    for my $job (@executing_jobs) {
+        my $worker = $job->assigned_worker;
+        next unless $worker;
+        for my $k (_worker_classes($worker, $class_limits)) {
+            $executing_class_counts{$k}++;
+        }
+    }
+
+    my %worker_by_id = map { $_->id => $_ } @$online_workers;
+    for my $job_id (keys %$allocated_jobs) {
+        my $worker_id = $allocated_jobs->{$job_id}->{worker};
+        my $worker = $worker_by_id{$worker_id};
+        next unless $worker;
+        for my $k (_worker_classes($worker, $class_limits)) {
+            $allocated_class_counts{$k}++;
+        }
+    }
+    return (\%executing_class_counts, \%allocated_class_counts);
+}
+
+sub _parse_class_limits_and_counts ($schema, $online_workers, $allocated_jobs) {
+    my $class_limits = _parse_class_limits($online_workers);
+
+    my ($executing_class_counts, $allocated_class_counts)
+      = _calculate_class_counts($schema, $online_workers, $allocated_jobs, $class_limits);
+
+    return ($class_limits, $executing_class_counts, $allocated_class_counts);
+}
+
+sub _pick_worker_for_sub_job ($sub_job, $allocated_workers, $taken, $class_limits, $executing_class_counts,
+    $allocated_class_counts, $temp_taken_class_counts)
+{
+    my $matched_but_limit = 0;
+    my $limit_class_name = '';
+    for my $worker (@{$sub_job->{matching_workers}}) {
+        next if $allocated_workers->{$worker->id};
+        next if $taken->{$worker->id};
+
+        # Check if picking this worker would exceed any class limit
+        my ($exceeds_limit, $exceeded_class)
+          = _worker_exceeds_class_limits($worker, $class_limits, $executing_class_counts,
+            $allocated_class_counts, $temp_taken_class_counts);
+        if ($exceeds_limit) {
+            $matched_but_limit = 1;
+            $limit_class_name = $exceeded_class;
+            next;
+        }
+
+        return ($worker, 0, '');
+    }
+    return (undef, $matched_but_limit, $limit_class_name);
+}
+
+sub _worker_exceeds_class_limits ($worker, $class_limits, $executing_class_counts, $allocated_class_counts,
+    $temp_taken_class_counts)
+{
+    return (0, '') unless keys %$class_limits;
+    for my $k (_worker_classes($worker, $class_limits)) {
+        my $current
+          = ($executing_class_counts->{$k} // 0)
+          + ($allocated_class_counts->{$k} // 0)
+          + ($temp_taken_class_counts->{$k} // 0);
+        if ($current + 1 > $class_limits->{$k}) {
+            return (1, $k);
+        }
+    }
+    return (0, '');
+}
+
+sub _update_temp_taken_class_counts ($worker, $class_limits, $temp_taken_class_counts) {
+    return unless keys %$class_limits;
+    for my $k (_worker_classes($worker, $class_limits)) {
+        $temp_taken_class_counts->{$k}++;
+    }
+}
+
+1;

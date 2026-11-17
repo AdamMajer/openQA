@@ -1,0 +1,33 @@
+#!/bin/bash -e
+
+# Navigate to the docs directory
+cd "$(dirname "${BASH_SOURCE[0]}")/../docs"
+mkdir -p ./build/
+
+if [[ ! -e ./build/images ]]; then
+    ln -s ../images build/images
+fi
+
+pandoc_bin=$(command -v pandoc) || true
+
+if [[ -z "$pandoc_bin" ]]; then
+    echo "pandoc not found in PATH."
+    exit 1
+fi
+
+# Copy CSS to build directory
+cp style.css build/
+
+# Run pandoc
+# We use a simple perl preprocessor to handle include:: directives
+syntax_highlight_opt=""
+if pandoc --help | grep -q 'syntax-highlighting'; then
+    syntax_highlight_opt="--syntax-highlighting=pygments"
+fi
+
+../tools/process-docs | pandoc -s -f gfm -o build/index.html \
+    --template=template.html \
+    -c style.css \
+    $syntax_highlight_opt \
+    --metadata title="openQA Documentation" \
+    --toc --number-sections

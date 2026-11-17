@@ -1,0 +1,218 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Jobs::Constants;
+use Mojo::Base -base, -signatures;
+
+use Exporter 'import';
+use List::Util qw(first);
+
+# define regex for validating test names in accordance with `JobScenarios-01.yaml` and `JobTemplates-01.yaml`
+# note: In contrast to the YAML schema a few more characters are allowed here as they are useful for manually
+#       triggered jobs, e.g. via `openqa-clone-custom-git-refspec`.
+my $TEST_NAME_ALLOWED_CHARS = '\p{Word} _*.,:/#@';
+my $TEST_NAME_ALLOWED_CHARS_PLUS_MINUS = $TEST_NAME_ALLOWED_CHARS . '+-';
+my $TEST_NAME_REGEX = qr|^[?$TEST_NAME_ALLOWED_CHARS_PLUS_MINUS]+\z|;
+sub TEST_NAME_ALLOWED_CHARS () { $TEST_NAME_ALLOWED_CHARS }
+sub TEST_NAME_ALLOWED_CHARS_PLUS_MINUS () { $TEST_NAME_ALLOWED_CHARS_PLUS_MINUS }
+sub TEST_NAME_REGEX () { $TEST_NAME_REGEX }
+
+# job states
+use constant {
+    # initial job state; the job is supposed to be assigned to a worker by the scheduler
+    SCHEDULED => 'scheduled',
+    # the job has been sent to worker but worker has not acknowledged yet; the state might be reverted to
+    # SCHEDULED in some conditions
+    ASSIGNED => 'assigned',
+    # worker prepares execution of backend/isotovideo (e.g. waiting for cache service)
+    SETUP => 'setup',
+    # backend/isotovideo is running
+    RUNNING => 'running',
+    # remaining test results are uploaded after backend/isotovideo has exited
+    UPLOADING => 'uploading',
+    # job was cancelled by the user (result USER_CANCELLED is set) or obsoleted due to a new build (result
+    # OBSOLETED is set) or skipped due to failed (directly) chained dependencies (result SKIPPED is set)
+    CANCELLED => 'cancelled',
+    # worker reported that the job is no longer running (a result other than NONE but *including*
+    # USER_CANCELLED and OBSOLETED is set) or web UI considers job dead/abandoned (result INCOMPLETE is set)
+    # or the job has been cancelled due to failed parallel dependencies (result PARALLEL_FAILED is set)
+    DONE => 'done',
+};
+use constant STATES => (SCHEDULED, ASSIGNED, SETUP, RUNNING, UPLOADING, DONE, CANCELLED);
+
+# note regarding CANCELLED vs. DONE:
+# There is an overlap between CANCELLED and DONE (considering that some results are possibly assigned in either of these
+# states). The state CANCELLED is set by the web UI side, e.g. instantly after the user clicks on the 'Cancel job' button.
+# If the worker acknowledges that the job is cancelled the state is set to DONE. The same applies generally to the other
+# overlapping results. Of course if a job has never been picked up by a worker the state is supposed to remain CANCELLED.
+# That is usually the case for jobs SKIPPED due to failed chained dependencies (*not* directly chained dependencies).
+
+# "meta" states
+use constant PENDING_STATES => (SCHEDULED, ASSIGNED, SETUP, RUNNING, UPLOADING);
+use constant EXECUTION_STATES => (ASSIGNED, SETUP, RUNNING, UPLOADING);
+use constant PRE_EXECUTION_STATES => (SCHEDULED);
+use constant PRISTINE_STATES => (SCHEDULED, ASSIGNED);    # no worker reported any updates/results so far
+use constant FINAL_STATES => (DONE, CANCELLED);
+use constant {
+    PRE_EXECUTION => 'pre_execution',
+    EXECUTION => 'execution',
+    FINAL => 'final',
+};
+use constant META_STATES => (PRE_EXECUTION, EXECUTION, FINAL);
+
+# results for the overall job
+use constant {
+    NONE => 'none',    # there's no overall result yet (job is not yet in one of the FINAL_STATES)
+    PASSED => 'passed',    # the test has been concluded suggessfully with a positive result
+    SOFTFAILED => 'softfailed',    # the test has been concluded suggessfully with a positive result
+    FAILED => 'failed',    # the test has been concluded suggessfully with a negative result
+    INCOMPLETE => 'incomplete',    # worker died or reported some problem
+    SKIPPED => 'skipped',    # (directly) chained dependencies failed before starting this job
+    OBSOLETED => 'obsoleted',    # new iso was posted so the job has been cancelled by openQA
+    PARALLEL_FAILED => 'parallel_failed',    # parallel job failed, this job can't continue
+    PARALLEL_RESTARTED => 'parallel_restarted',    # parallel job was restarted, this job has to be restarted too
+    USER_CANCELLED => 'user_cancelled',    # cancelled by user via job_cancel
+    USER_RESTARTED => 'user_restarted',    # restarted by user via job_restart
+    TIMEOUT_EXCEEDED =>
+      'timeout_exceeded',    # cancelled/stopped after max_job_scheduled_time/MAX_JOB_TIME has been exceeded
+};
+use constant RESULTS => (
+    NONE, PASSED, SOFTFAILED, FAILED, INCOMPLETE, SKIPPED,
+    OBSOLETED, PARALLEL_FAILED, PARALLEL_RESTARTED, USER_CANCELLED, USER_RESTARTED, TIMEOUT_EXCEEDED
+);
+
+# note: See the "Jobs" section of "GettingStarted.md" for the difference between SOFTFAILED and FAILED and
+#       further details.
+
+# "meta" results for the overall job
+use constant COMPLETE_RESULTS => (PASSED, SOFTFAILED, FAILED);
+use constant OK_RESULTS => (PASSED, SOFTFAILED);
+use constant NOT_COMPLETE_RESULTS => (INCOMPLETE, TIMEOUT_EXCEEDED);
+use constant ABORTED_RESULTS =>
+  (SKIPPED, OBSOLETED, PARALLEL_FAILED, PARALLEL_RESTARTED, USER_CANCELLED, USER_RESTARTED);
+use constant NOT_OK_RESULTS => (FAILED, NOT_COMPLETE_RESULTS, ABORTED_RESULTS);
+use constant {
+    COMPLETE => 'complete',
+    NOT_COMPLETE => 'not_complete',
+    ABORTED => 'aborted',
+    OK => 'ok',
+    NOT_OK => 'not_ok',
+};
+use constant META_RESULTS => (COMPLETE, NOT_COMPLETE, ABORTED, OK, NOT_OK);
+
+use constant META_MAPPING => {
+    state => {
+        PRE_EXECUTION() => [PRE_EXECUTION_STATES],
+        EXECUTION() => [EXECUTION_STATES],
+        FINAL() => [FINAL_STATES],
+    },
+    result => {
+        COMPLETE() => [COMPLETE_RESULTS],
+        NOT_COMPLETE() => [NOT_COMPLETE_RESULTS],
+        ABORTED() => [ABORTED_RESULTS],
+        OK() => [OK_RESULTS],
+        NOT_OK() => [NOT_OK_RESULTS],
+    },
+};
+
+# results for particular job modules
+use constant MODULE_RESULTS => (CANCELLED, FAILED, NONE, PASSED, RUNNING, SKIPPED, SOFTFAILED);
+
+# common result files to be expected in all jobs
+use constant COMMON_RESULT_LOG_FILES => qw(autoinst-log.txt worker-log.txt worker_packages.txt sut_packages.txt);
+use constant COMMON_RESULT_FILES => COMMON_RESULT_LOG_FILES, qw(vars.json);
+
+# result files handled by the cleanup of logs
+use constant
+  RESULT_CLEANUP_LOG_FILES => COMMON_RESULT_LOG_FILES,
+  qw(serial0.txt serial_terminal.txt serial_terminal_user.txt video_time.vtt);
+
+# default for new jobs that are useful outside the schema
+use constant DEFAULT_JOB_PRIORITY => 50;
+
+# priority for status aggregation (running/scheduled first, then worst finished result)
+use constant STATUS_PRIORITY =>
+  (RUNNING, SCHEDULED, FAILED, NOT_COMPLETE, SOFTFAILED, ABORTED, CANCELLED, PASSED, NONE);
+
+# the "column" to query for a tag ID in accordance with parse_tags_from_comments() and _important_builds()
+use constant TAG_ID_COLUMN => "concat(VERSION, '-', BUILD)";
+
+our @EXPORT =    ## no critic (Modules::ProhibitAutomaticExportation)
+  qw(
+  TEST_NAME_ALLOWED_CHARS
+  TEST_NAME_ALLOWED_CHARS_PLUS_MINUS
+  TEST_NAME_REGEX
+  ASSIGNED
+  CANCELLED
+  COMPLETE_RESULTS
+  DONE
+  EXECUTION
+  EXECUTION_STATES
+  FAILED
+  FINAL
+  FINAL_STATES
+  INCOMPLETE
+  NOT_COMPLETE
+  NOT_COMPLETE_RESULTS
+  ABORTED
+  ABORTED_RESULTS
+  COMPLETE
+  COMPLETE_RESULTS
+  OK
+  OK_RESULTS
+  NOT_OK
+  NOT_OK_RESULTS
+  NONE
+  OBSOLETED
+  PARALLEL_FAILED
+  PARALLEL_RESTARTED
+  PASSED
+  PENDING_STATES
+  PRE_EXECUTION
+  PRE_EXECUTION_STATES
+  PRISTINE_STATES
+  RESULTS
+  RUNNING
+  SCHEDULED
+  SETUP
+  SKIPPED
+  SOFTFAILED
+  STATES
+  UPLOADING
+  USER_CANCELLED
+  USER_RESTARTED
+  MODULE_RESULTS
+  META_RESULTS
+  META_STATES
+  META_MAPPING
+  COMMON_RESULT_FILES
+  TIMEOUT_EXCEEDED
+  DEFAULT_JOB_PRIORITY
+  RESULT_CLEANUP_LOG_FILES
+  TAG_ID_COLUMN
+  STATUS_PRIORITY
+  calculate_aggregate_status
+  );
+
+# mapping from any specific job state/result to a meta state/result
+my %META_STATE_MAPPING = (
+    (map { $_ => PRE_EXECUTION } PRE_EXECUTION_STATES),
+    (map { $_ => EXECUTION } EXECUTION_STATES),
+    (map { $_ => FINAL } FINAL_STATES),
+);
+my %META_RESULT_MAPPING = (
+    (map { $_ => $_ } COMPLETE_RESULTS),
+    (map { $_ => NOT_COMPLETE } NOT_COMPLETE_RESULTS),
+    (map { $_ => ABORTED } ABORTED_RESULTS),
+);
+sub meta_state ($state) { $META_STATE_MAPPING{$state} // NONE }
+sub meta_result ($result) { $META_RESULT_MAPPING{$result} // NONE }
+
+sub is_ok_result ($result) {
+    !!grep { $result eq $_ } OK_RESULTS;
+}
+
+sub calculate_aggregate_status ($aggregated) {
+    my %counts = (%$aggregated, failed => ($aggregated->{failed} // 0) || ($aggregated->{unknown} // 0));
+    return (first { $counts{$_} } STATUS_PRIORITY) // NONE;
+}

@@ -1,0 +1,231 @@
+#######################################################
+# This file is used to generate:
+# cpanfile
+# Certain lines in dist/rpm/openQA.spec
+#
+# After adding, changing or removing dependencies, run:
+#   make update-deps
+#######################################################
+---
+targets:
+  cpanfile: [ assetpack,        client, common, cover, devel, devel_no_selenium, main, test, style_check, worker, mcp ]
+  spec:     [ assetpack, build, client, common, cover, devel, devel_no_selenium, main, test, style_check, worker, mcp ]
+  cpanfile-targets:
+    # target: cpanfile target type (default main)
+    devel: develop
+    devel_no_selenium: develop
+    style_check: develop
+    cover: cover
+    test: test
+
+assetpack_requires:
+  perl(CSS::Minifier::XS): '>= 0.01'
+  perl(JavaScript::Minifier::XS): '>= 0.11'
+  perl(Mojolicious):
+  perl(Mojolicious::Plugin::AssetPack): '>= 1.36'
+  perl(YAML::PP): '>= 0.026'
+
+build_requires:
+  perl(CSS::Sass):
+  python3-argparse-manpage:
+  npm:
+  '%assetpack_requires':
+
+common_requires:
+  perl: '>= 5.20.0'
+  perl(Archive::Zip):
+  perl(Carp::Always): '>= 0.14.02'
+  perl(Config::IniFiles):
+  perl(Cpanel::JSON::XS): '>= 4.09'
+  perl(Cwd):
+  perl(Data::Dump):
+  perl(Data::Dumper):
+  perl(Digest::MD5):
+  perl(Feature::Compat::Try):
+  perl(Filesys::Df):
+  perl(Getopt::Long):
+  perl(HTTP::Status):
+  perl(Minion): '>= 10.25'
+  perl(Mojolicious):
+    perl: '>= 9.34'
+    rpm: '>= 9.340.0'
+  perl(Regexp::Common):
+  perl(Storable):
+  perl(Text::Glob):
+  perl(Time::Moment):
+  perl(IO::Interactive):
+  ntp-daemon:
+
+cover_requires:
+  perl(Devel::Cover):
+  perl(Devel::Cover::Report::Codecovbash):
+
+client_requires:
+  curl:
+  git-core:
+  jq:
+  perl(Getopt::Long::Descriptive):
+  perl(IO::Interactive):
+  perl(IO::Socket::SSL): '>= 2.009'
+  perl(IPC::Run):
+  perl(JSON::Validator):
+  perl(LWP::UserAgent):
+  perl(LWP::Protocol::https):
+  perl(Test::More):
+  perl(YAML::PP): '>= 0.020'
+  perl(YAML::XS):
+
+devel_no_selenium_requires:
+  '%build_requires':
+  '%test_requires':
+  '%style_check_requires':
+  '%qemu':
+  '%cover_requires':
+  curl:
+  make:
+  rsync:
+  postgresql-devel:
+  sudo:
+  tar:
+  xorg-x11-fonts:
+  pandoc:  # for generating HTML documentation
+  python3-weasyprint:  # for generating PDF documentation
+  perl(Perl::Tidy): '== 20260826'
+  perl(Test::CheckGitStatus):
+  perl(TAP::Harness::JUnit):  # for JUnit-compatible test results
+
+devel_requires:
+  '%devel_no_selenium_requires':
+  chromedriver:
+
+main_requires:
+  '%assetpack_requires':
+  git-core:
+  hostname:  # for script/configure-web-proxy
+  bsdtar:  # for extraction feature of OpenQA::Downloader
+  openssh-clients:
+  perl(aliased):
+  perl(base):
+  perl(constant):
+  perl(diagnostics):
+  perl(strict):
+  perl(warnings):
+  perl(BSD::Resource):
+  perl(Carp):
+  perl(CommonMark):
+  perl(CryptX):
+  perl(Date::Format):
+  perl(DateTime):
+  perl(DateTime::Duration):
+  perl(DateTime::Format::Pg):
+  perl(DBD::Pg):
+    perl: '>= 3.007004'
+    rpm: '>= 3.7.4'
+  perl(DBI): '>= 1.632'
+  perl(DBIx::Class): '>= 0.082801'
+  perl(DBIx::Class::DeploymentHandler):
+  perl(DBIx::Class::DynamicDefault):
+  perl(DBIx::Class::ResultClass::HashRefInflator):
+  perl(DBIx::Class::OptimisticLocking):
+  perl(DBIx::Class::Schema::Config):
+  perl(DBIx::Class::Storage::Statistics):
+  perl(Exporter):
+  perl(Fcntl):
+  perl(File::Basename):
+  perl(File::Copy):
+  perl(File::Copy::Recursive):
+  perl(File::Path):
+  perl(File::Spec):
+  perl(FindBin):
+  perl(Getopt::Long::Descriptive):
+  perl(IO::Handle):
+  perl(IPC::Run):
+  perl(JSON::Validator):
+  perl(LWP::UserAgent):
+  perl(Module::Load::Conditional):
+  perl(Module::Pluggable):
+  perl(Mojo::Base):
+  perl(Mojo::ByteStream):
+  perl(Mojo::IOLoop):
+  perl(Mojo::JSON):
+  perl(Mojo::Pg):
+  perl(Mojo::URL):
+  perl(Mojo::Util):
+  perl(Mojolicious::Commands):
+  perl(Mojolicious::Plugin):
+  perl(Mojolicious::Plugin::OAuth2):
+  perl(Mojolicious::Static):
+  perl(Mojo::RabbitMQ::Client):
+    perl: '>= v0.2'
+    rpm: '>= 0.2'
+  perl(Net::OpenID::Consumer):
+  perl(Pod::POM):
+  perl(POSIX):
+  perl(Scalar::Util):
+  perl(Sort::Versions):
+  perl(SQL::Translator):
+  perl(Text::Diff):
+  perl(Time::HiRes):
+  perl(Time::ParseDate):
+  perl(Time::Piece):
+  perl(Time::Seconds):
+  perl(URI::Escape):
+  perl(YAML::PP): '>= 0.026'
+  perl(YAML::XS):        # Required by JSON::Validator as a runtime dependency
+
+worker_requires:
+  os-autoinst:
+  openQA-client:
+  optipng:
+  sqlite3: '>= 3.24.0'   # for INSERT INTO … ON CONFLICT … DO UPDATE SET … required by cache service
+  bsdtar:  # for extraction feature of OpenQA::Downloader
+  perl(Capture::Tiny):
+  perl(Mojo::IOLoop::ReadWriteProcess): '>= 0.26'
+  perl(Minion::Backend::SQLite): '>= 5.0.7'
+  perl(Mojo::SQLite):
+  perl(File::Map):
+  psmisc:
+
+mcp_requires:
+  perl(MCP): '>= 0.80.0'
+
+test_requires:
+  '%common_requires':
+  '%main_requires':
+  '%mcp_requires':
+  '%python_scripts_requires':
+  '%worker_requires':
+  openssh-common:
+  curl:
+  file:
+  jq:
+  os-autoinst:
+  postgresql-server: '>= 14'
+  python3-setuptools:
+  perl(App::cpanminus):
+  perl(Selenium::Remote::Driver): '>= 1.23'
+  perl(Selenium::Remote::WDKeys):
+  perl(Test::Exception):
+  perl(Test::Mojo):
+  perl(Test::Most):
+  perl(Test::Compile):
+  perl(Test::Fatal):
+  perl(Test::MockModule):
+  perl(Test::MockObject):
+  perl(Test::Mock::Time):
+  perl(Test::Output):
+  perl(Test::Pod):
+  perl(Test::Warnings): '>= 0.029'
+
+style_check_requires:
+  python3-yamllint:
+  perl(Test::Perl::Critic):
+  perl(Perl::Critic): '>= 1.156.0'
+  perl(Perl::Critic::Community):
+  perl(Code::TidyAll):
+  perl(Pod::Markdown):
+  ShellCheck:
+  shfmt:
+  python3-gitlint:
+  python3-ruff:
+  python3-typer:

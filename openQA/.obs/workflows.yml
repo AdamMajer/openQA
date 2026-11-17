@@ -1,0 +1,60 @@
+---
+pr:
+  steps:
+    - branch_package:
+        source_project: devel:openQA
+        source_package: openQA
+        target_project: devel:openQA:GitHub
+        add_repositories: disabled
+    - configure_repositories:
+        project: devel:openQA:GitHub
+        repositories:
+          - name: openSUSE_Tumbleweed
+            paths:
+              - target_project: openSUSE:Factory
+                target_repository: snapshot
+              - target_project: devel:openQA
+                target_repository: openSUSE_Tumbleweed
+            architectures: [ x86_64 ]
+          - name: SLE_15_SP7_Backports
+            paths:
+              - target_project: devel:openQA:Leap:15.7
+                target_repository: SLE_15_SP7_Backports
+              - target_project: openSUSE:Backports:SLE-15-SP7:Update
+                target_repository: standard
+              - target_project: devel:openQA  # needed to inherit project config
+                target_repository: '15.7'
+            architectures: [ x86_64 ]
+          - name: '16.0'
+            paths:
+              - target_project: devel:openQA:Leap:16.0
+                target_repository: '16.0'
+              - target_project: devel:openQA
+                target_repository: '16.0'
+            architectures: [ x86_64 ]
+          - name: '16.1'
+            paths:
+              - target_project: devel:openQA:Leap:16.1
+                target_repository: '16.1'
+              - target_project: devel:openQA
+                target_repository: '16.1'
+            architectures: [ x86_64 ]
+
+  filters:
+    event: pull_request
+    branches:
+      only:
+        - master
+
+# Setup:
+# 1. Put this .obs/workflows.yml in the main branch of openQA
+# 2a. (Someone of our team) Create personal access token on GitHub with scope "repo"
+# 2b. Ensure it is renewed before expiry
+# 3. Create token on OBS:
+#   Type: Workflow
+#   Name: GitHub PRs
+#   SCM Token: token from above
+# 4. (Repo admin) Create webhook in openQA:
+#   URL: https://build.opensuse.org/trigger/workflow?id=<OBS Token ID>
+#   Content-Type: application/json
+#   Select individual events: Pull requests

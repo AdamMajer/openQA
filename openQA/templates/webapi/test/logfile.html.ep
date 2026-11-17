@@ -1,0 +1,36 @@
+% layout 'bootstrap';
+% title my $filename = param 'filename';
+
+% content_for 'head' => begin
+%= asset $_ for qw(test_result.js anser.js ansi-colors.css)
+% end
+% content_for 'ready_function' => begin
+    filterEmbeddedLogFiles();
+% end
+
+% my $url = url_for('test_file', testid => $testid, filename => $filename);
+<div class="logfile-toolbar">
+    <div class="corner-buttons">
+        <div class="form-check form-check-inline">
+            <input class="form-check-input" type="radio" name="logfile-query-mode" id="logfile-mode-filter" value="filter" checked>
+            <label class="form-check-label" for="logfile-mode-filter" title="Show only matching lines">Filter</label>
+        </div>
+        <div class="form-check form-check-inline">
+            <input class="form-check-input" type="radio" name="logfile-query-mode" id="logfile-mode-search" value="search">
+            <label class="form-check-label" for="logfile-mode-search" title="Show all lines and highlight matching ones">Search</label>
+        </div>
+        <span id="filter-info"></span>
+        <input id="filter-log-file" placeholder="substring or /regex/i" type="search">
+        <a class="btn btn-light" href=".#downloads">
+            <i class="fa-solid fa-chevron-left"></i> Back to job <%= $testid %>
+        </a>
+        <a class="btn btn-light" href="<%= $url %>" target="blank">
+            <i class="fa-solid fa-download"></i> Raw
+        </a>
+    </div>
+</div>
+<p><%= $filename %></p>
+<hr>
+<div class="embedded-logfile" data-src="<%= $url %>">
+Loading log contents …
+</div>

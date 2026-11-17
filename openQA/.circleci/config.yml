@@ -1,0 +1,287 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@6.0.0
+
+aliases:
+  - &restore_fullstack_cache
+    keys:
+      - v3-{{ checksum "tools/ci/autoinst.sha" }}-{{ checksum "tools/ci/build_autoinst.sh" }}
+
+  - &save_fullstack_cache
+    key: v3-{{ checksum "tools/ci/autoinst.sha" }}-{{ checksum "tools/ci/build_autoinst.sh" }}
+    paths:
+      - "/var/cache/autoinst"
+
+  - &restore_npm_cache
+    keys:
+      - v1-{{ checksum "package-lock.json" }}
+
+  - &save_npm_cache
+    key: v1-{{ checksum "package-lock.json" }}
+    paths:
+      - "~/project/node_modules"
+
+  - &store_logs
+    path: logs
+    destination: artifacts
+
+  - &store_test_results
+    path: test-results/junit
+
+  - &store_artifacts
+    path: test-results/t
+    destination: artifacts
+
+  - &store_cover_db
+    path: cover_db
+    destination: cover_db
+
+  - &build_autoinst
+    name: "Link or build os-autoinst"
+    command: |
+      if [ ! -z "$CIRCLE_WORKFLOW_ID" ]; then # only in workflow
+        rm -rf ../os-autoinst
+        cp -r /var/cache/autoinst ../os-autoinst
+        chown -R 1000 ../os-autoinst
+      else # only in local run
+        tools/ci/build_autoinst.sh
+      fi
+
+  - &make_test
+    name: "Running unit tests"
+    command: tools/ci/run_unit_tests.sh $CIRCLE_JOB
+    no_output_timeout: 50m
+
+  - &git_token_authentication
+    name: "Prepare auth token"
+    command: |
+      echo 'echo $GITHUB_TOKEN' > $(pwd)/.git-askpass
+      echo "export GIT_ASKPASS=$(pwd)/.git-askpass" >> $BASH_ENV
+      chmod +x $(pwd)/.git-askpass
+
+images:
+  - &docker_config
+    environment:
+      COMMIT_AUTHOR_EMAIL: skynet@open.qa
+      # Exclude container specific tests needing a container runtime
+      # environment, using github actions instead
+      CONTAINER_TEST: 0
+      HELM_TEST: 0
+
+  - &devel
+    image: registry.opensuse.org/devel/openqa/containers/opensuse/openqa_ci:latest
+    <<: *docker_config
+
+  - &dependency_bot
+    image: registry.opensuse.org/devel/openqa/containers/opensuse/openqa_ci:latest
+    environment:
+      COMMIT_AUTHOR_EMAIL: skynet@open.qa
+
+jobs:
+  dependencies-pr:
+    docker:
+      - <<: *dependency_bot
+    steps:
+      - checkout
+      - run:
+          name: "Setup git"
+          command: |
+            git config user.email "${COMMIT_AUTHOR_EMAIL}"
+            git config user.name "Dependency bot CI"
+            git config core.autocrlf true
+      - run: *git_token_authentication
+      - run:
+          name: "Prepare dependency PR"
+          command: tools/ci/prepare_dependency_pr.sh
+
+  cache-fullstack:
+    docker:
+      - <<: *devel
+    steps:
+      - checkout
+      - restore_cache: *restore_fullstack_cache
+      - store_artifacts: *store_logs
+      - run:
+          name: "Build os-autoinst (noop if cached)"
+          command: |
+            bash -x tools/ci/build_autoinst.sh "/var/cache/autoinst"
+      - save_cache: *save_fullstack_cache
+
+  cache-npm:
+    docker:
+      - <<: *devel
+    steps:
+      - checkout
+      - restore_cache: *restore_npm_cache
+      - run:
+          name: "Install npm dependencies"
+          command: npm clean-install --ignore-scripts
+      - save_cache: *save_npm_cache
+
+  log-installed-packages:
+    docker:
+      - <<: *devel
+    steps:
+      - run:
+          name: "Log installed rpm packages"
+          command: |
+            mkdir -p logs
+            rpm -q --all | sort > ./logs/packages.txt
+      - store_artifacts: *store_logs
+
+  checkstyle: &test-template
+    docker:
+      - <<: *devel
+    steps:
+      - checkout
+      - store_artifacts: *store_logs
+      - restore_cache: *restore_npm_cache
+      - run: *make_test
+      - persist_to_workspace:
+          root: .
+          paths:
+            - cover_db_*
+      - store_test_results: *store_test_results
+      - store_artifacts: *store_artifacts
+
+  fullstack: &test-fullstack-template
+    docker:
+      - <<: *devel
+    steps:
+      - checkout
+      - restore_cache: *restore_fullstack_cache
+      - store_artifacts: *store_logs
+      - restore_cache: *restore_npm_cache
+      - run: *build_autoinst
+      - run: *make_test
+      - persist_to_workspace:
+          root: .
+          paths:
+            - cover_db_*
+      - store_test_results: *store_test_results
+      - store_artifacts: *store_artifacts
+      - store_artifacts:
+          path: test-results/fullstack
+          destination: artifacts
+  compile:
+    <<: *test-template
+
+  t:
+    <<: *test-template
+
+  heavy:
+    <<: *test-template
+
+  ui:
+    <<: *test-template
+
+  api:
+    <<: *test-template
+
+  unstable:
+    <<: *test-template
+
+  fullstack-unstable:
+    <<: *test-fullstack-template
+
+  codecov:
+    docker:
+      - <<: *devel
+    steps:
+      - checkout
+      - store_artifacts: *store_logs
+      - restore_cache: *restore_npm_cache
+      - attach_workspace:
+          at: .
+      - run:
+          name: Merge coverage databases
+          command: |
+            cover -write cover_db cover_db*
+            ls cover_db/*cov*
+      - run: make coverage-report-html
+      - store_artifacts: *store_cover_db
+      - run: make coverage-report-codecov
+      - codecov/upload:
+          files: cover_db/codecov.json
+          verbose: true
+      - run: ./tools/check-line-coverage cover_db/codecov.json
+
+  build-docs: &docs-template
+    docker:
+      - <<: *devel
+    steps:
+      - checkout
+      - store_artifacts: *store_logs
+      - restore_cache: *restore_npm_cache
+      - run: *git_token_authentication
+      - run: tools/ci/build-docs
+
+  build-docs-nightly:
+    <<: *docs-template
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      - cache-npm
+      - cache-fullstack
+      - log-installed-packages
+      - checkstyle: &requires
+          requires:
+            - cache-npm
+      - compile:
+          <<: *requires
+      - t:
+          <<: *requires
+      - heavy:
+          <<: *requires
+      - api:
+          <<: *requires
+      - ui:
+          <<: *requires
+      # put unstable tests in tools/unstable_tests.txt and uncomment if necessary to handle with retries
+      # - unstable:
+      #     requires:
+      #       - cache-npm
+      - fullstack: &requires_fullstack
+          requires:
+            - cache-npm
+            - cache-fullstack
+      - fullstack-unstable:
+          <<: *requires_fullstack
+      - codecov:
+          context: Codecov
+          requires:
+            - t
+            - heavy
+            - api
+            - ui
+            # - unstable
+            - fullstack
+            - fullstack-unstable
+      - build-docs:
+          <<: *requires
+
+  # Nightly jobs are using the GitHub user "os-autoinst-bot" to create PRs (search for occurrences of `os-autoinst-bot`
+  # within this repository). This user's access token is configured on https://github.com/settings/tokens as usual and set
+  # as variable `GITHUB_TOKEN` on https://app.circleci.com/settings/organization/github/os-autoinst/contexts/200658e0-47ad-4806-bca3-eefa618e6611.
+  nightly:
+    triggers:
+      - schedule:
+          cron: "40 4 * * *"
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      # We also need the package cache for build-docs
+      # https://progress.opensuse.org/issues/123867
+      - cache-npm
+      - cache-fullstack:
+          <<: *requires
+      - dependencies-pr:
+          context: GitHub
+      - build-docs-nightly:
+          context: GitHub
+          <<: *requires_fullstack

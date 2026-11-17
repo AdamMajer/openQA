@@ -1,0 +1,123 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+=head1 worker
+
+worker - openQA worker daemon
+
+=head1 SYNOPSIS
+
+worker [OPTIONS]
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--host> HOST
+
+specify dispatcher/scheduler host to connect to
+
+=item B<--instance> NR
+
+specify instance number, ie pool directory to use
+
+=item B<--apikey> <value>
+
+specify the public key needed for API authentication. Overrides config file
+setting and environment variable C<OPENQA_API_KEY>. Use is discouraged due to
+risk of leaking credentials.
+
+=item B<--apisecret> <value>
+
+specify the secret key needed for API authentication. Overrides config file
+setting and environment variable C<OPENQA_API_SECRET>. Use is discouraged due
+to risk of leaking credentials.
+
+=item B<--isotovideo> PATH
+
+path to isotovideo script, useful for running from git
+
+=item B<--no-cleanup>
+
+don't clean pool directory after job
+
+=item B<--verbose>
+
+verbose output
+
+=item B<--help, -h>
+
+print help
+
+=back
+
+=head1 DESCRIPTION
+
+(no content)
+
+=head1 CONFIG FILE
+
+L<worker> relies on credentials provided by L<OpenQA::Client>, i.e. tries to
+find a config file C<client.conf> resolving C<$OPENQA_CONFIG> or
+C<~/.config/openqa> or C</etc/openqa/> in this order of preference.
+Additionally L<worker> uses a config file C<workers.ini> to configure worker
+settings.
+
+Example:
+  [global]
+  BACKEND = qemu
+  HOST = http://openqa.example.com
+
+
+=head1 SEE ALSO
+L<OpenQA::Client>
+
+=cut
+
+use Mojo::Base -strict, -signatures;
+
+BEGIN {
+    $ENV{MOJO_MAX_MESSAGE_SIZE} = 0;    # no limit for uploads
+    $ENV{MOJO_INACTIVITY_TIMEOUT} = 300;
+    $ENV{MOJO_CONNECT_TIMEOUT} = 300;
+    # the default is EV, and this heavily screws with our children handling
+    $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll';
+    #$ENV{MOJO_LOG_LEVEL} = 'debug';
+    #$ENV{MOJO_USERAGENT_DEBUG} = 1;
+    #$ENV{MOJO_IOLOOP_DEBUG} = 1;
+}
+
+use FindBin;
+use lib "$FindBin::RealBin/../lib";
+use Carp::Always;
+use Getopt::Long;
+Getopt::Long::Configure('no_ignore_case');
+
+use OpenQA::Worker;
+use OpenQA::Log 'log_info';
+
+my %options;
+
+sub usage ($r) { require Pod::Usage; Pod::Usage::pod2usage($r) }
+
+GetOptions(
+    \%options, 'no-cleanup', 'instance=i', 'isotovideo=s', 'host=s', 'apikey:s',
+    'apisecret:s', 'verbose|v|debug|d', 'help|h',
+) or usage(1);
+
+usage(0) if ($options{help});
+
+# count workers from 1 if not set - if tap devices are used worker would try to use tap -1
+$options{instance} ||= 1;
+
+my $worker = OpenQA::Worker->new(\%options);
+$worker->log_setup_info();
+
+sub catch_exit (@args) { $worker->handle_signal(@args) }    # uncoverable statement
+$SIG{HUP} = \*catch_exit;
+$SIG{TERM} = \*catch_exit;
+$SIG{INT} = \*catch_exit;
+
+exit $worker->exec();
+

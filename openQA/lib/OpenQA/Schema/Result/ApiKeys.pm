@@ -1,0 +1,63 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Schema::Result::ApiKeys;
+use Mojo::Base 'DBIx::Class::Core', -signatures;
+
+use Mojo::Util 'trim';
+use OpenQA::Utils 'random_hex';
+
+__PACKAGE__->table('api_keys');
+__PACKAGE__->load_components(qw(InflateColumn::DateTime Timestamps));
+__PACKAGE__->add_columns(
+    id => {
+        data_type => 'bigint',
+        is_auto_increment => 1,
+    },
+    key => {
+        data_type => 'text',
+    },
+    secret => {
+        data_type => 'text',
+    },
+    user_id => {
+        data_type => 'bigint',
+        is_foreign_key => 1,
+    },
+    t_expiration => {
+        data_type => 'timestamp',
+        is_nullable => 1,
+    },
+    comment => {
+        data_type => 'text',
+        default_value => '',
+        is_nullable => 0,
+    },
+    is_operator => {
+        data_type => 'integer',
+        is_boolean => 1,
+        false_id => ['0', '-1'],
+        default_value => '1',
+    },
+    is_admin => {
+        data_type => 'integer',
+        is_boolean => 1,
+        false_id => ['0', '-1'],
+        default_value => '1',
+    },
+);
+__PACKAGE__->add_timestamps;
+__PACKAGE__->set_primary_key('id');
+__PACKAGE__->add_unique_constraint([qw(key)]);
+__PACKAGE__->belongs_to(user => 'OpenQA::Schema::Result::Users', 'user_id');
+
+sub new ($class, $attrs) {
+    $attrs->{key} = random_hex() unless $attrs->{key};
+    $attrs->{secret} = random_hex() unless $attrs->{secret};
+    $attrs->{comment} = trim($attrs->{comment} // '');
+
+    my $new = $class->next::method($attrs);
+    return $new;
+}
+
+1;

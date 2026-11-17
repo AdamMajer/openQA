@@ -1,0 +1,384 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Mojo::Base -signatures;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Test::Mojo;
+use Test::Warnings ':report_warnings';
+use OpenQA::Constants 'DEFAULT_WORKER_TIMEOUT';
+use OpenQA::Test::TimeLimit '40';
+use OpenQA::Test::Case;
+use OpenQA::Test::Utils qw(assume_all_assets_exist embed_server_for_testing wait_for);
+use Date::Format 'time2str';
+use OpenQA::WebSockets::Client;
+use OpenQA::SeleniumTest;
+
+my $broken_worker_id = 5;
+my $online_worker_id = 6;
+my $offline_worker_id = 8;
+
+my $test_case = OpenQA::Test::Case->new;
+my $schema_name = OpenQA::Test::Database::generate_schema_name;
+my $schema
+  = $test_case->init_data(schema_name => $schema_name, fixtures_glob => '01-jobs.pl 02-workers.pl 03-users.pl');
+assume_all_assets_exist;
+
+embed_server_for_testing(
+    server_name => 'OpenQA::WebSockets',
+    client => OpenQA::WebSockets::Client->singleton,
+);
+
+my $jobs = $schema->resultset('Jobs');
+my $workers = $schema->resultset('Workers');
+$jobs->search({id => {-in => [99926, 99961]}})->update({assigned_worker_id => 1});
+$workers->create(
+    {
+        id => $broken_worker_id,
+        host => 'foo',
+        instance => 42,
+        error => 'out of order',
+    });
+
+# ensure workers are not considered dead too soon
+my $online_timestamp = time2str('%Y-%m-%d %H:%M:%S', time + 7200, 'UTC');
+$workers->update({t_seen => $online_timestamp});
+
+my $offline_timestamp = time2str('%Y-%m-%d %H:%M:%S', time - DEFAULT_WORKER_TIMEOUT - 1, 'UTC');
+$workers->create({id => $online_worker_id, host => 'online_test', instance => 1, t_seen => $online_timestamp});
+$workers->create({id => $offline_worker_id, host => 'offline_test', instance => 1, t_seen => $offline_timestamp});
+
+sub delete_button_selector ($worker_id) { "tr#worker_$worker_id .action [post_delete_url]" }
+
+driver_missing unless my $driver = call_driver;
+
+$driver->title_is('openQA', 'on main page');
+
+subtest 'offline status' => sub {
+    $driver->get("/admin/workers/$offline_worker_id");
+    like
+      $driver->find_element_by_class('status-info')->get_text,
+      qr/Seen: (?:.*ago|just now).*Status: Offline$/s,
+      'worker just shown as offline';
+
+    $workers->find($offline_worker_id)->update({error => 'graceful disconnect at foo', t_seen => $online_timestamp});
+    $driver->refresh;
+    like
+      $driver->find_element_by_class('status-info')->get_text,
+      qr/Seen: foo.*Status: Offline \(graceful disconnect\)$/s,
+      'worker shown as offline with graceful disconnect';
+
+    my $old_timestamp = time2str('%Y-%m-%d %H:%M:%S', time - 86400 * 7, 'UTC');
+    $workers->find($offline_worker_id)->update({t_seen => $old_timestamp, error => undef});
+    $driver->refresh;
+    my $seen_text = $driver->find_element_by_class('status-info')->get_text;
+    like $seen_text, qr/Seen: .*ago.*Status: Offline$/s, 'old worker shows relative time (not just now)';
+    unlike $seen_text, qr/just now/, 'old worker does NOT show "just now"';
+
+    $workers->find($offline_worker_id)->update({t_seen => undef, error => undef});
+    $driver->refresh;
+    like
+      $driver->find_element_by_class('status-info')->get_text,
+      qr/Seen: never.*Status: Offline$/s,
+      'worker with t_seen not set yet shown as "never"';
+};
+
+# without loggin we hide properties of worker
+$driver->get('/admin/workers/1');
+$driver->title_is('openQA: Worker localhost:1', 'on worker 1');
+is scalar @{$driver->find_elements('h3', 'css')}, 1, 'table properties hidden';
+
+$driver->find_element_by_link_text('Login')->click();
+# we're back on the worker page
+$driver->title_is('openQA: Worker localhost:1', 'back on worker 1 page');
+# but ...
+
+is $driver->find_element('#user-action a')->get_text(), 'Logged in as Demo', 'logged in as demo';
+
+subtest 'worker overview' => sub {
+    $driver->find_element('#user-action a')->click();
+    $driver->find_element_by_link_text('Workers')->click();
+    $driver->title_is('openQA: Workers', 'on workers overview');
+    disable_bootstrap_animations;
+    $driver->find_element('#summary')->text_like(qr/Online: 4.*Idle: 1.*Total: 5/s, 'correct statistics');
+    $driver->find_element('#workers_info')->text_like(qr/1 to 1 of 1.*filtered from 5 total/, 'correct number shown');
+
+    # show all worker regardless of their state
+    $driver->find_element_by_xpath(q{//select[@id='workers_online']/option[1]})->click();
+
+    # check delete link only shown on offline worker
+    my %not_deletable = (
+        'localhost:1' => 1,
+        'remotehost:1' => 2,
+        foo => $broken_worker_id,
+        online_test => $online_worker_id
+    );
+    is scalar @{$driver->find_elements(delete_button_selector($not_deletable{$_}), 'css')}, 0,
+      "$_ does not show delete button"
+      for sort keys %not_deletable;
+    is $driver->find_element(delete_button_selector($offline_worker_id))->is_displayed(),
+      1, 'offline worker show delete button';
+
+    # check worker 1
+    is $driver->find_element('tr#worker_1 .worker')->get_text(), 'localhost:1', 'localhost:1 shown';
+    $driver->find_element('tr#worker_1 .help_popover')->click();
+    wait_for_element(selector => '.popover', description => 'worker status popover is displayed');
+    wait_for_ajax;
+    like $driver->find_element('.popover')->get_text(), qr/Worker status\nJob: 99963/, 'on 99963';
+
+    # close the popover and wait until it is actually gone (seems to have a very short animation)
+    $driver->find_element('.dt-paging-button')->click();
+    wait_until_element_gone('.popover');
+
+    # check worker 2
+    is $driver->find_element('tr#worker_2 .worker')->get_text(), 'remotehost:1', 'remotehost:1 shown';
+    $driver->find_element('tr#worker_2 .help_popover')->click();
+    wait_for_element(selector => '.popover', description => 'worker status popover is displayed');
+    like $driver->find_element('.popover')->get_text(), qr/Worker status\nJob: 99961/, 'working 99961';
+    $driver->find_element('.dt-paging-button')->click();
+    wait_until_element_gone('.popover');
+
+    # check worker 3 (broken one added in schema hook)
+    is $driver->find_element("tr#worker_$broken_worker_id .worker")->get_text(), 'foo:42', 'foo shown';
+    $driver->find_element("tr#worker_$broken_worker_id .help_popover")->click();
+    is
+      $driver->find_element("tr#worker_$broken_worker_id .status")->get_text(),
+      'Unavailable', "worker $broken_worker_id is broken and displayed as unavailable",
+      ;
+    like wait_for_element(selector => '.popover')->get_text, qr/Details\nout of order/, 'reason for brokenness shown';
+};
+
+# test delete offline worker function
+subtest 'delete offline worker' => sub {
+    $driver->find_element(delete_button_selector($offline_worker_id))->click();
+    my $e = wait_for_element(selector => 'div#flash-messages .alert span', description => 'delete message displayed');
+    is $e->get_text(), 'Delete worker offline_test:1 successfully.', 'delete offline worker successfully';
+    is scalar @{$driver->find_elements('table#workers tbody tr')}, 4, 'worker deleted not shown';
+};
+
+$driver->find_element('tr#worker_1 .worker a')->click();
+$driver->title_is('openQA: Worker localhost:1', 'on worker 1');
+is scalar @{$driver->find_elements('#content h3', 'css')}, 2, 'table properties shown';
+like $driver->find_element_by_xpath('//body')->get_text(), qr/JOBTOKEN token99963/, 'token for 99963';
+
+# previous jobs table
+wait_for_ajax;
+my $table = $driver->find_element_by_id('previous_jobs');
+ok $table, 'previous jobs table found';
+my @entries = map { $_->get_text() } $driver->find_child_elements($table, 'tbody/tr/td', 'xpath');
+is scalar @entries, 6, 'two previous jobs shown (3 cols per row)';
+is_deeply
+  \@entries,
+  [
+    'opensuse-13.1-NET-x86_64-Build0091-kde@64bit',
+    '', 'not yet', 'opensuse-Factory-staging_e-x86_64-Build87.5011-minimalx@32bit',
+    '0', '1 hour ago',
+  ],
+  'correct entries shown';
+
+# restart running job assigned to a worker
+$driver->find_child_element($table, 'a.restart', 'css')->click();
+wait_for_ajax;
+$table = $driver->find_element_by_id('previous_jobs');
+ok $table, 'still on same page (with table)';
+@entries = map { $_->get_text() } $driver->find_child_elements($table, 'tbody/tr/td', 'xpath');
+is_deeply
+  \@entries,
+  [
+    'opensuse-13.1-NET-x86_64-Build0091-kde@64bit',
+    '', 'not yet', 'opensuse-Factory-staging_e-x86_64-Build87.5011-minimalx@32bit (restarted)',
+    '0', '1 hour ago',
+  ],
+  'the first job has been restarted';
+
+subtest 'table persistence' => sub {
+    subtest 'load worker page with a specific status filter' => sub {
+        $driver->get('/admin/workers?status=Working');
+        wait_for { $driver->find_element('#workers_online')->get_value eq 'Working' } 'status selection updated';
+        is $driver->find_element('#workers_online')->get_value, 'Working', 'working status selected from URL';
+    };
+    subtest 'change select filter and check URL updates' => sub {
+        $driver->find_element_by_xpath(q{//select[@id='workers_online']/option[@value='Idle']})->click;
+        wait_for { $driver->get_current_url !~ qr/status=/ } 'URL updated with status removed for default';
+        unlike $driver->get_current_url, qr/status=/, 'URL updated with status removed for default';
+        $driver->find_element_by_xpath(q{//select[@id='workers_online']/option[@value='Offline']})->click;
+        wait_for_url qr/status=Offline/;
+    };
+    subtest 'enter search query and check URL updates' => sub {
+        $driver->find_element('.dt-search input')->send_keys('foo');
+        wait_for_url qr/q=foo/;
+    };
+    subtest 'sort by host (second column) and check URL updates' => sub {
+        $driver->find_element('#workers thead th:nth-child(2)')->click;
+        wait_for_url qr/sort=1/;
+    };
+    subtest 'reload page with further query parameters to verify persistence restores correctly' => sub {
+        $driver->get('/admin/workers?sort=1&order=desc&q=foo');
+        wait_for { $driver->find_element('.dt-search input')->get_value eq 'foo' } 'table updated';
+        is $driver->find_element('.dt-search input')->get_value, 'foo', 'search value "foo" restored';
+        is $driver->find_element('.dt-ordering-desc')->get_text, 'Host', 'sorting in descending order by host';
+    };
+};
+
+subtest 'reserve and release a worker' => sub {
+    $driver->get('/admin/workers/1');
+    disable_bootstrap_animations;
+    $driver->find_element('#reservation button.btn-success')->click();
+    wait_for_element(selector => '#reserveWorkerModal.show', description => 'reservation modal is displayed');
+    is $driver->find_element('#reserveWorkerName')->get_value, 'localhost:1', 'modal is prefilled with the worker';
+    is $driver->find_element('#reserveWorkerDuration')->get_value, '5h', 'modal defaults to the configured duration';
+
+    $driver->find_element('#reserveWorkerClass')->send_keys('invalid,tag');
+    $driver->find_element('#reserveWorkerComment')->send_keys('maintenance <script>');
+    $driver->find_element('#reserveWorkerForm button[type=submit]')->click();
+
+    is $driver->find_element('#reserveWorkerClass')->get_value, 'invalid,tag', 'value is invalid,tag';
+
+    $driver->find_element('#reserveWorkerClass')->clear();
+    $driver->find_element('#reserveWorkerClass')->send_keys('poo123');
+    $driver->find_element('#reserveWorkerForm button[type=submit]')->click();
+
+    wait_for_element(selector => '#reservation button.btn-danger', description => 'release button is displayed');
+    like $driver->find_element('#reservation')->get_text,
+      qr/Reserved by: Demo.*Specific class: poo123.*Comment: maintenance <script>/s,
+      'reservation details are shown escaped';
+    is $workers->find(1)->reservation->{comment}, 'maintenance <script>', 'reservation is persisted';
+
+    $driver->find_element('#reservation button.btn-danger')->click();
+    wait_for_element(selector => '#reservation button.btn-success', description => 'reserve button is displayed again');
+    is $workers->find(1)->reservation, undef, 'reservation is released again';
+};
+
+subtest 'Worker host administration view and reservation scope' => sub {
+    my $w2 = $workers->create({host => 'localhost', instance => 2});
+
+    $driver->get('/admin/workers?status=');
+    $driver->find_element('tr#worker_1 td.host a')->click();
+    $driver->title_is('openQA: Worker Host localhost', 'Navigate to host localhost page from workers list');
+
+    $driver->get('/admin/workers/1');
+    $driver->find_element_by_link_text('localhost')->click();
+    $driver->title_is('openQA: Worker Host localhost', 'Navigate to host localhost page from worker show page');
+
+    $driver->get('/admin/workers?status=');
+    disable_bootstrap_animations;
+    $driver->find_element('tr#worker_1 td.action button.btn-outline-success')->click();
+    wait_for_element(
+        selector => '#reserveWorkerModal.show',
+        description => 'Reservation modal with scope selection is displayed'
+    );
+
+    is $driver->find_element('#reserveScopeContainer')->is_displayed(), 1,
+      'Scope selection is visible for workers on a host';
+    $driver->find_element('#reserveScopeHost')->click();
+
+    $driver->find_element('#reserveWorkerComment')->send_keys('host maintenance');
+    $driver->find_element('#reserveWorkerForm button[type=submit]')->click();
+
+    wait_for { $workers->find(1)->is_reserved && $workers->find($w2->id)->is_reserved }
+    'All worker instances on the host are reserved';
+    is $workers->find(1)->reservation->{scope}, 'host', 'Worker 1 reservation scope is set to host';
+    is $workers->find($w2->id)->reservation->{scope}, 'host', 'Worker 2 reservation scope is set to host';
+
+    $driver->get('/admin/worker_hosts/localhost');
+    disable_bootstrap_animations;
+    $driver->title_is('openQA: Worker Host localhost', 'Navigate to host page to check reservation details');
+    like $driver->find_element('#reservation')->get_text,
+      qr/fully reserved.*Reserved by: Demo.*Comment: host maintenance/s, 'Host page shows fully reserved status';
+
+    $driver->find_element('#reservation button.btn-danger')->click();
+    wait_for { !$workers->find(1)->is_reserved && !$workers->find($w2->id)->is_reserved }
+    'All worker instances on the host are released';
+
+    $driver->find_element('#reservation button.btn-success')->click();
+    wait_for_element(
+        selector => '#reserveWorkerModal.show',
+        description => 'Reservation modal is displayed when reserving from host view'
+    );
+    is $driver->find_element('#reserveWorkerName')->get_value, 'All 2 instances on localhost',
+      'Modal title shows correct target instances count';
+
+    $driver->find_element('#reserveWorkerComment')->send_keys('host view maintenance');
+    $driver->find_element('#reserveWorkerForm button[type=submit]')->click();
+
+    wait_for { $workers->find(1)->is_reserved && $workers->find($w2->id)->is_reserved }
+    'All worker instances are reserved after host view reservation';
+
+    $w2->delete;
+};
+
+subtest 'host previous jobs table' => sub {
+    $driver->get('/admin/worker_hosts/localhost');
+    wait_for_ajax;
+    my $table = $driver->find_element_by_id('previous_host_jobs');
+    ok $table, 'host previous jobs table found';
+    my @entries = map { $_->get_text() } $driver->find_child_elements($table, 'tbody/tr/td', 'xpath');
+    is scalar @entries, 8, 'two previous jobs shown (4 cols per row)';
+    is_deeply
+      \@entries,
+      [
+        'opensuse-13.1-NET-x86_64-Build0091-kde@64bit',
+        ':1', '', 'not yet', 'opensuse-Factory-staging_e-x86_64-Build87.5011-minimalx@32bit (restarted)',
+        ':1', '0', '1 hour ago',
+      ],
+      'host previous jobs ordered by completion time descending by default';
+
+    $driver->find_element('#previous_host_jobs thead th:nth-child(4)')->click;
+    my @expected = (
+        'opensuse-Factory-staging_e-x86_64-Build87.5011-minimalx@32bit (restarted)',
+        ':1', '0', '1 hour ago', 'opensuse-13.1-NET-x86_64-Build0091-kde@64bit',
+        ':1', '', 'not yet',
+    );
+    @entries = ();
+    wait_for {
+        @entries = map { $_->[0] } @{map_elements('#previous_host_jobs tbody tr td', 'e.textContent.trim()')};
+        @entries == @expected && $entries[0] =~ /Factory/ && $entries[4] =~ /NET/
+    }
+    'host previous jobs sorted by completion time ascending';
+    is_deeply \@entries, \@expected, 'host previous jobs sorted by completion time ascending after clicking column';
+};
+
+subtest 'worker previous jobs table' => sub {
+    $driver->get('/admin/workers/1');
+    wait_for_ajax;
+    my $table = $driver->find_element_by_id('previous_jobs');
+    my @entries = map { $_->get_text() } $driver->find_child_elements($table, 'tbody/tr/td', 'xpath');
+    is_deeply \@entries,
+      [
+        'opensuse-13.1-NET-x86_64-Build0091-kde@64bit',
+        '', 'not yet', 'opensuse-Factory-staging_e-x86_64-Build87.5011-minimalx@32bit (restarted)',
+        '0', '1 hour ago',
+      ],
+      'worker previous jobs ordered by completion time descending by default';
+};
+
+subtest 'host previous jobs slot column sorts by worker instance number' => sub {
+    my $w3 = $workers->create({id => 7, host => 'localhost', instance => 3});
+    my $w4 = $workers->create({id => 9, host => 'localhost', instance => 2});
+    $jobs->find(99963)->update({assigned_worker_id => $w3->id});
+    $jobs->find(99961)->update({assigned_worker_id => $w4->id});
+
+    $driver->get('/admin/worker_hosts/localhost');
+    wait_for_ajax;
+    $driver->find_element('#previous_host_jobs thead th:nth-child(2)')->click;
+    my @slots;
+    wait_for {
+        @slots
+          = map { $_->[0] } @{map_elements('#previous_host_jobs tbody tr td:nth-child(2)', 'e.textContent.trim()')};
+        @slots == 3 && "@slots" eq ':1 :2 :3'
+    }
+    'slot column sorted by worker instance number ascending';
+    is_deeply \@slots, [':1', ':2', ':3'],
+      'slot column sorted by worker instance number ascending rather than by worker id';
+
+    $jobs->find(99961)->update({assigned_worker_id => 1});
+    $jobs->find(99963)->update({assigned_worker_id => undef});
+    $w3->delete;
+    $w4->delete;
+};
+
+kill_driver();
+done_testing();

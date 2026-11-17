@@ -1,0 +1,74 @@
+<% my $help_text = '
+    <p>
+        The comment field supports Markdown, automatic detection of URLs and special tags to record issue references, \'labels\'
+        as well as \'build tagging\'.
+    </p>
+    <ul>
+        <li>
+            For issue references write <code><i>bugtracker_shortname</i>#<i>bug_nr</i></code> in a comment, e.g. <code>bsc#1234</code> anywhere in a sentence.
+        </li>
+        <li>
+            For generic labels use <code>label:<i>keyword</i></code> where <i>keyword</i> can be any valid character up to the next whitespace, e.g. "false_positive".
+        </li>
+    </ul>
+    <p>
+        The keywords are not defined within openQA itself. A valid list of keywords should be decided upon within each project or
+        environment of one openQA instance.
+    </p>
+    <p>
+        One special label format is available which allows to forcefully overwrite the result of a job using a comment. The expected format is <code>label:force_result:<i>new_result[:description]</i></code>, for example <code>label:force_result:failed</code> or <code>label:force_result:softfailed:bsc#1234</code>. For this command to be effective the according user needs to have at least operator permissions.
+    </p>
+    <p>
+        Also GitHub pull requests and issues can be linked using the generic format <i>marker</i>[#<i>project/repo</i>]#<i>id</i>,
+        e.g. gh#os-autoinst/openQA#1234. You can also write (or copy-paste) full links to bugs and issues.
+    </p>
+    <p>
+        The links are automatically changed to the shortlinks (e.g. <code>https://progress.opensuse.org/issues/11110</code> turns
+        into <code>poo#11110</code>).
+    </p>
+    <p>
+        Issue references are automatically carried over to the next jobs in the same scenario when the corresponding job fails in
+        the same module or the failed modules did not change. To mention links to tickets without enabling them for carry-over you can prepend the
+        link or short-reference with <code>label:</code>, e.g. <code>this is *not* label:bsc#1234</code>.
+    </p>
+    <p>
+        Comments on job group pages can be "pinned" to the top by including the special keyword <code>pinned-description</code>
+        anywhere in the text.
+    </p>';
+%>
+<div class="row mb-3 row-cols-lg-auto g-3 align-items-center">
+    <div class="col-auto input-group">
+      <label for="text" class="col-sm-1 col-form-label">
+        <img class="img-circle" src="<%= current_user->gravatar(60) %>" alt="Own avatar" title="<%= current_user->name %>">
+    </label>
+        <textarea class="form-control" name="text" id="text" placeholder="Write your comments here (Markdown and special tags supported)…" rows="5"></textarea>
+        <span class="input-group-text comment-toolbar">
+          <a class="help_popover fa-solid fa-tag" title="Add generic label" role="button"
+             data-template="label:keyword" onclick="insertTemplate(this)"></a>
+          <br>
+          % if ($group_comment) {
+          <a class="help_popover fa-solid fa-map-pin" title="Pin comment" role="button"
+             data-template="pinned-description" onclick="insertTemplate(this)"></a>
+          % } else {
+          <a class="help_popover fa-solid fa-ticket" title="Add force result label" role="button"
+             data-template="label:force_result:new_result[:description_or_bugref]" onclick="insertTemplate(this)"></a>
+          <br>
+          <a class="help_popover fa-solid fa-flag" title="Flag this comment for carryover even without issue reference. This is useful for comments containing only a force-result label that won't trigger automatic carryover despite an issue reference being a part of the label." role="button"
+             data-template="flag:carryover" onclick="insertTemplate(this)"></a>
+          % }
+          <br>
+          %= include_branding 'commenting_tools';
+          %= help_popover 'Help for comments' => $help_text, 'https://open.qa/docs/#use-of-the-web-interface' => 'the documentation'
+        </span>
+    </div>
+</div>
+% unless (stash('nosubmit')) {
+<div class="row mb-3">
+    <div class="col-sm-1"></div>
+    <div class="col-sm-11">
+        <button class="btn btn-success btn-circle" type="submit" id="submitComment">
+            <i class="fa-solid fa-comment"></i> Submit comment
+        </button>
+    </div>
+</div>
+% }

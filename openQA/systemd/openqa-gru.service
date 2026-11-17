@@ -1,0 +1,15 @@
+[Unit]
+Description=The openQA GRU daemon for various background tasks
+After=postgresql.service openqa-setup-db.service remote-fs.target
+Wants=openqa-setup-db.service
+
+[Service]
+User=geekotest
+ExecStart=/usr/share/openqa/script/openqa-gru
+Nice=19
+# Longer stopping time foreseen due to niceness
+TimeoutStopSec=5min
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

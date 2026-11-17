@@ -1,0 +1,649 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Mojo::Base -signatures;
+
+use Date::Format 'time2str';
+use Test::Mojo;
+use Mojo::File qw(tempdir);
+use Test::Warnings ':report_warnings';
+use Time::Seconds;
+use POSIX qw(strftime);
+use OpenQA::Test::TimeLimit '40';
+use OpenQA::Test::Case;
+require OpenQA::Test::Database;
+use OpenQA::Test::Utils qw(assume_all_assets_exist);
+use OpenQA::Jobs::Constants qw(NONE RUNNING SCHEDULED);
+
+my $test_case = OpenQA::Test::Case->new;
+my $schema_name = OpenQA::Test::Database::generate_schema_name;
+my $fixtures = '01-jobs.pl 03-users.pl 04-products.pl 05-job_modules.pl 06-job_dependencies.pl';
+my $schema = $test_case->init_data(schema_name => $schema_name, fixtures_glob => $fixtures);
+
+use OpenQA::SeleniumTest;
+
+my $t = Test::Mojo->new('OpenQA::WebAPI');
+
+$ENV{OPENQA_CONFIG} = my $config_dir = tempdir("$FindBin::Script-XXXX");
+my $cfg
+  = "[scheduler]\nmax_running_jobs = 10\ndynamic_job_limit_enabled = 1\ndynamic_job_limit_min = 3\ndynamic_job_limit_load_threshold = 0.001\ndynamic_job_limit_step = 10\ndynamic_job_limit_interval = 0\n[scm git]\ngit_auto_update = no";
+$config_dir->child('openqa.ini')->spew($cfg);
+
+my @job_params = (
+    group_id => 1002,
+    priority => 35,
+    result => NONE,
+    state => RUNNING,
+    t_finished => undef,
+    t_started => time2str('%Y-%m-%d %H:%M:%S', time - 5 * ONE_MINUTE, 'UTC'),
+    t_created => time2str('%Y-%m-%d %H:%M:%S', time - ONE_HOUR, 'UTC'),
+    TEST => 'kde',
+    ARCH => 'x86_64',
+    BUILD => '0092',
+    DISTRI => 'opensuse',
+    FLAVOR => 'NET',
+    MACHINE => '64bit',
+    VERSION => '13.1'
+);
+
+# Customize the database based on fixtures.
+# We do not need job 99981 right now so delete it here just to have a helpful
+# example for customizing the test database
+sub prepare_database () {
+    my $bugs = $schema->resultset('Bugs');
+    my %bug_args = (refreshed => 1, existing => 1);
+    $bugs->create({bugid => 'poo#1', title => 'open poo bug', open => 1, %bug_args});
+    $bugs->create({bugid => 'poo#2', title => 'closed poo bug', open => 0, %bug_args});
+    $bugs->create({bugid => 'bsc#4', title => 'closed bugzilla bug', open => 0, %bug_args});
+
+    my $jobs = $schema->resultset('Jobs');
+    $jobs->find(99981)->delete;
+
+    # add a few comments
+    my $job99946_comments = $jobs->find(99946)->comments;
+    $job99946_comments->create({text => 'test1', user_id => 99901});
+    $job99946_comments->create({text => 'test2', user_id => 99901});
+    my $job99963_comments = $jobs->find(99963)->comments;
+    $job99963_comments->create({text => 'test1', user_id => 99901});
+    $job99963_comments->create({text => 'test2', user_id => 99901});
+    my $job99928_comments = $jobs->find(99928)->comments;
+    $job99928_comments->create({text => 'test1', user_id => 99901});
+    my $job99936_comments = $jobs->find(99936)->comments;
+    $job99936_comments->create({text => 'poo#1', user_id => 99901});
+    $job99936_comments->create({text => 'poo#2', user_id => 99901});
+    # This bugref doesn't have a corresponding bug entry
+    $job99936_comments->create({text => 'bsc#3', user_id => 99901});
+    $job99936_comments->create({text => 'bsc#4', user_id => 99901});
+
+    # add another running job which is "half done"
+    my $running_job = $jobs->create({id => 99970, state => RUNNING, TEST => 'kde', @job_params});
+    my @modules = (
+        {name => 'start_install', category => 'installation', script => 'start_install.pm', result => 'passed'},
+        {name => 'livecdreboot', category => 'installation', script => 'livecdreboot.pm', result => 'passed'},
+        {name => 'aplay', category => 'console', script => 'aplay.pm', result => 'running'},
+        {name => 'glibc_i686', category => 'console', script => 'glibc_i686.pm', result => 'none'},
+    );
+    $running_job->discard_changes;
+    $running_job->insert_test_modules(\@modules);
+    $running_job->update_module($_->{name}, {result => $_->{result}}) for @modules;
+
+    my $job99940 = $jobs->find(99940);
+    my %modules = (a => 'skip', b => 'ok', c => 'none', d => 'softfail', e => 'fail');
+    foreach my $key (sort keys %modules) {
+        $job99940->insert_module({name => $key, category => $key, script => $key});
+        $job99940->update_module($key, {result => $modules{$key}, details => []});
+    }
+
+    my $schedule_job = $jobs->create(
+        {
+            @job_params,
+            id => 99991,
+            state => OpenQA::Jobs::Constants::SCHEDULED,
+            TEST => 'kde_variant',
+            settings =>
+              [{key => 'JOB_TEMPLATE_NAME', value => 'kde_variant'}, {key => 'TEST_SUITE_NAME', value => 'kde'}]});
+
+    $jobs->create(
+        {
+            @job_params,
+            id => 99997,
+            state => OpenQA::Jobs::Constants::SCHEDULED,
+            blocked_by_id => 99963,
+            TEST => 'kde_blocked',
+            settings => [{key => 'TEST_SUITE_NAME', value => 'kde'}]});
+
+    # ensure chained jobs 99937 is still displayed on page one together with its chained dependency 99938
+    $jobs->search({id => 99937})->update({t_finished => time2str('%Y-%m-%d %H:%M:%S', time - 149 * ONE_HOUR, 'UTC')});
+
+    # create linked label with bugref; supposed to be rendered as clickable label (and *not* as bugref)
+    $jobs->find({id => 80000})->comments->create({text => 'label:linked:poo#123', user_id => 1});
+
+    assume_all_assets_exist;
+}
+
+prepare_database();
+
+driver_missing unless my $driver = call_driver;
+
+$driver->title_is('openQA', 'on main page');
+is $driver->get('/results'), 1, '/results gets';
+like $driver->get_current_url(), qr{.*/tests}, 'legacy redirection from /results to /tests';
+
+wait_for_ajax(msg => 'DataTables on "All tests" page');
+ok javascript_console_has_no_warnings_or_errors, 'no JavaScript problems';
+
+# Test 99946 is successful (29/0/1)
+my $job99946 = $driver->find_element('#results #job_99946');
+my @tds = $driver->find_child_elements($job99946, 'td');
+is scalar @tds, 4, '4 columns displayed';
+is +(shift @tds)->get_text(), 'Build0091 of opensuse-13.1-DVD.i586', 'medium of 99946';
+is +(shift @tds)->get_text() =~ s/\s+\d+$//r, 'textmode@32bit', 'test of 99946';
+is +(shift @tds)->get_text(), '28 1 1', 'result of 99946 (passed, softfailed, failed)';
+my $time = $driver->find_child_element(shift @tds, 'span');
+$time->attribute_like('title', qr/.*Z/, 'finish time title of 99946');
+$time->text_like(qr/3 hours ago/, 'finish time of 99946');
+
+subtest 'label:linked with bugref' => sub {
+    my $link = $driver->find_element('#job_80000 a[href="https://progress.opensuse.org/issues/123"]');
+    my $label = $driver->find_element('#job_80000 .test-label');
+    ok $link, 'rendered as link';
+    ok $label, 'label present' or return;
+    is $label->get_attribute('title'), 'Label: linked:poo#123', 'title contains bugref';
+    element_not_present '#job_80000 .fa-solid.fa-bolt', 'no bugref icon displayed (only the label)';
+};
+
+subtest 'running jobs, progress bars' => sub {
+    is $driver->find_element('#job_99961 .progress-bar-striped')->get_text(),
+      'running', 'striped progress bar if not modules present yet';
+    is $driver->find_element('#job_99970 .progress-bar')->get_text(),
+      '67 %', 'progress is 67 % if 2 modules finished, 1 is running and 1 is queued';
+    # note: For simplicity the running module is ignored. That means 2 of only 3 modules
+    #       have been finished and hence we get 67 %. I suppose that's not worse than counting
+    #       the currently running module always as zero progress.
+
+    # job which is still running but all modules are completed or skipped after failure
+    isnt $driver->find_element('#running #job_99963'), undef, '99963 still running';
+    like $driver->find_element('#job_99963 td.test a')->get_attribute('href'), qr{.*/tests/99963}, 'right link';
+    is $driver->find_element('#job_99963 .progress-bar')->get_text(),
+      '40 %', 'progress is 40 % if job fatally failed at this point (but status not updated to uploading/done)';
+    $time = $driver->find_element('#job_99963 td.time span');
+    $time->attribute_like('title', qr/.*Z/, 'right time title for running');
+    $time->text_like(qr/\d+ minutes ago/, 'right time for running');
+};
+
+subtest 'comments and bugrefs displayed for finished jobs' => sub {
+    is $driver->find_element('#job_99946 .fa-solid.fa-comment')->get_attribute('title'),
+      '2 comments available', 'available comments shown for finished jobs';
+    is @{$driver->find_elements('#job_99962 .fa-solid.fa-comment')},
+      0, 'available comments only shown if at least one comment available';
+    is $driver->find_element('#job_99936 .fa-solid.fa-bolt')->get_attribute('title'),
+      "Bug referenced: poo#1\nopen poo bug", 'available bugref (poo#1) shown for finished jobs';
+    is $driver->find_element('#job_99936 .fa-solid.fa-bug')->get_attribute('title'),
+      'Bug referenced: bsc#3', 'available bugref (bsc#3) shown for finished jobs';
+    my @closed = $driver->find_elements('#job_99936 .bug_closed');
+    is $closed[1]->get_attribute('title'),
+      "Bug referenced: poo#2\nclosed poo bug", 'available bugref (poo#2) shown for finished jobs';
+    is $closed[0]->get_attribute('title'),
+      "Bug referenced: bsc#4\nclosed bugzilla bug", 'available bugref (bsc#4) shown for finished jobs';
+    is_deeply [$driver->find_elements('#job_99963 .fa-solid.fa-comment')],
+      [], 'available comments not shown for running jobs (for performance reasons)';
+    is_deeply [$driver->find_elements('#job_99928 .fa-solid.fa-comment')],
+      [], 'available comments not shown for scheduled jobs (for performance reasons)';
+};
+
+subtest 'priority displayed when not logged in' => sub {
+    is $driver->find_element('#job_99928 td + td + td')->get_text(), '46', 'priority displayed';
+    my @prio_links = $driver->find_elements('#job_99928 td + td + td a');
+    is_deeply \@prio_links, [], 'no links to increase/decrease prio';
+};
+
+my @header = $driver->find_elements('h2');
+my @header_texts = map { OpenQA::Test::Case::trim_whitespace($_->get_text()) } @header;
+my @expected = (
+    '3 jobs are running (dynamic scheduling limit: 3 / max 10)',
+    '4 scheduled jobs (1 blocked by other jobs)',
+    'Last 11 finished jobs'
+);
+is_deeply \@header_texts, \@expected, 'all headings correctly displayed';
+
+$driver->get('/tests?limit=1');
+wait_for_ajax(msg => 'DataTables on "All tests" page with limit');
+@header = $driver->find_elements('h2');
+@header_texts = map { OpenQA::Test::Case::trim_whitespace($_->get_text()) } @header;
+@expected = (
+    '3 jobs are running (dynamic scheduling limit: 3 / max 10)',
+    '4 scheduled jobs (1 blocked by other jobs)',
+    'Last 1 finished jobs'
+);
+is_deeply \@header_texts, \@expected, 'limit for finished tests can be adjusted with query parameter';
+like $driver->find_element_by_id('scheduled_info')->get_text(),
+  qr/^Showing 1 to 1 of 4 entries$/, 'info line reports the true total while the scheduled listing is capped';
+$driver->get('/tests?limit=4');
+wait_for_ajax(msg => 'DataTables on "All tests" page with uncapped scheduled listing');
+like $driver->find_element_by_id('scheduled_info')->get_text(),
+  qr/^Showing 1 to 4 of 4 entries$/, 'info line matches the listing size when the listing is not capped';
+
+$t->get_ok('/tests/99963')->status_is(200);
+$t->content_like(qr/State.*running/, 'Running jobs are marked');
+$t->element_exists('button[id^="badgeCopyButton-"]', 'Badge copy button is displayed on job details page');
+$t->element_exists('button.copy-badge-btn', 'Copy badge button is displayed on job details page');
+
+$t->get_ok('/tests/list_running_ajax')->status_is(200);
+
+my $app = OpenQA::App->singleton;
+my $scheduler_config = $app->config->{scheduler};
+
+subtest 'running jobs list with static limit' => sub {
+    local $scheduler_config->{dynamic_job_limit_enabled} = 0;
+    local $scheduler_config->{max_running_jobs} = 2;
+    $t->get_ok('/tests/list_running_ajax')->status_is(200);
+    my $json = $t->tx->res->json;
+    is $json->{max_running_jobs}, 2, 'max_running_jobs included in response when static limit reached';
+};
+
+subtest 'running jobs list limit info based on global count' => sub {
+    my $dl = $app->dynamic_limit;
+
+    local $scheduler_config->{dynamic_job_limit_enabled} = 1;
+    local $scheduler_config->{dynamic_job_limit_min} = 3;
+    local $scheduler_config->{max_running_jobs} = 10;
+    local $scheduler_config->{dynamic_job_limit_load_threshold} = 100;
+    $dl->effective_limit(3);
+    $dl->block_adjustment_for(9999);
+
+    # Global count is 3 (99961, 99963, 99970). Filter by groupid=1001 (99963).
+    $t->get_ok('/tests/list_running_ajax?groupid=1001')->status_is(200);
+    my $json = $t->tx->res->json;
+    is scalar @{$json->{data}}, 1, 'only one job matches filter (group 1001)';
+    is $json->{dynamic_job_limit}, 3,
+      'dynamic_job_limit included based on global count even when filtered list is smaller';
+
+    # Global count (3) is below limit (4).
+    local $scheduler_config->{dynamic_job_limit_min} = 4;
+    $dl->effective_limit(4);
+    $t->get_ok('/tests/list_running_ajax')->status_is(200);
+    $json = $t->tx->res->json;
+    ok !exists $json->{dynamic_job_limit}, 'dynamic_job_limit omitted when global count is below limit';
+    ok !exists $json->{max_running_jobs},
+      'max_running_jobs omitted when below dynamic limit to avoid misleading "limited by server config"';
+
+    subtest 'static limit behavior when dynamic limit is disabled' => sub {
+        local $scheduler_config->{dynamic_job_limit_enabled} = 0;
+        local $scheduler_config->{max_running_jobs} = 3;
+        $t->get_ok('/tests/list_running_ajax')->status_is(200);
+        is $t->tx->res->json->{max_running_jobs}, 3, 'max_running_jobs included when reached';
+
+        local $scheduler_config->{max_running_jobs} = 4;
+        $t->get_ok('/tests/list_running_ajax')->status_is(200);
+        ok !exists $t->tx->res->json->{max_running_jobs}, 'max_running_jobs omitted when below limit';
+    };
+};
+
+subtest 'all tests server-side limit has precedence over user-specified limit' => sub {
+    my $limits = $app->config->{misc_limits};
+    $limits->{all_tests_max_finished_jobs} = 5;    # set low low maximum limit
+    $limits->{all_tests_default_finished_jobs} = 2;    # set low default limit
+
+    $t->get_ok('/tests/list_ajax?limit=10', 'query with exceeding user-specified limit')->status_is(200);
+    my $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'job data returned (1)' and is scalar @$jobs, 5, 'maximum limit effective';
+
+    $t->get_ok('/tests/list_ajax?limit=4', 'query with low user-specified limit')->status_is(200);
+    $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'job data returned (2)' and is scalar @$jobs, 4, 'user-specified limit effective';
+
+    $t->get_ok('/tests/list_ajax', 'query with (low) default limit')->status_is(200);
+    $jobs = $t->tx->res->json->{data};
+    is ref $jobs, 'ARRAY', 'job data returned (3)' and is scalar @$jobs, 2, 'default limit effective';
+};
+
+subtest 'scheduled jobs server-side limit has precedence over user-specified limit' => sub {
+    my $limits = OpenQA::App->singleton->config->{misc_limits};
+    $limits->{generic_max_limit} = 5;
+    $limits->{generic_default_limit} = 2;
+
+    $schema->txn_begin;
+
+    for my $i (1 .. 5) {
+        $schema->resultset('Jobs')->create(
+            {
+                @job_params,
+                id => 99991 + $i,
+                state => OpenQA::Jobs::Constants::SCHEDULED,
+                TEST => 'kde_variant',
+                settings =>
+                  [{key => 'JOB_TEMPLATE_NAME', value => 'kde_variant'}, {key => 'TEST_SUITE_NAME', value => 'kde'}]});
+    }
+
+    $t->get_ok('/tests/list_scheduled_ajax?limit=10', 'query with exceeding user-specified limit for list scheduled')
+      ->status_is(200);
+    my $json = $t->tx->res->json;
+    my $jobs = $json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (1)' and is scalar @$jobs, 5, 'maximum limit for list scheduled is effective';
+    is $json->{total_count}, 9, 'total scheduled count exceeds the effective limit';
+    is $json->{blocked_count}, 1, 'blocked scheduled jobs counted over the whole set';
+
+    $t->get_ok('/tests/list_scheduled_ajax?limit=3', 'query with exceeding user-specified limit for previous')
+      ->status_is(200);
+
+    $json = $t->tx->res->json;
+    $jobs = $json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (2)' and is scalar @$jobs, 3, 'user limit for list scheduled is effective';
+    is $json->{total_count}, 9, 'total scheduled count is the same at user limit';
+
+    $t->get_ok('/tests/list_scheduled_ajax', 'query with (low) default limit for list scheduled')->status_is(200);
+    $json = $t->tx->res->json;
+    $jobs = $json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (3)' and is scalar @$jobs, 2, 'default limit for list scheduled is effective';
+    is $json->{total_count}, 9, 'total scheduled count is the same at default limit';
+
+    $t->get_ok('/tests/list_scheduled_ajax?limit=0', 'query with zero limit for list scheduled')->status_is(200);
+    $json = $t->tx->res->json;
+    $jobs = $json->{data};
+    is ref $jobs, 'ARRAY', 'data returned (4)' and is scalar @$jobs, 9, 'zero limit lists all scheduled jobs';
+    is $json->{total_count}, 9, 'total scheduled count is the same at zero limit';
+
+    $schema->txn_rollback;
+};
+
+$driver->find_element_by_link_text('Build0091')->click();
+like
+  $driver->find_element_by_id('summary')->get_text(),
+  qr/Overall Summary of opensuse build 0091/,
+  'we are on build 91';
+
+# return
+is $driver->get('/tests'), 1, '/tests gets';
+wait_for_ajax(msg => 'wait for all tests displayed before looking for 99928');
+
+# Test 99928 is scheduled
+isnt $driver->find_element('#scheduled #job_99928'), undef, '99928 scheduled';
+like $driver->find_element('#scheduled #job_99928 td.test a')->get_attribute('href'), qr{.*/tests/99928}, 'right link';
+$time = $driver->find_element('#scheduled #job_99928 td.time span');
+$time->attribute_like('title', qr/.*Z/, 'right time title for scheduled');
+$time->text_like(qr/2 hours ago/, 'right time for scheduled');
+$driver->find_element('#scheduled #job_99928 td.test a')->click();
+$driver->title_is('openQA: opensuse-13.1-DVD-i586-Build0091-RAID1@32bit test results', 'tests/99928 followed');
+
+# return
+is $driver->get('/tests'), 1, '/tests gets';
+wait_for_ajax();
+
+# Test 99938 failed, so it should be displayed in red
+my $job99938 = $driver->find_element('#results #job_99946');
+
+is $driver->find_element('#results #job_99938 .test .status.result_failed')->get_text(), '', '99938 failed';
+like $driver->find_element('#results #job_99938 td.test a')->get_attribute('href'), qr{.*/tests/99938}, 'right link';
+$driver->find_element('#results #job_99938 td.test a')->click();
+$driver->title_is('openQA: opensuse-Factory-DVD-x86_64-Build0048-doc@64bit test results', 'tests/99938 followed');
+
+subtest 'copy badge button click' => sub {
+    $driver->execute_script(
+        'navigator.clipboard.writeText = function(text) { window.copiedText = text; return Promise.resolve(); };');
+    $driver->find_element('button#badgeCopyButton-99938')->click();
+    wait_until sub {
+        my $copied = $driver->execute_script('return window.copiedText;');
+        return $copied && $copied =~ qr/!\[opensuse-Factory-DVD-x86_64-Build0048-doc\@64bit test result\]/;
+    }, 'clipboard contains markdown status badge snippet';
+
+    my $icon = $driver->find_element('button#badgeCopyButton-99938 i');
+    wait_until sub {
+        return $icon->get_attribute('class') =~ /fa-check/;
+    }, 'icon class changes to fa-check';
+};
+
+# return
+is $driver->get('/tests'), 1, '/tests gets';
+wait_for_ajax();
+
+my @links = $driver->find_elements('#results #job_99946 td.test a', 'css');
+is @links, 3, 'only three links (icon, name and comments but no restart)';
+
+# Test 99926 is displayed
+is $driver->find_element('#results #job_99926 .test .status.result_incomplete')->get_text(), '', '99926 incomplete';
+
+subtest 'priority adjustment when logged in' => sub {
+    $driver->find_element_by_link_text('Login')->click();
+    wait_for_ajax;
+    is $driver->find_element('#job_99928 .prio-value')->get_text(), '46', 'priority displayed';
+    $driver->find_element('#job_99928 .prio-down')->click();
+    wait_for_ajax;
+    is $driver->find_element('#job_99928 .prio-value')->get_text(), '36', 'priority decreased';
+    $driver->find_element('#job_99928 .prio-down')->click();
+    wait_for_ajax;
+    is $driver->find_element('#job_99928 .prio-value')->get_text(), '26', 'priority further decreased';
+    $driver->find_element('#job_99928 .prio-up')->click();
+    wait_for_ajax;
+    is $driver->find_element('#job_99928 .prio-value')->get_text(), '36', 'priority further increased';
+
+    $driver->get('/tests');
+    wait_for_ajax;
+    is $driver->find_element('#job_99928 .prio-value')->get_text(), '36', 'adjustment persists after reload';
+    is $driver->find_element('#job_99927 .prio-value')->get_text(), '45', 'priority of other job not affected';
+};
+
+ok $driver->get('/logout'), 'logout';
+ok $driver->get('/tests'), 'get tests';
+wait_for_ajax(msg => 'wait for all tests displayed before looking for 99938');
+# parent-child
+my $child_e = $driver->find_element('#results #job_99938 .parent_child');
+is $child_e->get_attribute('title'), '1 chained parent', 'dep info';
+is $child_e->get_attribute('data-children'), '[]', 'no children';
+is $child_e->get_attribute('data-parents'), '[99937]', 'parent';
+
+my $parent_e = $driver->find_element('#results #job_99937 .parent_child');
+is $parent_e->get_attribute('title'), '1 chained child', 'dep info';
+is $parent_e->get_attribute('data-children'), '[99938]', 'child';
+is $parent_e->get_attribute('data-parents'), '[]', 'no parents';
+
+sub get_effective_cell_background ($row_id) {
+    $driver->execute_script(
+        "return Array.from(new Set(Array.from(document.getElementById('$row_id').getElementsByTagName('td'))
+            .map(e => getComputedStyle(e).backgroundColor)))"
+    );
+}
+
+sub check_no_highlighting () {
+    is scalar @{$driver->find_elements('#job_99937.highlight_parent')}, 0, 'parent not highlighted';
+    is scalar @{$driver->find_elements('#job_99938.highlight_child')}, 0, 'child not highlighted';
+}
+
+# no highlighting in first place
+check_no_highlighting;
+
+# job dependencies highlighted on hover
+$driver->move_to(element => $child_e);
+is scalar(@{$driver->find_elements('#job_99937.highlight_parent')}), 1, 'parent highlighted';
+is_deeply get_effective_cell_background('job_99937'), ['rgb(255, 224, 224)'], 'parent highlighting effective';
+$driver->move_to(element => $parent_e);
+is scalar(@{$driver->find_elements('#job_99938.highlight_child')}), 1, 'child highlighted';
+is_deeply get_effective_cell_background('job_99938'), ['rgb(208, 240, 255)'], 'child highlighting effective';
+$driver->move_to(xoffset => 200, yoffset => 500);
+check_no_highlighting;
+
+# first check the relevant jobs
+my @jobs = map { $_->get_attribute('id') } @{$driver->find_elements('#results tbody tr', 'css')};
+
+is_deeply
+  \@jobs,
+  [qw(job_99940 job_99939 job_99938 job_99926 job_99936 job_99947 job_99962 job_99946 job_80000 job_99937)],
+  '99945 is not displayed';
+$driver->find_element_by_id('relevantfilter')->click();
+wait_for_ajax();
+
+# Test 99945 is not longer relevant (replaced by 99946) - but displayed for all
+@jobs = map { $_->get_attribute('id') } @{$driver->find_elements('#results tbody tr', 'css')};
+is_deeply
+  \@jobs,
+  [qw(job_99940 job_99939 job_99938 job_99926 job_99936 job_99947 job_99962 job_99946 job_99945 job_99944)],
+  'all rows displayed';
+
+subtest 'filter-finished' => sub {
+    # test filtering finished jobs by result
+    my $filter_input = $driver->find_element('#finished_jobs_result_filter_chosen input', 'css');
+    $filter_input->click();
+    $filter_input->send_keys('Passed');
+    $driver->find_element('#finished_jobs_result_filter_chosen .active-result', 'css')->click();
+    # actually this does not use AJAX, but be sure all JavaScript processing is done anyways
+    wait_for_ajax();
+    @jobs = map { $_->get_attribute('id') } @{$driver->find_elements('#results tbody tr', 'css')};
+    is_deeply \@jobs, [qw(job_99947 job_99946 job_99945 job_80000 job_99937 job_99764)], 'only passed jobs displayed';
+    $driver->find_element('#finished_jobs_result_filter_chosen .search-choice-close', 'css')->click();
+    # enable filter via query parameter, this time disable relevantfilter
+    $driver->get('/tests?resultfilter=Failed&foo=bar&resultfilter=Softfailed');
+    wait_for_ajax_and_animations(msg => 'tables loaded after reloading page with disabled relevantfilter');
+    $driver->find_element_by_id('relevantfilter')->click();
+    wait_for_ajax_and_animations();
+    @jobs = map { $_->get_attribute('id') } @{$driver->find_elements('#results tbody tr', 'css')};
+    is_deeply
+      \@jobs,
+      [qw(job_99940 job_99939 job_99938 job_99936 job_99962 job_99944)],
+      'only softfailed and failed jobs displayed';
+    $driver->find_element('#finished_jobs_result_filter_chosen .search-choice-close', 'css')->click();
+    $driver->find_element('#finished_jobs_result_filter_chosen .search-choice-close', 'css')->click();
+
+    # now toggle back
+    $driver->find_element_by_id('relevantfilter')->click();
+    wait_for_ajax();
+
+    @jobs = map { $_->get_attribute('id') } @{$driver->find_elements('#results tbody tr', 'css')};
+    is_deeply
+      \@jobs,
+      [qw(job_99940 job_99939 job_99938 job_99926 job_99936 job_99947 job_99962 job_99946 job_80000 job_99937)],
+      '99945 again hidden';
+
+    ok $driver->get('/tests?todo=1'), 'get TODO-tests';
+    wait_for_ajax(msg => 'tables loaded after reloading page with TODO-parameter');
+    @jobs = map { $_->get_attribute('id') } @{$driver->find_elements('#results tbody tr', 'css')};
+    is_deeply \@jobs, [qw(job_99940 job_99938 job_99926 job_99962)], 'only todo tests are shown';
+    $driver->find_element_by_id('todofilter')->click;
+    wait_for_ajax(msg => 'table re-loaded after unchecking TODO-checkbox');
+    cmp_ok scalar $driver->find_elements('#results tbody tr', 'css'), '>', scalar @jobs, 'all jobs shown again';
+};
+
+subtest 'result filter does not affect scheduled and running jobs' => sub {
+    $driver->get('/tests?resultfilter=Failed');
+    wait_for_ajax msg => 'tables loaded after reloading page with resultfilter';
+
+    my @running_jobs = $driver->find_elements('#running tbody tr');
+    is scalar @running_jobs, 3, 'Running jobs are displayed';
+
+    my @scheduled_jobs = $driver->find_elements('#scheduled tbody tr');
+    is scalar @scheduled_jobs, 4, 'Scheduled jobs are displayed';
+
+    my @finished_jobs = $driver->find_elements('#results tbody tr');
+    is scalar @finished_jobs, 3, 'Finished jobs table is correctly filtered';
+};
+
+subtest 'match parameter' => sub {
+    $driver->get('/tests?match=staging_e');
+    wait_for_ajax msg => '"All tests" with match parameter';
+    my @match_jobs = map { $_->get_attribute('id') } @{$driver->find_elements('tbody tr', 'css')};
+    ok !$match_jobs[0], 'no running job matching';
+    ok !$match_jobs[1], 'no scheduled job matching';
+    is $match_jobs[2], 'job_99926', 'exactly one finished job matching';
+};
+
+subtest 'comment parameter' => sub {
+    $driver->get('/tests?comment=test1');
+    wait_for_ajax msg => '"All tests" with comment parameter';
+    is_deeply [map { $_->get_attribute('id') } @{$driver->find_elements('tbody tr', 'css')}],
+      [qw(job_99963 job_99928 job_99946)],
+      'exactly one running, scheduled and finished job match';
+};
+
+$driver->get('/tests');
+wait_for_ajax();
+my @cancel_links = $driver->find_elements('#job_99928 a.cancel');
+is scalar @cancel_links, 0, 'no cancel link when not logged in';
+
+# now login to test restart links
+$driver->find_element_by_link_text('Login')->click();
+wait_for_ajax();
+@cancel_links = $driver->find_elements('#job_99928 a.cancel');
+is scalar @cancel_links, 1, 'cancel link displayed when logged in';
+
+my $td = $driver->find_element('#job_99946 td.test');
+is $td->get_text() =~ s/\s+\d+$//r, 'textmode@32bit', 'correct test name';
+
+$driver->find_child_element($td, '.restart', 'css')->click();
+wait_for_ajax();
+
+$driver->title_is('openQA: Test results', 'restart stays on page');
+$td = $driver->find_element('#job_99946 td.test');
+is $td->get_text() =~ s/\s+\d+(\s+.*)?$/$1/r, 'textmode@32bit (restarted)', 'restart removes link';
+
+subtest 'priority explanation tooltip' => sub {
+
+    # Create a job with priority explanation
+    my $group = $schema->resultset('JobGroups')->find({name => 'opensuse'});
+    my $now = strftime('%Y-%m-%d %H:%M:%S', gmtime);
+    my $job = $schema->resultset('Jobs')->create(
+        {
+            id => 88888,
+            state => SCHEDULED,
+            priority => 62,
+            TEST => 'prio_test',
+            DISTRI => 'opensuse',
+            VERSION => '15.5',
+            FLAVOR => 'DVD',
+            ARCH => 'x86_64',
+            BUILD => '1234',
+            group_id => $group->id,
+            t_created => $now,
+            t_updated => $now,
+        });
+    $job->settings->create({key => '_PRIORITY_EXPLANATION', value => '+50 because job group name matches Development'});
+
+    # we are already on /tests from previous actions and logged in
+    $driver->get('/tests');
+    wait_for_ajax;
+    my $prio_cell
+      = wait_for_element(selector => '#job_88888 .prio-value', description => 'priority cell for job 88888');
+
+    is $prio_cell->get_text(), '62', 'priority value is correct';
+    is $prio_cell->get_attribute('data-bs-toggle'), 'tooltip', 'tooltip is enabled';
+    like $prio_cell->get_attribute('title'), qr/\+50 because job group name matches/, 'tooltip title is correct';
+
+    # Also check the details page (infopanel)
+    $driver->get('/tests/88888');
+    wait_for_ajax;
+    $prio_cell = wait_for_element(selector => '#info_box .prio-value', description => 'priority cell on details page');
+    is $prio_cell->get_text(), '62', 'priority value on details page is correct';
+    my $title
+      = $prio_cell->get_attribute('title')
+      || $prio_cell->get_attribute('data-bs-title')
+      || $prio_cell->get_attribute('data-bs-original-title');
+    like $title, qr/\+50 because job group name matches/, 'tooltip title on details page is correct';
+};
+
+subtest 'job 99940 module results and job 99991 description' => sub {
+
+    $driver->get('/tests');
+    wait_for_ajax;
+    my $results = $driver->find_elements('#job_99940 > td')->[2];
+    $results = $driver->find_child_element($results, 'a');
+    my @count = split /\s+/, $results->get_text();
+    my @types = $driver->find_child_elements($results, 'i');
+    is @count, @types, 'each number has a type';
+    for my $class (qw(module_passed module_failed module_softfailed module_none module_skipped)) {
+        is scalar(@{$driver->find_child_elements($results, 'i.' . $class)}), 1, "$class displayed";
+    }
+
+    is $driver->find_element('#job_99991 td.test')->get_text() =~ s/\s+\d+$//r,
+      'kde_variant@64bit', 'job 99991 displays TEST correctly';
+
+    $driver->get('/tests/99991#settings');
+    wait_for_ajax;
+    is $driver->find_element('#scenario-description')->get_text(),
+      'Simple kde test, before advanced_kde',
+      'job 99991 description displays correctly';
+};
+
+kill_driver();
+done_testing();

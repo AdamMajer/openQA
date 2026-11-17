@@ -1,0 +1,31 @@
+<span id="more_builds">
+    Limit to
+    <select onchange="window.location.href = this.value;" class="form-select form-select-sm" name="limit_builds">
+    % foreach (@$limit_builds_preset) {
+      <option value="<%= url_with->query({limit_builds => $_}) %>" <%= $_ == $limit_builds ? 'selected' : '' %>><%= $_ %></option>
+    % }
+    </select>
+    builds&nbsp;&nbsp;
+    <div class="cbc">
+      <input type="checkbox" id="cb_only_tagged" value="<%= url_with->query({only_tagged => int(!$only_tagged)}) %>" <%= $only_tagged ? 'checked' : '' %>
+            onchange="window.location.href = this.value;" class="form-check-input" />
+      <label for="cb_only_tagged" class="form-check-label">Only show tagged builds</label>
+    </div>
+</span>
+
+<span id="mode_section">&nbsp;&nbsp;
+    <div class="cbc">
+      <input type="checkbox" id="cb_fullscreen" value="<%= url_with->query({fullscreen => int(!$fullscreen)}) %>" <%= $fullscreen ? 'checked' : '' %>
+            onchange="window.location.href = this.value;" class="form-check-input" />
+      <label for="cb_fullscreen" class="form-check-label">Fullscreen mode</label>
+    </div>
+    % if ($fullscreen) {
+      &nbsp;&nbsp;Auto refresh every
+      <select onchange="window.location.href = this.value;" class="form-select form-select-sm" name="interval">
+      % foreach (@$interval_preset) {
+        <option value="<%= url_with->query({interval => $_}) %>" <%= $_ == $interval ? 'selected' : '' %>><%= $_ %></option>
+      % }
+      </select>
+      seconds
+    % }
+</span>

@@ -1,0 +1,948 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# see also t/ui/14-dashboard.t and t/ui/14-dashboard-parents.t for Selenium test
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+use Mojo::Base -signatures;
+use Test::Mojo;
+use Test::Warnings ':report_warnings';
+use Test::MockModule;
+use OpenQA::Test::Case;
+use OpenQA::Test::TimeLimit '10';
+use OpenQA::Jobs::Constants;
+use OpenQA::Constants qw(BUILD_SORT_BY_NEWEST_JOB BUILD_SORT_BY_OLDEST_JOB);
+use OpenQA::Utils qw(regex_match);
+use Mojo::File qw(tempfile);
+use Date::Format;
+use Time::Seconds qw(ONE_HOUR);
+
+# init test case
+my $test_case = OpenQA::Test::Case->new;
+$test_case->init_data(fixtures_glob => '01-jobs.pl 03-users.pl 05-job_modules.pl');
+my $t = Test::Mojo->new('OpenQA::WebAPI');
+my $auth = {'X-CSRF-Token' => $t->ua->get('/tests')->res->dom->at('meta[name=csrf-token]')->attr('content')};
+$test_case->login($t, 'percival');
+my $job_groups = $t->app->schema->resultset('JobGroups');
+my $parent_groups = $t->app->schema->resultset('JobGroupParents');
+my $jobs = $t->app->schema->resultset('Jobs');
+
+subtest 'MIME types' => sub {
+    is $t->app->types->type('yaml'), 'text/yaml;charset=UTF-8', 'right type';
+    is $t->app->types->type('bz2'), 'application/x-bzip2', 'right type';
+    is $t->app->types->type('xz'), 'application/x-xz', 'right type';
+    is $t->app->types->type('rss'), 'application/rss+xml;charset=UTF-8', 'right type';
+};
+
+# regular job groups shown
+$t->get_ok('/dashboard_build_results')->status_is(200);
+my @h2 = $t->tx->res->dom->find('h2 a')->map('text')->each;
+is_deeply \@h2, ['opensuse', 'opensuse test'], 'two groups shown (from fixtures)';
+
+# create (initially) empty parent group
+my $test_parent = $parent_groups->create({name => 'Test parent', sort_order => 2});
+
+subtest 'Validation errors' => sub {
+    $t->get_ok('/dashboard_build_results/?group=opensuse')->status_is(200)->content_like(qr{/group_overview/1002});
+    $t->get_ok('/dashboard_build_results/?group=[')->status_is(400)
+      ->json_like('/error', qr/group parameter is invalid: Unmatched \[ in regex/i);
+
+    $t->get_ok('/group_overview/1002?limit_builds=a')->status_is(400)
+      ->content_like(qr/Erroneous parameters.*limit_builds/);
+    $t->get_ok('/group_overview/1002.json?limit_builds=a')->status_is(400)
+      ->json_like('/error', qr/Erroneous parameters.*limit_builds/);
+    $t->get_ok('/group_overview/1002?comments_page=a')->status_is(400)
+      ->content_like(qr/Erroneous parameters.*comments_page/);
+    $t->get_ok('/group_overview/1002?comments_limit=a')->status_is(400)
+      ->content_like(qr/Erroneous parameters.*comments_limit/);
+    $t->get_ok('/group_overview/1002?group=$*')->status_is(400)
+      ->content_like(qr/group parameter is invalid.*matches null string many times/i);
+    $t->get_ok('/group_overview/1002.rss?limit_builds=a')->status_is(400)->content_type_like(qr{application/rss\+xml})
+      ->content_like(qr/Erroneous parameters.*limit_builds/);
+    $t->get_ok('/group_overview/1002.rss?group=$*')->status_is(400)
+      ->content_like(qr/group parameter is invalid.*matches null string many times/i);
+
+    my $id = $test_parent->id;
+    $t->get_ok("/parent_group_overview/$id?limit_builds=a")->status_is(400)
+      ->content_like(qr/Erroneous parameters.*limit_builds/);
+    $t->get_ok("/parent_group_overview/$id.json?limit_builds=a")->status_is(400)
+      ->json_like('/error', qr/Erroneous parameters.*limit_builds/);
+    $t->get_ok("/parent_group_overview/$id?comments_page=a")->status_is(400)
+      ->content_like(qr/Erroneous parameters.*comments_page/);
+    $t->get_ok("/parent_group_overview/$id?comments_limit=a")->status_is(400)
+      ->content_like(qr/Erroneous parameters.*comments_limit/);
+    $t->get_ok(qq{/parent_group_overview/$id?group=\$*})->status_is(400)
+      ->content_like(qr/group parameter is invalid.*matches null string many times/i);
+
+    my $groups_mock = Test::MockModule->new('OpenQA::Schema::Result::JobGroups');
+    $groups_mock->redefine(regex_match => sub { die 'invalid regex: fake regex error after validation' });
+    $t->get_ok('/dashboard_build_results/?group=opensuse')->status_is(400)
+      ->json_like('/error', qr/invalid regex: fake regex error after validation/i);
+    my $build_results_mock = Test::MockModule->new('OpenQA::BuildResults');
+    $build_results_mock->redefine(find_child_groups => sub { die 'invalid regex: fake regex error after validation' });
+    $t->get_ok("/parent_group_overview/$id?group=opensuse")->status_is(400)
+      ->content_like(qr/invalid regex: fake regex error after validation/i);
+};
+
+subtest 'Regex-specific validation' => sub {
+    # This tests checks the regex validation helper and utilty function producing hard failures directly using
+    # a few cases from https://perldoc.perl.org/perldiag.
+
+    my $c = $t->app->build_controller;
+    is $c->regex_problem(['']), undef, 'passing empty regex to regex_problem is ok';
+    like $c->regex_problem(['[[:alnum]]']), qr/not.*posix/i, 'Assuming NOT a POSIX class since %s in regex';
+    like $c->regex_problem(['[a-\d]']), qr/false.*range/i, 'False [] range "%s" in regex';
+
+    lives_ok { regex_match('', '') } 'passing empty regex to regex_match is ok';
+    throws_ok { regex_match('[:alpha:]', '') } qr/posix syntax.*/i,
+      'POSIX syntax [%c %c] belongs inside character classes%s';
+    throws_ok { regex_match('.{2,1}', '') } qr/quantifier/i, 'Quantifier {n,m} with n > m can not match';
+};
+
+subtest 'Changelog' => sub {
+    my $global_cfg = $t->app->config->{global};
+    $global_cfg->{changelog_file} = 'does not exist';
+    $t->get_ok('/changelog')->status_is(200)->content_like(qr/No changelog available/)
+      ->content_unlike(qr/Custom changelog works/);
+    my $changelog = tempfile;
+    $changelog->spew('Custom changelog works!');
+    $global_cfg->{changelog_file} = $changelog->to_string;
+    $t->get_ok('/changelog')->status_is(200)->content_like(qr/Custom changelog works/);
+};
+
+$t->get_ok('/health')->status_is(200)->content_is('ok', 'health check route just returns plain ok');
+
+$t->get_ok('/api/v1/routes')->status_is(200)
+  ->json_is('/routes/1/path', '/admin', 'simple check for listing WebAPI routes');
+
+$t->get_ok('/dashboard_build_results')->status_is(200);
+@h2 = $t->tx->res->dom->find('h2 a')->map('text')->each;
+is_deeply \@h2, ['opensuse', 'opensuse test'], 'empty parent group not shown';
+
+# move opensuse group to new parent group
+my $opensuse_group = $job_groups->find({name => 'opensuse'});
+$opensuse_group->update({parent_id => $test_parent->id});
+
+$t->get_ok('/group_overview/' . $opensuse_group->id)->status_is(200);
+my $dom = $t->tx->res->dom;
+like
+  $dom->find('h2')->map('all_text')->join,
+  qr/[ \n]*Last Builds for[ \n]*Test parent[ \n]*\/[ \n]*opensuse[ \n]*/,
+  'parent name also shown on group overview';
+like $dom->find('#sorting-note')->map('all_text')->join, qr/Builds are sorted by name/, 'note about sorting present';
+
+$t->get_ok('/dashboard_build_results')->status_is(200);
+@h2 = $t->tx->res->dom->find('h2 a')->map(sub ($e) { $e->text . ($e->attr('title') // '') })->each;
+my $test_overview_tooltip = 'Shows the latest test results for all job groups within this parent job group';
+is_deeply
+  \@h2,
+  ['opensuse test', 'Test parent', $test_overview_tooltip],
+  'parent group shown and opensuse is no more on top-level';
+my $tests_overview_dashboard = $t->tx->res->dom->find('#test_result_overview_link_1')->first;
+is
+  $tests_overview_dashboard->attr('href'),
+  '/tests/overview?groupid=1001',
+  'The "test result overview" anchor href points to /test/overview and includes all the groupids for group 1';
+
+my @h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+is_deeply \@h4, [qw(Build87.5011 Build0048@0815 Build0048)], 'builds on parent-level shown, sorted first by version';
+@h4 = $t->tx->res->dom->find('div.collapse .h4 a')->map('text')->each;
+is_deeply \@h4, ['opensuse', 'opensuse', 'opensuse'], 'opensuse now shown as child group (for each build)';
+
+# check config file build limit
+my $ogfpb = $t->app->config->{global}->{frontpage_builds};
+$t->app->config->{global}->{frontpage_builds} = 1;
+$t->get_ok('/dashboard_build_results')->status_is(200);
+@h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+is_deeply \@h4, [qw(Build87.5011)], 'single build on parent-level shown (limit builds via config)';
+
+# check query param build limit works and overrides config file limit
+$t->get_ok('/dashboard_build_results?limit_builds=2')->status_is(200);
+@h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+is_deeply \@h4, [qw(Build87.5011 Build0048@0815)], 'builds on parent-level shown (limit builds)';
+@h4 = $t->tx->res->dom->find('div.collapse .h4 a')->map('text')->each;
+is_deeply \@h4, ['opensuse', 'opensuse'], 'opensuse now shown as child group (limit builds)';
+
+$t->app->config->{global}->{frontpage_builds} = $ogfpb;
+
+# also add opensuse test to parent to actually check the grouping
+my $opensuse_test_group = $job_groups->find({name => 'opensuse test'});
+$opensuse_test_group->update({parent_id => $test_parent->id});
+
+# and add review for build 0048@0815
+$opensuse_group->jobs->find({BUILD => '0048@0815'})->comments->create({text => 'poo#1234', user_id => 99901});
+
+$t->get_ok('/dashboard_build_results?limit_builds=20&show_tags=1')->status_is(200);
+@h2 = $t->tx->res->dom->find('h2 a')->map(sub ($e) { $e->text . ($e->attr('title') // '') })->each;
+is_deeply
+  \@h2,
+  ['Test parent', $test_overview_tooltip],
+  'only link to parent (and related overview) shown, no more top-level job groups';
+
+sub check_test_parent ($default_expanded) {
+
+    @h4 = $t->tx->res->dom->find("div.children-$default_expanded .h4 a")->map('text')->each;
+    is_deeply
+      \@h4,
+      ['Build87.5011', 'Build0048@0815', 'Build0048', 'Build0092', 'Build0091'],
+      'builds on parent-level shown';
+
+    $t->element_count_is('#review-' . $test_parent->id . '-Factory-0048_0815',
+        1, 'review badge for build 0048@0815 shown');
+    $t->element_count_is('#child-review-' . $test_parent->id . '-Factory-0048_0815',
+        1, 'review badge for build 0048@0815 also shown on child-level');
+    $t->element_count_is('#review-' . $test_parent->id . '-0048', 0, 'review badge for build 0048 NOT shown yet');
+    $t->element_count_is('#child-review-' . $test_parent->id . '-0048',
+        0, 'review badge for build 0048 also on child-level NOT shown yet');
+
+    my @progress_bars = $t->tx->res->dom->find("div.children-$default_expanded .progress")->map('attr', 'title')->each;
+    is_deeply
+      \@progress_bars,
+      [
+        "failed: 1\ntotal: 1",
+        "failed: 1\ntotal: 1",
+        "softfailed: 2\nfailed: 1\ntotal: 3",
+        "passed: 1\ntotal: 1",
+        "passed: 2\nunfinished: 3\nskipped: 1\ntotal: 6",
+      ],
+      'parent-level progress bars are accumulated';
+
+    @h4 = $t->tx->res->dom->find('div#group' . $test_parent->id . '_build13_1-0091 .h4 a')->map('text')->each;
+    is_deeply \@h4, ['opensuse', 'opensuse test'], 'both child groups shown under common build';
+    @progress_bars
+      = $t->tx->res->dom->find('div#group' . $test_parent->id . '_build13_1-0091 .progress')->map('attr', 'title')
+      ->each;
+    is_deeply
+      \@progress_bars,
+      ["passed: 2\nunfinished: 2\nskipped: 1\ntotal: 5", "unfinished: 1\ntotal: 1"],
+      'progress bars for child groups shown correctly';
+
+    my @urls
+      = $t->tx->res->dom->find('div#group' . $test_parent->id . '_build13_1-0091 .h4 a')->map('attr', 'href')->each;
+    is_deeply
+      \@urls,
+      [
+        '/tests/overview?distri=opensuse&version=13.1&build=0091&groupid=1001',
+        '/tests/overview?distri=opensuse&version=13.1&build=0091&groupid=1002'
+      ],
+      'link URLs';
+
+    $t->element_count_is("div.children-$default_expanded .badge-all-passed", 1, 'badge shown on parent-level');
+    $t->element_count_is("div.children-$default_expanded .h4 span span.tag", 0, 'no tags shown yet');
+}
+check_test_parent('collapsed');
+
+# links are correct
+my @urls = $t->tx->res->dom->find('h2 a, .row a')->map('attr', 'href')->each;
+for my $url (@urls) {
+    next if ($url =~ /^#/ || $url =~ /^.*\:\//);
+    $t->get_ok($url)->status_is(200);
+}
+
+# parent group overview
+$t->get_ok('/parent_group_overview/' . $test_parent->id)->status_is(200);
+check_test_parent('expanded');
+my $tests_overview = $t->tx->res->dom->find('#test_result_overview_link_1')->first;
+is
+  $tests_overview->attr('href'),
+  '/tests/overview?groupid=1001&groupid=1002',
+  "The 'test result overview' anchor href points to /test/overview and includes all the groupids";
+
+# add tags (99901 is user ID of arthur)
+my $tag_for_0092_comment = $opensuse_group->comments->create({text => 'tag:0092:important:some_tag', user_id => 99901});
+
+sub check_tags () {
+    $t->get_ok('/dashboard_build_results?limit_builds=20&show_tags=1')->status_is(200);
+    my @tags = $t->tx->res->dom->find('div.children-collapsed span span.tag')->map('text')->each;
+    is_deeply \@tags, ['some_tag'], 'tag is shown on parent-level';
+
+    $t->get_ok('/parent_group_overview/' . $test_parent->id . '?limit_builds=20&show_tags=1')->status_is(200);
+    @tags = $t->tx->res->dom->find('div.children-expanded span span.tag')->map('text')->each;
+    is_deeply \@tags, ['some_tag'], 'tag is shown on parent-level';
+
+    $t->get_ok('/dashboard_build_results?limit_builds=20&only_tagged=1')->status_is(200);
+    @tags = $t->tx->res->dom->find('div.children-collapsed span span.tag')->map('text')->each;
+    is_deeply \@tags, ['some_tag'], 'tag is shown on parent-level (only tagged)';
+    @h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+    is_deeply \@h4, ['Build0092'], 'only tagged builds on parent-level shown';
+}
+check_tags();
+
+# use version-build format where version matches
+$tag_for_0092_comment->update({text => 'tag:13.1-0092:important:some_tag', user_id => 99901});
+check_tags();
+
+# use version-build format where version doesn't matches
+$tag_for_0092_comment->update({text => 'tag:5-0092:important:some_tag', user_id => 99901});
+$t->get_ok('/dashboard_build_results?limit_builds=20&only_tagged=1')->status_is(200);
+my @tags = $t->tx->res->dom->find('div.children-collapsed .h4 span span.tag')->map('text')->each;
+is_deeply \@tags, [], 'tag is not shown on parent-level because version does not match';
+@h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+is_deeply \@h4, [], 'also no tagged builds on parent-level shown';
+
+# tags in a comment with flag:verbatim are ignored
+$tag_for_0092_comment->update({text => 'flag:verbatim quoting tag:0092:important:some_tag', user_id => 99901});
+$t->get_ok('/dashboard_build_results?limit_builds=20&only_tagged=1')->status_is(200);
+@h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+is_deeply \@h4, [], 'no tagged builds shown for a verbatim comment';
+
+# now tag build 0091 to check build tagging when there are common builds
+$tag_for_0092_comment->delete();
+my $tag_for_0091_comment
+  = $opensuse_test_group->comments->create({text => 'tag:0091:important:some_tag', user_id => 99901});
+
+$t->get_ok('/dashboard_build_results?limit_builds=20&only_tagged=1')->status_is(200);
+@h4 = $t->tx->res->dom->find('div.children-collapsed .h4 a')->map('text')->each;
+is_deeply \@h4, ['Build0091'], 'only tagged builds on parent-level shown (common build)';
+@h4 = $t->tx->res->dom->find('div#group' . $test_parent->id . '_build13_1-0091 .h4 a')->map('text')->each;
+is_deeply \@h4, ['opensuse', 'opensuse test'], 'both groups shown, though';
+
+# temporarily create failed job with build 0048@0815 in opensuse test to verify that review badge is only shown
+# if all combined builds are reviewed
+my $job_hash = {
+    BUILD => '0048@0815',
+    DISTRI => 'opensuse',
+    VERSION => 'Factory',
+    FLAVOR => 'tape',
+    ARCH => 'x86_64',
+    MACHINE => 'xxx',
+    TEST => 'dummy',
+    state => OpenQA::Jobs::Constants::DONE,
+    result => OpenQA::Jobs::Constants::FAILED,
+    group_id => $opensuse_test_group->id
+};
+my $not_reviewed_job = $jobs->create($job_hash);
+$t->app->schema->resultset('JobModules')->create(
+    {
+        script => 'tests/x11/failing_module.pm',
+        job_id => $not_reviewed_job->id,
+        category => 'x11',
+        name => 'failing_module',
+        result => 'failed'
+    });
+
+my $review_build_id = '-Factory-0048_0815';
+$t->get_ok('/dashboard_build_results?limit_builds=20')->status_is(200);
+$t->element_count_is('#review-' . $test_parent->id . $review_build_id,
+    0, 'review badge NOT shown for build 0048@0815 anymore');
+$t->element_count_is('#child-review-' . $test_parent->id . $review_build_id,
+    1, 'review badge review badge for build 0048@0815 still shown on child-level');
+
+$not_reviewed_job->delete();
+
+# auto badges when all passed or all either passed or softfailed
+sub check_auto_badge ($all_passed_count, $build = '13_1-0092') {
+    $t->element_count_is('#badge-all-passed-' . $test_parent->id . '-' . $build,
+        $all_passed_count, "all passed review badge shown for build $build on parent level");
+    $t->element_count_is('#child-badge-all-passed-' . $test_parent->id . '-' . $build,
+        $all_passed_count, "all passed review badge shown for build $build on child-level");
+}
+# all passed
+$t->get_ok('/dashboard_build_results?limit_builds=20')->status_is(200);
+check_auto_badge(1);
+# all passed or softfailed
+$jobs->find({id => 99947})->update({result => OpenQA::Jobs::Constants::SOFTFAILED});
+$t->get_ok('/dashboard_build_results?limit_builds=20')->status_is(200);
+check_auto_badge(1);
+$jobs->find({id => 99947})->update({result => OpenQA::Jobs::Constants::PASSED});
+
+sub check_badge ($reviewed_count, $msg, $build = undef, $commented_count = 0) {
+    $build //= 'Factory-0048';
+    $t->get_ok('/dashboard_build_results?limit_builds=20')->status_is(200);
+    my $id = $test_parent->id;
+    $t->element_count_is("#review-$id-$build", $reviewed_count, "$msg (review badges, parent-level)");
+    $t->element_count_is("#child-review-$id-$build", $reviewed_count, "$msg (review badges, child-level)");
+    $t->element_count_is("#badge-commented-$id-$build", $commented_count, "$msg (commented badges, parent-level)");
+    $t->element_count_is("#child-badge-commented-$id-$build", $commented_count, "$msg (commented badges, child-level)");
+}
+
+# make one of the softfailed jobs a failed because of failed not-important modules
+$t->app->schema->resultset('JobModules')->create(
+    {
+        script => 'tests/x11/failing_module.pm',
+        job_id => 99936,
+        category => 'x11',
+        name => 'failing_module',
+        result => 'failed'
+    });
+
+# failed:                             not reviewed
+# softfailed:                         not reviewed
+check_badge(0, 'no badge for completely unreviewed build');
+
+my $softfailed_issueref
+  = $opensuse_group->jobs->find({id => 99939})->comments->create({text => 'poo#4322', user_id => 99901});
+
+# failed:                             not reviewed
+# softfailed:                         reviewed
+check_badge(0, 'no badge as long as not all failed reviewed');
+
+my $failed_not_important_module_issueref
+  = $opensuse_group->jobs->find({id => 99936})->comments->create({text => 'poo#4322', user_id => 99901});
+
+# failed:                             not reviewed
+# softfailed:                         reviewed
+check_badge(0, 'no badge as long as not all failed reviewed');
+
+# add arbitrary comment for job 99938
+my $failed_comment
+  = $opensuse_group->jobs->find({id => 99938})->comments->create({text => 'arbitrary comment', user_id => 99901});
+
+# failed:                             not reviewed, only arbitrary comment
+# softfailed:                         reviewed
+check_badge(0, 'only commented badge', undef, 1);
+
+# add review for job 99938 (so now the other failed jobs are reviewed but one is missing)
+my $failed_issueref
+  = $opensuse_group->jobs->find({id => 99938})->comments->create({text => 'poo#4321', user_id => 99901});
+
+# failed:                             reviewed
+# softfailed:                         reviewed
+check_badge(1, 'badge when all failed reviewed, reviewed softfailed with failing module makes no difference');
+
+my $failed_with_non_important_module_issueref
+  = $opensuse_group->jobs->find({id => 99936})->comments->create({text => 'poo#4322', user_id => 99901});
+
+# failed:                             reviewed
+# softfailed without failing modules: reviewed
+check_badge(1, 'badge when all failed reviewed, reviewed softfailed without failing modules makes no difference');
+
+$softfailed_issueref->delete;
+
+# failed:                             reviewed
+# softfailed without failing modules: not reviewed
+check_badge(1, 'badge when all failed reviewed, unreviewed softfailed without failing modules makes no difference');
+
+$failed_with_non_important_module_issueref->delete;
+
+# failed:                             reviewed
+# softfailed without failing modules: not reviewed
+check_badge(1, 'badge when all failed reviewed, unreviewed softfailed without failing modules makes no difference');
+
+$opensuse_group->jobs->find({id => 99938})->delete;
+
+# failed:                             deleted
+# softfailed without failing modules: not reviewed
+check_badge(0, 'no badge when no failed');
+
+$failed_with_non_important_module_issueref
+  = $opensuse_group->jobs->find({id => 99936})->comments->create({text => 'poo#4322', user_id => 99901});
+
+# failed:                             deleted
+# softfailed without failing modules: not reviewed
+check_badge(0, 'no badge when no failed, reviewed softfailed with failing modules makes no difference');
+
+# change DISTRI/VERSION of test in opensuse group to test whether links are still correct then
+$opensuse_group->jobs->update({VERSION => '14.2', DISTRI => 'suse'});
+
+$t->get_ok('/dashboard_build_results?limit_builds=20&show_tags=0')->status_is(200);
+@urls = $t->tx->res->dom->find('.h4 a')->each;
+is scalar @urls, 12, 'now builds belong to different versions and are split';
+is $urls[1]->attr('href'),
+  '/tests/overview?distri=suse&version=14.2&build=87.5011&groupid=1001',
+  'most recent version/build';
+is $urls[-1]->attr('href'),
+  '/tests/overview?distri=opensuse&version=13.1&build=0091&groupid=1002',
+  'oldest version/build still shown';
+
+subtest 'build which has jobs with different DISTRIs links to overview with all DISTRIs' => sub {
+    my $job_with_different_distri = $opensuse_group->jobs->create(
+        {
+            ARCH => 'x86_64',
+            BUILD => '87.5011',
+            DISTRI => 'opensuse',
+            FLAVOR => 'staging_e',
+            TEST => 'minimaly',
+            VERSION => '14.2',
+            MACHINE => '32bit',
+        });
+    $t->get_ok('/dashboard_build_results?limit_builds=20&show_tags=0')->status_is(200);
+    my @urls = $t->tx->res->dom->find('.h4 a')->each;
+    is scalar @urls, 12, 'still 12 builds shown';
+    my $first_url = $urls[1]->attr('href');
+    is
+      $first_url,
+      '/tests/overview?distri=opensuse&distri=suse&version=14.2&build=87.5011&groupid=1001',
+      'both distris present in overview link';
+    $job_with_different_distri->delete;
+};
+
+# helper sub used by next two subtests
+sub check_builds ($build_names, $group, $msg, $parent = undef) {
+    my $route = $parent ? 'parent_group_overview' : 'group_overview';
+    my $div_class = $parent ? 'children-expanded' : 'no-children';
+    $t->get_ok("/$route/" . $group->id . '?limit_builds=100')->status_is(200);
+    my @h4 = $t->tx->res->dom->find("div.$div_class .h4 a")->map('text')->each;
+    is_deeply \@h4, $build_names, $msg || always_explain @h4;
+}
+
+subtest 'proper build sorting for dotted build number' => sub {
+    my $group = $job_groups->create({name => 'dotted version group'});
+    $job_hash->{group_id} = $group->id;
+    $job_hash->{VERSION} = '42.1';
+    my @builds = qw(
+      CURRENT
+      :TW.1181 :TW.1180 :TW.1179
+      :126416.perl-DBD-mysql.3690 :126006.gnome-control-center.3662 :125970.yast2.2588
+      20170112-2 20170112-1 20170111-2
+      62.51 62.50 62.49 62.5
+      0207
+      0185 0184 0183
+      0049@0207 0048@0206 0048@0205
+    );
+    for my $build (@builds) {
+        $job_hash->{BUILD} = $build;
+        $jobs->create($job_hash);
+    }
+
+    # with version sorting, builds should be sorted in order shown
+    my @build_names = map { 'Build' . $_ } @builds;
+    check_builds(\@build_names, $group, 'builds shown sorted by dotted number');
+
+    # without version sorting, builds should be sorted in reverse order
+    # (as the build which most recently had a job created sorts first)
+    $group->update({build_version_sort => BUILD_SORT_BY_NEWEST_JOB});
+    @build_names = reverse @build_names;
+    check_builds(\@build_names, $group, 'builds shown sorted by newest job in jobgroup');
+
+    # sorted by oldest job per build
+    # here a job for the old build 62.51 is rescheduled which will not break sorting
+    # in a jobgroup with BUILD_SORT_BY_OLDEST_JOB
+    $job_hash->{BUILD} = '62.51';
+    $jobs->create($job_hash);
+    $group->update({build_version_sort => BUILD_SORT_BY_OLDEST_JOB});
+    check_builds(\@build_names, $group, 'builds shown sorted by oldest job in jobgroup');
+};
+
+subtest 'job groups with multiple version and builds' => sub {
+    my $group = $job_groups->create({name => 'multi version group'});
+    $job_hash->{group_id} = $group->id;
+
+    sub create_job_version_build {
+        my ($version, $build) = @_;
+        $job_hash->{VERSION} = $version;
+        $job_hash->{BUILD} = $build;
+        $jobs->create($job_hash);
+    }
+
+    # create some test builds with jobs
+    create_job_version_build('42.3', '0002');
+    create_job_version_build('42.3', '0001');
+    create_job_version_build('42.2', '2192');
+    create_job_version_build('42.2', '2191');
+    create_job_version_build('42.2', '0002');
+
+    # with version sorting, builds should be sorted in order shown
+    my @build_names = qw(42.3-Build0002 Build0001 Build2192 Build2191 42.2-Build0002);
+    check_builds(\@build_names, $group, 'builds shown sorted by dotted versions');
+
+    # without version sorting, builds should be sorted in reverse order
+    # (as the build which most recently had a job created sorts first)
+    $group->update({build_version_sort => 0});
+    @build_names = reverse @build_names;
+    check_builds(\@build_names, $group, 'builds shown sorted by job creation time');
+};
+
+subtest 'job parent groups with multiple version and builds' => sub {
+    $test_parent->update({build_version_sort => 1});
+
+    # parent group overview
+    $t->get_ok('/parent_group_overview/' . $test_parent->id)->status_is(200);
+
+    my @build_names = qw(Build87.5011 Build0092 14.2-Build0091 Build0048@0815 Build0048 13.1-Build0091);
+    check_builds(\@build_names, $test_parent, 'parent group builds shown sorted by dotted versions',
+        'parent_group_overview');
+
+    my @entire_build_url_list = $t->tx->res->dom->find('.h4 a:first-child')->each();
+    my $first_entire_build_url = $entire_build_url_list[0]->attr('href');
+    is
+      $first_entire_build_url,
+      '/tests/overview?distri=suse&version=14.2&build=87.5011&groupid=1001&groupid=1002',
+      'entire build url contains all the child group ids';
+
+    $test_parent->update({build_version_sort => 0});
+
+    $t->get_ok('/parent_group_overview/' . $test_parent->id)->status_is(200);
+    @build_names = qw(14.2-Build0091 13.1-Build0091 Build0092 Build0048@0815 Build0048 Build87.5011);
+    check_builds(\@build_names, $test_parent, 'parent group builds shown sorted by time', 'parent_group_overview');
+
+    my $second_test_parent = $parent_groups->create({name => 'Second test parent', sort_order => 2});
+
+    $t->get_ok('/parent_group_overview/' . $second_test_parent->id)->status_is(200);
+
+    # Create a new parent group and put the job created by the other test into that one.
+    my $multi_version_group = $job_groups->find({name => 'multi version group'});
+    $multi_version_group->update({parent_id => $second_test_parent->id});
+
+    @build_names = qw(42.3-Build0002 Build0001 Build2192 Build2191 42.2-Build0002);
+    check_builds(\@build_names, $second_test_parent, 'parent group builds shown sorted by dotted versions',
+        'parent_group_overview');
+
+    $second_test_parent->update({build_version_sort => 0});
+
+    @build_names = reverse @build_names;
+    check_builds(\@build_names, $second_test_parent, 'parent group builds shown sorted by date',
+        'parent_group_overview');
+
+};
+
+subtest 'extra plugin links' => sub {
+    $t->app->config->{plugin_links}{operator}{Test1} = 'tests_overview';
+    $t->app->config->{plugin_links}{operator}{Test2} = 'latest';
+    $t->get_ok('/')->status_is(200)->element_exists('a[href*="/tests/overview"]')
+      ->text_like('a[href*="/tests/overview"]', qr/Test1/)->element_exists('a[href*="/tests/latest"]')
+      ->text_like('a[href*="/tests/latest"]', qr/Test2/);
+    $t->app->schema->resultset('Users')->search({username => 'percival'})->next->update({is_admin => 1});
+    $t->get_ok('/')->status_is(200)->element_exists('a[href*="/tests/overview"]')
+      ->element_exists('a[href*="/tests/latest"]');
+};
+
+subtest 'SUSE branding' => sub {
+    $t->app->config->{global}->{branding} = 'openqa.suse.de';
+    $t->get_ok('/')->status_is(200, 'main page');
+    $t->text_like('.jumbotron h2', qr/Welcome to.*at SUSE/, 'text from docbox rendered');
+    $t->attr_like('#sponsorbox a', 'href', qr/suse.com/, 'link to SUSE website');
+    $t->get_ok('/group_overview/1002')->status_is(200, 'group dashboard');
+    $t->get_ok('/parent_group_overview/' . $test_parent->id)->status_is(200, 'parent group dashboard');
+    $t->get_ok('/tests/99962/comments_ajax')->status_is(200, 'job comments');
+    my $btn_sel = '#commentForm .comment-toolbar a.fa-unlink';
+    $t->attr_like($btn_sel, 'title', qr/Add marker.*approved/, 'button title for adding review marker');
+    $t->attr_like($btn_sel, 'data-template', qr/\@review:acceptable_for/, 'button template for adding review marker');
+    $t->get_ok('/tests/overview?build=0091&result=none')->status_is(200, 'test overview page');
+    $t->attr_like('a.fa-unlink', 'data-template', qr/\@review:acceptable_for/, 'review marker on test overview page');
+};
+
+subtest 'Privacy policy configuration' => sub {
+    $t->get_ok('/')->status_is(200)->text_like('#footer-legal a', qr/Privacy Policy/)
+      ->attr_like('#footer-legal a', 'href', qr|docs/PrivacyPolicy.md|);
+
+    my $original_url = $t->app->config->{global}->{privacy_policy_url};
+    $t->app->config->{global}->{privacy_policy_url} = 'https://custom-privacy-policy.invalid';
+    $t->get_ok('/')->status_is(200)->text_like('#footer-legal a', qr/Privacy Policy/)
+      ->attr_like('#footer-legal a', 'href', qr|^https://custom-privacy-policy\.invalid$|);
+
+    $t->app->config->{global}->{privacy_policy_url} = $original_url;
+};
+
+subtest 're-routing' => sub {
+    # enable re-routing like it can be enabled via Mojolicious::Plugin::RequestBase
+    $t->app->hook(before_dispatch => sub ($c) { $c->req->url->base->path('/base') });
+    $t->get_ok('/')->status_is(200, 'could load main page with base');
+    $t->content_like(qr|function urlWithBase.*return '/base' \+ path|s, 'JavaScript helper has base');
+    $t->attr_like('#all_tests .nav-link', 'href', qr|/base/tests|s, 'base applied to navbar link');
+};
+
+subtest 'Group overview limit' => sub {
+    $t->get_ok('/group_overview/1001')->status_is(200)->element_exists_not('#max-jobs-limit');
+    $t->app->config->{misc_limits}->{job_groups_overview_max_jobs} = 1;
+    $t->get_ok('/group_overview/1001')->status_is(200)->element_exists('#max-jobs-limit')
+      ->text_like('#max-jobs-limit', qr/Only 1 results included/);
+};
+
+subtest 'Parent group overview limit' => sub {
+    $t->get_ok('/parent_group_overview/1')->status_is(200)->element_exists('#max-jobs-limit')
+      ->text_like('#max-jobs-limit', qr/Only 1 results included/);
+};
+
+subtest 'Dashboard limit' => sub {
+    $t->get_ok('/dashboard_build_results')->status_is(200)->element_exists('#max-jobs-limit')
+      ->text_like('#max-jobs-limit', qr/Only 1 results included/);
+};
+
+subtest 'API V1 JobGroup limit' => sub {
+    $t->get_ok('/api/v1/job_groups/1001/build_results')->status_is(200)->json_is('/limit_exceeded' => 1);
+};
+
+subtest 'Dashboard limit reached between groups' => sub {
+    # 'opensuse' (1001) has 2 jobs in the first 2 builds (87.5011 and 0048@0815)
+    # when clones are not included.
+    $t->app->config->{misc_limits}->{job_groups_overview_max_jobs} = 2;
+    $t->get_ok('/dashboard_build_results.json?limit_builds=2')->status_is(200)->json_is('/limit_exceeded' => 2);
+    $t->get_ok('/dashboard_build_results?limit_builds=2')->status_is(200)->element_exists('#max-jobs-limit')
+      ->text_like('#max-jobs-limit', qr/Only 2 results included/);
+
+    # Coverage for check between groups
+    my $group_aaa = $job_groups->create({name => 'AAA', sort_order => -1});
+    $jobs->create(
+        {
+            group_id => $group_aaa->id,
+            priority => 50,
+            result => 'passed',
+            TEST => 'test',
+            state => 'done',
+            BUILD => '1',
+            VERSION => '1',
+            ARCH => 'x86_64',
+            FLAVOR => 'flavor',
+            MACHINE => 'machine',
+        });
+    $t->app->config->{misc_limits}->{job_groups_overview_max_jobs} = 1;
+    $t->get_ok('/dashboard_build_results.json')->status_is(200)->json_is('/limit_exceeded' => 1);
+    # AAA should be present, others not
+    my $res = $t->tx->res->json;
+    is scalar @{$res->{results}}, 1, 'Only one group returned';
+    is $res->{results}->[0]->{group}->{name}, 'AAA', 'The correct group is returned';
+    $group_aaa->delete;
+};
+
+subtest 'Group overview JSON and comments coverage' => sub {
+    $opensuse_group->comments->create({text => 'some comment', user_id => 99901});
+    $opensuse_group->comments->create({text => 'pinned-description: some info', user_id => 99901});
+    $t->app->config->{misc_limits}->{job_groups_overview_max_jobs} = 2;
+    $t->get_ok('/group_overview/1001.json')->status_is(200)->json_has('/group')->json_has('/build_results')
+      ->json_is('/limit_exceeded' => 2);
+    my $res = $t->tx->res->json;
+    ok scalar @{$res->{comments}} > 0, 'comments are returned';
+    ok scalar @{$res->{pinned_comments}} > 0, 'pinned comments are returned';
+};
+
+subtest 'Parent group overview JSON' => sub {
+    $t->get_ok('/parent_group_overview/1.json')->status_is(200)->json_has('/group')->json_has('/build_results')
+      ->json_is('/limit_exceeded' => 2);
+};
+
+subtest 'RSS feed for job groups' => sub {
+    $t->get_ok('/group_overview/999999.rss')->status_is(404);
+
+    $t->get_ok('/group_overview/1001.rss')->status_is(200)->content_type_is('application/rss+xml;charset=UTF-8');
+    my $dom = Mojo::DOM->new->xml(1)->parse($t->tx->res->body);
+    is $dom->at('rss')->attr('version'), '2.0', 'RSS 2.0 root';
+    like $dom->at('channel > title')->text, qr/opensuse/, 'channel title has group name';
+    like $dom->at('channel > link')->text, qr{/group_overview/1001$}, 'channel link is group overview URL';
+    like $dom->at('channel > atom\:link')->attr('href'), qr{^https?://.+/group_overview/1001\.rss$}, 'self atom link';
+    like $dom->at('channel > description')->text, qr/opensuse/, 'channel description';
+
+    my @items = $dom->find('channel > item')->each;
+    ok scalar @items > 0, 'items returned';
+    is $dom->at('channel > lastBuildDate')->text, $items[0]->at('pubDate')->text, 'lastBuildDate matches latest item';
+
+    for my $item (@items) {
+        ok $item->at('title')->text, 'item has title';
+        like $item->at('link')->text, qr{/tests/overview\?}, 'item has tests overview link';
+        like $item->at('link')->text, qr{groupid=1001}, 'item link has groupid';
+        like $item->at('guid')->text, qr{^1001-}, 'item has guid';
+        is $item->at('guid')->attr('isPermaLink'), 'false', 'guid is not permalink';
+        like $item->at('pubDate')->text, qr/^\w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} \+0000$/,
+          'valid RFC-822 pubDate';
+    }
+
+    $t->get_ok('/group_overview/1001.rss?limit_builds=1')->status_is(200);
+    my $dom_limit1 = Mojo::DOM->new->xml(1)->parse($t->tx->res->body);
+    is scalar $dom_limit1->find('channel > item')->each, 1, 'only latest build returned with limit_builds=1';
+
+    my $empty_group = $job_groups->create({name => 'empty_feed_group'});
+    $t->get_ok('/group_overview/' . $empty_group->id . '.rss')->status_is(200);
+    my $dom_empty = Mojo::DOM->new->xml(1)->parse($t->tx->res->body);
+    is scalar $dom_empty->find('channel > item')->each, 0, 'empty group has 0 items';
+    ok !$dom_empty->at('channel > lastBuildDate'), 'empty group has no lastBuildDate';
+    $empty_group->delete;
+};
+
+subtest 'RSS feed for parent groups' => sub {
+    $t->get_ok('/parent_group_overview/1.rss')->status_is(200)->content_type_is('application/rss+xml;charset=UTF-8');
+    my $dom = Mojo::DOM->new->xml(1)->parse($t->tx->res->body);
+    is $dom->at('rss')->attr('version'), '2.0', 'RSS 2.0 root';
+    like $dom->at('channel > link')->text, qr{/parent_group_overview/1$}, 'channel link is parent group overview URL';
+    like $dom->at('channel > atom\:link')->attr('href'), qr{^https?://.+/parent_group_overview/1\.rss$},
+      'self atom link';
+    my @items = $dom->find('channel > item')->each;
+    if (@items) {
+        like $items[0]->at('link')->text, qr{groupid=}, 'parent group item link has child group query';
+    }
+};
+
+subtest 'RSS feed discoverability' => sub {
+    $t->get_ok('/group_overview/1001')->status_is(200)
+      ->element_exists('link[rel="alternate"][type="application/rss+xml"][href$="/group_overview/1001.rss"]')
+      ->element_exists('a#rss-feed-link[href$="/group_overview/1001.rss"]');
+
+    $t->get_ok('/parent_group_overview/1')->status_is(200)
+      ->element_exists('link[rel="alternate"][type="application/rss+xml"][href$="/parent_group_overview/1.rss"]')
+      ->element_exists('a#rss-feed-link[href$="/parent_group_overview/1.rss"]');
+};
+
+subtest 'dashboard_build_results coverage' => sub {
+    my $build_results_mock = Test::MockModule->new('OpenQA::BuildResults');
+    $build_results_mock->redefine(
+        compute_build_results => sub { die 'invalid regex: fake regex error after validation' });
+    $t->get_ok('/group_overview/1001')->status_is(400)
+      ->content_like(qr/invalid regex: fake regex error after validation/i);
+    $build_results_mock->unmock('compute_build_results');
+
+    $t->get_ok('/dashboard_build_results.json?group=opensuse')->status_is(200);
+    $t->get_ok('/dashboard_build_results.json?show_tags=1')->status_is(200);
+    $t->get_ok('/dashboard_build_results.json?only_tagged=1')->status_is(200);
+    $t->get_ok('/dashboard_build_results.json')->status_is(200);
+    my $res = $t->tx->res->json;
+    ok scalar @{$res->{results}} > 0, 'results are returned';
+};
+
+subtest 'Ignore job groups' => sub {
+    $t->app->schema->txn_begin;
+    # Create local groups and jobs for testing to avoid interference with other tests
+    my $g1 = $job_groups->create({name => 'IgnoreMe1'});
+    my $g2 = $job_groups->create({name => 'IgnoreMe2'});
+    my $job_defaults = {
+        TEST => 't',
+        DISTRI => 'd',
+        VERSION => 'v',
+        FLAVOR => 'f',
+        ARCH => 'a',
+        BUILD => 'b',
+        state => 'done',
+        priority => 50
+    };
+    $jobs->create({%$job_defaults, group_id => $g1->id});
+    $jobs->create({%$job_defaults, group_id => $g2->id});
+
+    subtest 'Ignore via openqa.ini (ignored_job_groups)' => sub {
+        $t->app->ignored_groups({IgnoreMe1 => 1});
+        my $res = $t->get_ok('/dashboard_build_results.json')->status_is(200)->tx->res->json;
+        my @group_names = map { $_->{group}->{name} } @{$res->{results}};
+        ok !grep({ $_ eq 'IgnoreMe1' } @group_names), 'IgnoreMe1 is hidden when configured in openqa.ini';
+        ok grep({ $_ eq 'IgnoreMe2' } @group_names), 'IgnoreMe2 remains visible when IgnoreMe1 is ignored';
+
+        $test_case->login($t, 'arthur');
+        $t->get_ok('/admin/job_templates/' . $g1->id)->status_is(200)
+          ->element_exists('input#editor-ignore-on-dashboard[disabled="disabled"]')
+          ->element_exists('input#editor-ignore-on-dashboard[checked="checked"]')
+          ->element_exists('label[for="editor-ignore-on-dashboard"][title*="the group name is configured"]');
+        $test_case->login($t, 'percival');
+
+        $t->app->ignored_groups({IgnoreMe1 => 1, IgnoreMe2 => 1});
+        $res = $t->get_ok('/dashboard_build_results.json')->status_is(200)->tx->res->json;
+        @group_names = map { $_->{group}->{name} } @{$res->{results}};
+        ok !grep({ $_ eq 'IgnoreMe1' } @group_names), 'IgnoreMe1 is hidden when multiple groups are ignored';
+        ok !grep({ $_ eq 'IgnoreMe2' } @group_names), 'IgnoreMe2 is hidden when multiple groups are ignored';
+
+        # sloppiness is handled in the attribute builder, so we test it by resetting and letting it recompute
+        $t->app->config->{global}->{ignored_job_groups} = ' , IgnoreMe1 , , ';
+        delete $t->app->{ignored_groups};
+        $res = $t->get_ok('/dashboard_build_results.json')->status_is(200)->tx->res->json;
+        @group_names = map { $_->{group}->{name} } @{$res->{results}};
+        ok !grep({ $_ eq 'IgnoreMe1' } @group_names), 'IgnoreMe1 is hidden even with sloppy config formatting';
+        ok grep({ $_ eq 'IgnoreMe2' } @group_names), 'IgnoreMe2 remains visible with sloppy config for IgnoreMe1';
+        $t->app->ignored_groups({});
+    };
+
+    subtest 'Ignore child groups via openqa.ini' => sub {
+        my $parent = $parent_groups->create({name => 'Test Parent Config'});
+        $g1->update({parent_id => $parent->id});
+        $g2->update({parent_id => $parent->id});
+
+        $t->app->ignored_groups({IgnoreMe1 => 1});
+        my $res = $t->get_ok('/parent_group_overview/' . $parent->id . '.json')->status_is(200)->tx->res->json;
+        my @child_names = map { $_->{name} } @{$res->{children}};
+        ok !grep({ $_ eq 'IgnoreMe1' } @child_names),
+          'Child IgnoreMe1 is hidden in parent overview when ignored globally';
+        ok grep({ $_ eq 'IgnoreMe2' } @child_names), 'Child IgnoreMe2 remains visible in parent overview';
+
+        $t->app->ignored_groups({'Test Parent Config' => 1});
+        $test_case->login($t, 'arthur');
+        $t->get_ok('/admin/job_templates/' . $g1->id)->status_is(200)
+          ->element_exists('input#editor-ignore-on-dashboard[disabled="disabled"]')
+          ->element_exists('input#editor-ignore-on-dashboard[checked="checked"]')
+          ->element_exists('label[for="editor-ignore-on-dashboard"][title*="the parent group name is configured"]');
+        $test_case->login($t, 'percival');
+        $t->app->ignored_groups({});
+    };
+
+    subtest 'Ignore via database flag (ignore_on_dashboard)' => sub {
+        $g1->update({ignore_on_dashboard => 1});
+        my $res = $t->get_ok('/dashboard_build_results.json')->status_is(200)->tx->res->json;
+        my @group_names = map { $_->{group}->{name} } @{$res->{results}};
+        ok !grep({ $_ eq 'IgnoreMe1' } @group_names), 'IgnoreMe1 is hidden when ignore_on_dashboard flag is set';
+        $g1->update({ignore_on_dashboard => 0});
+    };
+
+    subtest 'Ignore parent group via database flag' => sub {
+        my $parent = $parent_groups->create({name => 'Test Parent DB'});
+        $parent->update({ignore_on_dashboard => 1});
+        my $res = $t->get_ok('/dashboard_build_results.json')->status_is(200)->tx->res->json;
+        my @group_names = map { $_->{group}->{name} } @{$res->{results}};
+        ok !grep({ $_ eq 'Test Parent DB' } @group_names),
+          'Parent group is hidden when its ignore_on_dashboard flag is set';
+    };
+
+    $t->app->schema->txn_rollback;
+};
+
+subtest 'OpenQA::BuildResults::compute_build_results coverage' => sub {
+    my $group = $job_groups->find(1001);
+    $group->update({build_version_sort => OpenQA::Constants::BUILD_SORT_BY_NAME});
+    my $res = OpenQA::BuildResults::compute_build_results($group, 10, undef, undef, [], undef);
+    ok @{$res->{build_results}}, 'compute_build_results newest=0';
+
+    $group->update({build_version_sort => OpenQA::Constants::BUILD_SORT_BY_NEWEST_JOB});
+    $res = OpenQA::BuildResults::compute_build_results($group, 10, undef, undef, [], undef);
+    ok @{$res->{build_results}}, 'compute_build_results newest=1';
+
+    $res = OpenQA::BuildResults::compute_build_results($group, 10, undef, undef, [], undef, 1);
+    is $res->{limit_exceeded}, 1, 'limit exceeded';
+
+    my $build = 'COVERAGE_BUILD';
+    my $common = {
+        group_id => 1001,
+        VERSION => '13.1',
+        BUILD => $build,
+        ARCH => 'x86_64',
+        FLAVOR => 'DVD',
+        MACHINE => '64bit',
+        DISTRI => 'opensuse',
+    };
+    $jobs->create({%$common, TEST => 'cancelled_job', state => CANCELLED});
+    $jobs->create({%$common, TEST => 'skipped_job', state => DONE, result => SKIPPED});
+    my $failed_job = $jobs->create({%$common, TEST => 'failed_job', state => DONE, result => FAILED});
+    $t->app->schema->resultset('Comments')
+      ->create({job_id => $failed_job->id, user_id => 99901, text => 'some comment'});
+    my $labeled_job = $jobs->create({%$common, TEST => 'labeled_job', state => DONE, result => FAILED});
+    $t->app->schema->resultset('Comments')
+      ->create({job_id => $labeled_job->id, user_id => 99901, text => 'label:reviewed_label'});
+
+    $res = OpenQA::BuildResults::compute_build_results($group, 10, undef, undef, [], undef);
+    my $found = (grep { $_->{build} eq $build } @{$res->{build_results}})[0];
+    is $found->{skipped}, 2, 'skipped jobs counted';
+    is $found->{comments}, 2, 'comments counted';
+    is $found->{labeled}, 1, 'labeled job counted';
+
+    my $parent = $parent_groups->create(
+        {name => 'coverage_parent', build_version_sort => OpenQA::Constants::BUILD_SORT_BY_NAME});
+    $group->update({parent_id => $parent->id});
+    $parent->discard_changes;
+
+    $res = OpenQA::BuildResults::compute_build_results($parent, 10, undef, undef, [], undef);
+    $found = (grep { $_->{build} eq $build } @{$res->{build_results}})[0];
+    ok $found->{children}->{$group->id}, 'child group results';
+    is $found->{children}->{$group->id}->{failed}, 2, 'child group failed jobs';
+
+    my $t_str = '2026-04-20 12:00:00';
+    $jobs->create({%$common, TEST => 'time1', DISTRI => 'd1', t_created => $t_str, state => DONE, result => PASSED});
+    $jobs->create({%$common, TEST => 'time2', DISTRI => 'd2', t_created => $t_str, state => DONE, result => PASSED});
+    ok OpenQA::BuildResults::compute_build_results($parent, 10, undef, undef, [], undef), 'same timestamp';
+};
+
+subtest 'always_show_version toggle overview display' => sub {
+    delete $t->app->config->{misc_limits}->{job_groups_overview_max_jobs};
+    my $group = $job_groups->find(1001);
+    $group->update({parent_id => undef, always_show_version => 0});
+
+    $t->get_ok('/group_overview/1001?time_limit_days=99999')->status_is(200)->content_like(qr{BuildCOVERAGE_BUILD})
+      ->content_unlike(qr{13\.1-BuildCOVERAGE_BUILD});
+    $t->get_ok('/dashboard_build_results?time_limit_days=99999')->status_is(200)
+      ->content_unlike(qr{13\.1-BuildCOVERAGE_BUILD});
+
+    $group->update({always_show_version => 1});
+    $t->get_ok('/group_overview/1001?time_limit_days=99999')->status_is(200)
+      ->content_like(qr{13\.1-BuildCOVERAGE_BUILD});
+    $t->get_ok('/dashboard_build_results?time_limit_days=99999')->status_is(200)
+      ->content_like(qr{13\.1-BuildCOVERAGE_BUILD});
+    $t->get_ok('/group_overview/1001.rss?time_limit_days=99999')->status_is(200)
+      ->content_like(qr{13\.1-BuildCOVERAGE_BUILD});
+
+    $group->update({always_show_version => undef});
+};
+
+done_testing;

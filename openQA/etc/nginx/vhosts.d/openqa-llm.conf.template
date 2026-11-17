@@ -1,0 +1,65 @@
+# Local LLM Server Proxy Configuration
+#
+# To enable the LLM proxy:
+# 1. Copy this file to openqa-llm.conf:
+#    cp openqa-llm.conf.template openqa-llm.conf
+# 2. Edit the 'llm_backend' upstream block below to include all your
+#    workers that are running the openQA-llm-server.
+# 3. Adjust the 'allow' directive to match your internal network.
+# 4. Reload nginx: systemctl reload nginx
+#
+# For workers that are running the openQA-llm-decision-server, uncomment the
+# 'llm_decision_backend' upstream block and the '/v1/systemone' location, and
+# list these workers in that block. In a copy of an older template, first move
+# the proxy settings and the access rule from 'location /' to the server block
+# as below: the '/v1/systemone' location sets none of its own.
+
+upstream llm_backend {
+    # openqa-llm-investigate names the job in X-Openqa-Job: keep all requests of
+    # a job on one server, so that its chat stays in that server's prompt cache
+    # (round robin for requests without the header)
+    hash $http_x_openqa_job consistent;
+    # Replace the following with your actual worker hostnames or IPs
+    server openqaworker1:8080 max_fails=3 fail_timeout=30s;
+    # server openqaworker2:8080 max_fails=3 fail_timeout=30s;
+}
+
+# upstream llm_decision_backend {
+#     # a job sends one long request and the servers keep no prompt cache
+#     least_conn;
+#     server openqaworker1:8081 max_fails=3 fail_timeout=30s;
+#     # server openqaworker2:8081 max_fails=3 fail_timeout=30s;
+# }
+
+server {
+    listen 80;
+    server_name openqa-llm;
+
+    # LLMs are slow, don't time out early
+    proxy_read_timeout 600s;
+    proxy_connect_timeout 600s;
+    proxy_send_timeout 600s;
+    # a server that is still loading its model answers 503: try the next one
+    # (but not after a timeout, when the request may still be processed)
+    proxy_next_upstream error http_503 non_idempotent;
+
+    # Crucial for "streaming" tokens (Real-time typing)
+    proxy_buffering off;
+    proxy_redirect off;
+
+    # Ensure we pass the real worker IP for logging
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+
+    # Security: Internal network only (Adjust to your subnet)
+    allow 10.0.0.0/8;
+    deny all;
+
+    location / {
+        proxy_pass http://llm_backend;
+    }
+
+    # location = /v1/systemone {
+    #     proxy_pass http://llm_decision_backend;
+    # }
+}

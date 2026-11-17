@@ -1,0 +1,4 @@
+% app->plugin('OpenQA::WebAPI::Plugin::IssueReporter::OpenSuseIssueReporter');
+% for my $a (@{$c->report_external_issue}) {
+      %= stepaction_for($a->{label} => $a->{url}, $a->{icon}, "report $a->{id}");
+% }

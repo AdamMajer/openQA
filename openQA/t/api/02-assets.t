@@ -1,0 +1,263 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Mojo::Base -signatures;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Test::Mojo;
+use Test::Warnings qw(:all :report_warnings);
+use OpenQA::Test::TimeLimit '8';
+use OpenQA::Test::Case;
+use OpenQA::Test::Client 'client';
+use Mojo::IOLoop;
+
+OpenQA::Test::Case->new->init_data(fixtures_glob => '01-jobs.pl 03-users.pl');
+my $t = client(Test::Mojo->new('OpenQA::WebAPI'), apikey => 'ARTHURKEY01', apisecret => 'EXCALIBUR');
+
+sub la () {
+    return unless $ENV{HARNESS_IS_VERBOSE};
+    $t->get_ok('/api/v1/assets')->status_is(200);    # uncoverable statement
+    my @assets = @{$t->tx->res->json->{assets}};    # uncoverable statement
+    note "asset: $_->{id}: $_->{type}/$_->{name}\n" for @assets;    # uncoverable statement
+}
+
+sub iso_path ($iso) {
+    return "t/data/openqa/share/factory/iso/$iso";
+}
+
+sub touch_isos ($isos) {
+    for my $iso (@$isos) {
+        ok open(my $fh, '>', iso_path($iso)), "touch $iso";
+        close $fh;
+    }
+}
+my $iso1 = 'test-dvd-1.iso';
+my $iso2 = 'test-dvd-2.iso';
+touch_isos [$iso1, $iso2];
+
+my $listing = [
+    {
+        name => $iso1,
+        type => 'iso',
+        size => undef,
+        checksum => undef,
+        last_use_job_id => undef,
+        fixed => 0,
+    },
+    {
+        name => $iso2,
+        type => 'iso',
+        size => undef,
+        checksum => undef,
+        last_use_job_id => undef,
+        fixed => 0,
+    },
+];
+
+la;
+
+$t->post_ok('/api/v1/assets', form => {type => 'iso', name => $iso1})->status_is(200, 'iso registered');
+$listing->[0]->{id} = $t->tx->res->json->{id};
+$t->post_ok('/api/v1/assets', form => {type => 'iso', name => $iso1})->status_is(200, 'register iso again')
+  ->json_is('/id' => $listing->[0]->{id}, 'iso has the same ID, no duplicate');
+
+la;
+
+# check data
+$t->get_ok('/api/v1/assets/iso/' . $iso1)->status_is(200);
+delete $t->tx->res->json->{$_} for qw/t_updated t_created/;
+$t->json_is('' => $listing->[0], 'asset correctly entered by name');
+$t->get_ok('/api/v1/assets/' . $listing->[0]->{id})->status_is(200);
+delete $t->tx->res->json->{$_} for qw/t_updated t_created/;
+$t->json_is('' => $listing->[0], 'asset correctly entered by id');
+$t->get_ok('/api/v1/assets/iso/' . $iso2)->status_is(404, 'iso does not exist');
+
+$t->post_ok('/api/v1/assets', form => {type => 'iso', name => $iso2})->status_is(200, 'second asset posted');
+$listing->[1]->{id} = $t->tx->res->json->{id};
+isnt $listing->[0]->{id}, $listing->[1]->{id}, 'new assets has a distinct ID';
+
+# check data
+$t->get_ok('/api/v1/assets/' . $listing->[1]->{id})->status_is(200);
+delete $t->tx->res->json->{$_} for qw/t_updated t_created/;
+$t->json_is('' => $listing->[1], 'asset correctly entered by ID');
+
+# check listing
+$t->get_ok('/api/v1/assets')->status_is(200);
+delete $t->tx->res->json->{assets}->[6]->{$_} for qw/t_updated t_created/;
+$t->json_is('/assets/6' => $listing->[0], 'listing ok');
+
+#check user specified and server-side limit
+subtest 'server-side limit has precedence over user-specified limit' => sub {
+    my $limits = OpenQA::App->singleton->config->{misc_limits};
+    $limits->{assets_max_limit} = 5;
+    $limits->{assets_default_limit} = 2;
+
+    $t->get_ok('/api/v1/assets?limit=10', 'query with exceeding user-specified limit for assets')->status_is(200);
+    my $assets = $t->tx->res->json->{assets};
+    is ref $assets, 'ARRAY', 'data returned (1)' and is scalar @$assets, 5, 'maximum limit for assets is effective';
+
+    $t->get_ok('/api/v1/assets?limit=3', 'query with exceeding user-specified limit for assets')->status_is(200);
+    $assets = $t->tx->res->json->{assets};
+    is ref $assets, 'ARRAY', 'data returned (2)' and is scalar @$assets, 3, 'user limit for assets is effective';
+
+    $t->get_ok('/api/v1/assets', 'query with (low) default limit for assets')->status_is(200);
+    $assets = $t->tx->res->json->{assets};
+    is ref $assets, 'ARRAY', 'data returned (3)' and is scalar @$assets, 2, 'default limit for assets is effective';
+};
+
+subtest 'server-side limit with pagination' => sub {
+    subtest 'input validation' => sub {
+        $t->get_ok('/api/v1/assets?limit=a')->status_is(400)
+          ->json_is({error_status => 400, error => 'Erroneous parameters (limit invalid)'});
+        $t->get_ok('/api/v1/assets?offset=a')->status_is(400)
+          ->json_is({error_status => 400, error => 'Erroneous parameters (offset invalid)'});
+    };
+
+    subtest 'navigation with high limit' => sub {
+        my $links;
+
+        subtest 'first page' => sub {
+            $t->get_ok('/api/v1/assets?limit=5')->status_is(200)->json_has('/assets/4')->json_hasnt('/assets/5');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+
+        subtest 'second page' => sub {
+            $t->get_ok($links->{next}{link})->status_is(200)->json_has('/assets/2')->json_hasnt('/assets/3');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok !$links->{next}, 'no next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'first page (prev link)' => sub {
+            $t->get_ok($links->{prev}{link})->status_is(200)->json_has('/assets/4')->json_hasnt('/assets/5');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+
+        subtest 'first page (first link)' => sub {
+            $t->get_ok($links->{first}{link})->status_is(200)->json_has('/assets/4')->json_hasnt('/assets/5');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+    };
+
+    subtest 'navigation with low limit' => sub {
+        my $links;
+
+        subtest 'first page' => sub {
+            $t->get_ok('/api/v1/assets?limit=2')->status_is(200)->json_has('/assets/1')->json_hasnt('/assets/2')
+              ->json_like('/assets/0/name', qr/openSUSE-13.1-DVD-i586-Build0091-Media\.iso/)
+              ->json_like('/assets/1/name', qr/openSUSE-13.1-DVD-x86_64-Build0091-Media\.iso/);
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+
+        subtest 'second page' => sub {
+            $t->get_ok($links->{next}{link})->status_is(200)->json_has('/assets/1')->json_hasnt('/assets/2')
+              ->json_like('/assets/0/name', qr/openSUSE-13.1-GNOME-Live-i686-Build0091-Media\.iso/)
+              ->json_like('/assets/1/name', qr/openSUSE-Factory-staging_e-x86_64-Build87.5011-Media\.iso/);
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'third page' => sub {
+            $t->get_ok($links->{next}{link})->status_is(200)->json_has('/assets/1')->json_hasnt('/assets/2');
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'fourth page' => sub {
+            $t->get_ok($links->{next}{link})->status_is(200)->json_has('/assets/1')->json_hasnt('/assets/2')
+              ->json_like('/assets/0/name', qr/test-dvd-1\.iso/)->json_like('/assets/1/name', qr/test-dvd-2\.iso/);
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok !$links->{next}, 'no next page';
+            ok $links->{prev}, 'has previous page';
+        };
+
+        subtest 'first page (first link)' => sub {
+            $t->get_ok($links->{first}{link})->status_is(200)->json_has('/assets/1')->json_hasnt('/assets/2')
+              ->json_like('/assets/0/name', qr/openSUSE-13.1-DVD-i586-Build0091-Media\.iso/)
+              ->json_like('/assets/1/name', qr/openSUSE-13.1-DVD-x86_64-Build0091-Media\.iso/);
+            $links = $t->tx->res->headers->links;
+            ok $links->{first}, 'has first page';
+            ok $links->{next}, 'has next page';
+            ok !$links->{prev}, 'no previous page';
+        };
+    };
+};
+
+la;
+
+# test delete operation
+$t->delete_ok('/api/v1/assets/1a')->status_is(404, 'assert with invalid ID');
+$t->delete_ok('/api/v1/assets/99')->status_is(404, 'asset does not exist');
+$t->delete_ok('/api/v1/assets/' . $listing->[0]->{id})->status_is(200, 'asset deleted')
+  ->json_is('/count' => 1, 'one asset deleted');
+
+$t->get_ok('/api/v1/assets/' . $listing->[0]->{id})->status_is(404, 'asset was deleted');
+ok !-e iso_path($iso1), 'iso file 1 has been removed';
+$t->get_ok('/api/v1/assets/' . $listing->[1]->{id})->status_is(200, 'second asset remains');
+ok -e iso_path($iso2), 'iso file 2 is still there';
+
+touch_isos [$iso1];
+$t->post_ok('/api/v1/assets', form => {type => 'iso', name => $iso1})->status_is(200, 'registering again works')
+  ->json_is('/id' =>, $listing->[1]->{id} + 1, 'asset has next id');
+
+$t->delete_ok('/api/v1/assets/iso/' . $iso2)->status_is(200, 'delete asset by name');
+ok !-e iso_path($iso2), 'iso file 2 has been removed';
+$t->get_ok('/api/v1/assets/' . ($listing->[1]->{id} + 1))->status_is(200, 'third asset remains');
+
+la;
+
+$t->post_ok('/api/v1/assets', form => {type => 'foo', name => $iso1})->status_is(400, 'invalid type is an error');
+$t->post_ok('/api/v1/assets', form => {type => 'iso', name => ''})
+  ->status_is(400, 'posting asset with invalid name fails');
+$t->post_ok('/api/v1/assets', form => {type => 'iso', name => 'foo.iso'})
+  ->status_is(400, 'registering non-existing asset fails');
+
+$t->get_ok('/api/v1/assets/iso')->status_is(404, 'getting asset without name is an error');
+$t->delete_ok('/api/v1/assets/iso')->status_is(404, 'deleting without name is an error');
+
+# trigger cleanup task
+my $gru = $t->app->gru;
+my $gru_tasks = $t->app->schema->resultset('GruTasks');
+$t->app->minion->reset;    # be sure no 'limit_assets' tasks have already been enqueued
+is $gru->count_jobs(limit_assets => ['inactive']), 0, 'is_task_active returns 0 if not tasks enqueued';
+is $gru_tasks->count, 0, 'no gru tasks present so far';
+$t->post_ok('/api/v1/assets/cleanup')->status_is(200)->json_is('/status' => 'ok', 'status ok');
+is $gru_tasks->count, 1, 'gru task added'
+  and is $gru_tasks->first->taskname, 'limit_assets', 'right gru task added';
+is $gru->count_jobs(limit_assets => ['inactive']), 1, 'is_task_active returns 1 after task enqueued';
+$t->post_ok('/api/v1/assets/cleanup')->status_is(200)->json_is('/status' => 'ok', 'status ok')
+  ->json_is('/gru_id' => undef);
+is $gru_tasks->count, 1, 'no further task if one was already enqueued';
+
+# switch to operator (default client) and try some modifications
+client($t);
+
+# test delete operation
+$t->delete_ok('/api/v1/assets/' . ($listing->[1]->{id} + 1))->status_is(403, 'asset deletion forbidden for operator');
+$t->delete_ok('/api/v1/assets/iso/' . $iso1)->status_is(403, 'asset deletion forbidden for operator');
+$t->get_ok('/api/v1/assets/' . ($listing->[1]->{id} + 1))->status_is(200, 'asset is still there');
+ok -e iso_path($iso1), 'iso file 1 is still there';
+ok unlink(iso_path($iso1)), 'remove iso file 1 manually';
+
+done_testing();

@@ -1,0 +1,11 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::WebAPI::Controller::Admin::Table;
+use Mojo::Base 'Mojolicious::Controller', -signatures;
+
+sub admintable ($self, $template) {
+    $self->render("admin/$template/index");
+}
+
+1;

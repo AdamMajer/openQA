@@ -1,0 +1,21 @@
+% layout 'bootstrap';
+% title 'Search';
+
+% content_for ready_function => begin
+  renderSearchResults(document.getElementById('global-search').value);
+% end
+
+<div>
+    <h2 id="results-heading">Search results</h2>
+    <p>The search currently finds <b><a href="#templates">job templates</a></b> by name or description,
+       <b><a href="#modules">job modules</a></b> by filename,
+       or <b><a href="#code">test modules</a></b> within the test distributions,
+       either by <b>filename</b> or <b>source code</b>.</p>
+    <div id="flash-messages"></div>
+    <p id="progress-indication" style="display: none">
+        <i class="fa-solid fa-gear fa-spin fa-3x fa-fw"></i>
+        <span class="visually-hidden">Loading…</span>
+    </p>
+    <div id="results" class="list-group">
+    </div>
+</div>

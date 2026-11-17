@@ -1,0 +1,107 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+use Test::Warnings qw(warning :report_warnings);
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+use OpenQA::Test::TimeLimit '6';
+use Mojo::Base -signatures;
+use Test::MockModule;
+use OpenQA::Script::CloneJobSUSE qw(detect_maintenance_update);
+use Mojo::URL;
+
+# define fake client
+package Test::FakeUserAgentRes {
+    use Mojo::Base -base, -signatures;
+    has is_success => 1;
+}    # uncoverable statement
+
+package Test::FakeUserAgentTxn {
+    use Mojo::Base -base, -signatures;
+    has res => sub { Test::FakeUserAgentRes->new };
+}    # uncoverable statement
+
+package Test::FakeUserAgent {
+    use Mojo::Base -base, -signatures;
+    has is_validrepo => 1;
+
+    sub get ($self, $url) {
+        Test::FakeUserAgentTxn->new(res => Test::FakeUserAgentRes->new(is_success => $self->is_validrepo));
+    }
+}    # uncoverable statement
+
+sub create_mock () {
+    my $fake_ua = Test::FakeUserAgent->new;
+    my %url_handler = (remote_url => Mojo::URL->new('http://foo'), remote => $fake_ua);
+    return ($fake_ua, \%url_handler);
+}
+
+subtest 'maintenance update detect' => sub {
+    my $job_id = 1;
+    my %job = (
+        id => $job_id,
+        SCC_ADDONS => 'we,sdk',
+        WE_TEST_REPOS => 'http://foo/WE_suse/openqa,http://foo/WE_suse_2/openqa',
+        SDK_TEST_REPOS => 'http://foo/SDK_suse/openqa,http://foo/SDK_suse_2/openqa',
+    );
+    my %incident_job = (
+        id => $job_id,
+        INCIDENT_REPO => 'http://foo/incident_repo/openqa,http://foo/incident_repo_1/openqa',
+    );
+    my %skip_check = (
+        id => $job_id,
+        SKIP_MAINTENANCE_UPDATES => '1'
+    );
+    my ($fake_ua, $url_handler) = create_mock;
+    $fake_ua->is_validrepo(1);
+    lives_ok { detect_maintenance_update($job_id, $url_handler, \%job) } 'Maintenance updates are available';
+    lives_ok { detect_maintenance_update($job_id, $url_handler, \%incident_job) } 'Maintenance updates are available';
+    $fake_ua->is_validrepo(0);
+    throws_ok { detect_maintenance_update($job_id, $url_handler, \%job) } qr/Current job $job_id will fail/,
+      'Maintenance updates have been released';
+    throws_ok { detect_maintenance_update($job_id, $url_handler, \%incident_job) } qr/Current job $job_id will fail/,
+      'Maintenance updates have been released';
+    lives_ok { detect_maintenance_update($job_id, $url_handler, \%skip_check) } 'Skip updates check';
+};
+
+subtest 'similar but invalid settings' => sub {
+    my $job_id = 1;
+    my %job = (
+        id => $job_id,
+        XXX_SCC_ADDONS => 'we,sdk',
+    );
+    my %incident_job = (
+        id => $job_id,
+        XXX_INCIDENT_REPO => 'http://foo/incident_repo/openqa,http://foo/incident_repo_1/openqa',
+    );
+    my ($fake_ua, $url_handler) = create_mock;
+    $fake_ua->is_validrepo(0);
+    lives_ok { detect_maintenance_update($job_id, $url_handler, \%job) } 'Addon-like setting ignored';
+    lives_ok { detect_maintenance_update($job_id, $url_handler, \%incident_job) } 'Incident-like setting ignored';
+};
+
+subtest 'repos with variables' => sub {
+    my $settings = {INCIDENT_REPO => 'http://%MIRROR%/incident_repo/openqa,http://%MIRROR%/incident_repo_1/openqa'};
+    my ($fake_ua, $url_handler) = create_mock;
+    $fake_ua->is_validrepo(1);
+    my $w = warning { detect_maintenance_update(1, $url_handler, $settings) };
+    is ref($w), 'ARRAY', 'got multiple warnings';
+    like $w->[0], qr/URL '.*incident_repo\/openqa' contains unexpanded variables: MIRROR/,
+      'first unexpanded repo skipped with warning';
+    like $w->[1], qr/URL '.*incident_repo_1\/openqa' contains unexpanded variables: MIRROR/,
+      'second unexpanded repo skipped with warning';
+
+    $settings->{MIRROR} = 'my.mirror';
+    lives_ok { detect_maintenance_update(1, $url_handler, $settings) } 'Specified variables are expanded';
+
+    my $settings_unrelated_unexpanded = {
+        INCIDENT_REPO => 'http://foo/incident_repo/openqa',
+        SOME_OTHER_VAR => '%UNEXP_VAR%',
+    };
+    lives_ok { detect_maintenance_update(1, $url_handler, $settings_unrelated_unexpanded) }
+    'Unrelated unexpanded variables are ignored';
+};
+
+done_testing();

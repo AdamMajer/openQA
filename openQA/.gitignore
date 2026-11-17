@@ -1,0 +1,38 @@
+etc/mine/
+# Devel::Cover
+/cover_db*
+# TAP::Harness::JUnit
+/test-results/
+# CircleCI cache
+/logs/
+# Editor files
+*.swp
+*~
+# docs
+docs/build/
+docs/vendor/
+**/openqa-in-5-minutes.gif
+**/openqa-in-5-minutes.webm
+# Development
+contrib/completions/
+contrib/manpages/
+.sass-cache/
+.tidyall.d/
+assets/cache/
+assets/assetpack.db
+docker.env
+node_modules
+nytprof/
+/public/packed/
+/public/sass/bootstrap.scss
+# Tests
+.prove
+/t/cache.d/
+/t/data/openqa/webui/cache
+/t/data/openqa/db/db.lock
+/t/data/openqa/testresults
+/t/data/openqa/share/tests/opensuse/needles
+t/data/openqa/share/factory/iso/Core-7.2.iso
+t/log_chromedriver
+container/webui/workdir
+__pycache__/

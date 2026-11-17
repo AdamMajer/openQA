@@ -1,0 +1,169 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+
+package OpenQA::WebAPI::Controller::Admin::AuditLog;
+use Mojo::Base 'Mojolicious::Controller', -signatures;
+
+use Time::Piece;
+use Time::Seconds;
+use Time::ParseDate;
+use Mojo::JSON 'encode_json';
+use OpenQA::WebAPI::ServerSideDataTable;
+
+sub index ($self) {
+    my $event_id = $self->param('eventid');
+    $self->stash(audit_enabled => $self->app->config->{global}{audit_enabled});
+    $self->stash(search => $event_id ? "id:$event_id" : $self->param('search'));
+    $self->render('admin/audit_log/index');
+}
+
+sub productlog ($self) {
+    $self->render('admin/audit_log/productlog');
+}
+
+sub productlog_ajax ($self) {
+
+    my @searchable_columns = qw(me.distri me.version me.flavor me.arch me.build me.iso);
+    my @filter_conds;
+    if (my $id = $self->param('id')) {
+        push @filter_conds, {'me.id' => $id};
+    }
+    if (my $search_value = $self->param('search[value]')) {
+        my %condition = (like => "\%$search_value%");
+        my @or_conds = (map { $_ => \%condition } @searchable_columns);
+        push @or_conds, 'CAST(me.settings AS text)' => \%condition;
+        push @filter_conds, {-or => \@or_conds};
+    }
+
+    OpenQA::WebAPI::ServerSideDataTable::render_response(
+        controller => $self,
+        resultset => 'ScheduledProducts',
+        columns => [qw(me.id me.t_created me.status me.settings me.results), @searchable_columns],
+        filter_conds => (@filter_conds ? \@filter_conds : undef),
+        additional_params => {prefetch => 'triggered_by', cache => 1},
+        prepare_data_function => sub {
+            my ($scheduled_products) = @_;
+            my @scheduled_products;
+            while (my $scheduled_product = $scheduled_products->next) {
+                my $data = $scheduled_product->to_hash;
+                my $responsible_user = $scheduled_product->triggered_by;
+                $data->{user_name} = $responsible_user ? $responsible_user->name : 'system';
+                push @scheduled_products, $data;
+            }
+            return \@scheduled_products;
+        },
+    );
+}
+
+sub _add_single_query ($query, $key, $search_terms) {
+
+    return unless @$search_terms;
+    my $search = join ' ', @$search_terms;
+    @$search_terms = ();
+
+    my %key_mapping = (
+        owner => 'owner.nickname',
+        user => 'owner.nickname',
+        data => 'event_data',
+        connection => 'connection_id',
+        event => 'event',
+    );
+    if (my $actual_key = $key_mapping{$key}) {
+        push @{$query->{$actual_key}}, ($actual_key => {-like => '%' . $search . '%'});
+    }
+    elsif ($key eq 'id') {
+        push @{$query->{$key}}, ('CAST(me.id AS text)' => {-like => '%' . $search . '%'});
+    }
+    elsif ($key eq 'older' || $key eq 'newer') {
+        if ($search eq 'today') {
+            $search = '1 day ago';
+        }
+        elsif ($search eq 'yesterday') {
+            $search = '2 days ago';
+        }
+        else {
+            $search = '1 ' . $search unless $search =~ /^[\s\d]/;
+            $search .= ' ago' unless $search =~ /\sago\s*$/;
+        }
+        if (my $time = parsedate($search, PREFER_PAST => 1, DATE_REQUIRED => 1)) {
+            my $time_conditions = ($query->{'me.t_created'} //= {-and => []});
+            push @{$time_conditions->{-and}},
+              {
+                'me.t_created' => {
+                    ($key eq 'newer' ? '>=' : '<') => localtime($time)->ymd()}};
+        }
+    }
+}
+
+sub _get_search_query ($self) {
+
+    # construct query only from allowed columns
+    my $query = {};
+    my $search_value = $self->param('search[value]');
+    return [] unless defined $search_value && $search_value =~ /\S/;
+
+    my @subsearch = split ' ', $search_value;
+    my $current_key = 'data';
+    my @current_search;
+    for my $s (@subsearch) {
+        if (CORE::index($s, ':') == -1) {
+            # bareword - add to current_search
+            push @current_search, $s;
+        }
+        else {
+            # we are starting new search group, push the current to the query and reset it
+            _add_single_query($query, $current_key, \@current_search);
+
+            my ($key, $search_term) = split /:/, $s;
+            # new search column found, assign key as current key
+            $current_key = $key;
+            push @current_search, $search_term;
+        }
+    }
+    # add the last single query if anything is entered
+    _add_single_query($query, $current_key, \@current_search);
+
+    # add proper -and => -or structure to constructed query
+    my @filter_conds;
+    for my $k (keys %$query) {
+        push @filter_conds, (-or => $query->{$k});
+    }
+    return \@filter_conds;
+}
+
+sub ajax ($self, $filter_conds = undef) {
+    OpenQA::WebAPI::ServerSideDataTable::render_response(
+        controller => $self,
+        resultset => 'AuditEvents',
+        columns => [qw(me.id me.t_created owner.nickname me.connection_id me.event me.event_data)],
+        filter_conds => ($filter_conds // $self->_get_search_query),
+        additional_params => {
+            prefetch => 'owner',
+            cache => 1
+        },
+        prepare_data_function => sub {
+            my ($results) = @_;
+            my @events;
+            while (my $event = $results->next) {
+                push @events,
+                  {
+                    id => $event->id,
+                    user => $event->owner ? $event->owner->nickname : 'system',
+                    connection => $event->connection_id,
+                    event => $event->event,
+                    event_data => $event->event_data,
+                    event_time => $event->t_created,
+                  };
+            }
+            return \@events;
+        },
+    );
+}
+
+sub ajax_current_user ($self) {
+    return $self->render(json => {data => []}) unless my $current_user = $self->current_user;
+    $self->ajax([{user_id => $current_user->id}, $self->_get_search_query]);
+}
+
+1;

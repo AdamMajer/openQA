@@ -1,0 +1,116 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+=head1 NAME
+
+openqa-validate-yaml - check YAML files against a schema
+
+=head1 SYNOPSIS
+
+openqa-validate-yaml [I<OPTIONS>] [-] [I<file> ...]
+
+=head1 DESCRIPTION
+
+B<openqa-validate-yaml>
+should be given a list of one or more filenames.
+The files are expected to be YAML files.
+B<openqa-validate-yaml>
+tests each item in the list to see
+if the files are valid when checked against a Schema.
+
+'-' can be specified instead of a filename
+to read the test input from STDIN.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--validate-schema>
+
+Validate the Schema file itself, in addition to any YAML files.
+
+=item B<--schema-file>=I<SCHEMA>
+
+Specify the schema file or URL to validate against (default .../public/schema/JobTemplates-01.yaml)'],
+
+=item B<-h>
+
+Print a usage message, and exit.
+
+=back
+
+=head1 AUTHOR
+
+This manual page was written by Philip Hands <phil@hands.com>,
+for the Debian GNU/Linux system (but may be used by others).
+
+=cut
+
+
+use strict;
+use warnings;
+use 5.010;
+
+use FindBin '$RealBin';
+use lib "$RealBin/../lib";
+use Test::More;
+use Getopt::Long::Descriptive;
+use OpenQA::YAML qw(load_yaml validate_data);
+
+my ($opt, $usage) = describe_options(
+    <<"EOM",
+$0 %o <yaml-files>
+
+Validate YAML files against a schema.
+You can pass YAML filenames or '-' for STDIN.
+EOM
+    ['validate-schema', 'Validate Schema file itself also'],
+    ['schema-file=s', 'Schema file or URL to validate against (default public/schema/JobTemplates-01.yaml)'],
+    ['help|h', 'print usage message and exit', {shortcircuit => 1}],
+);
+
+print($usage->text), exit if $opt->help;
+
+my @files = @ARGV or pass 'Nothing to do';
+
+my $default_schema = "$RealBin/../public/schema/JobTemplates-01.yaml";
+my $schema = $opt->schema_file // $default_schema;
+diag 'Validating schema, too' if $opt->validate_schema;
+for my $file (@files) {
+    my $data;
+    if ($file eq '-') {
+        my $yaml = do { local $/; <ARGV> };
+        $data = load_yaml(string => $yaml);
+    }
+    else {
+        $data = load_yaml(file => $file);
+    }
+
+    my $errors = validate_data(
+        schema_file => $schema,
+        data => $data,
+        validate_schema => $opt->validate_schema,
+    );
+
+    is(scalar @$errors, 0, "$file - valid")
+      or diag @$errors;
+}
+done_testing;

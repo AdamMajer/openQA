@@ -1,0 +1,53 @@
+% layout 'bootstrap';
+% title $group->{full_name};
+
+%= include 'layouts/info'
+
+% content_for 'head' => begin
+    <link rel="alternate" type="application/rss+xml" title="<%= $group->{full_name} %> builds"
+          href="<%= url_for('group_overview', groupid => $group->{id}, format => 'rss') %>">
+% end
+
+% content_for 'ready_function' => begin
+    updateTimeago();
+    toggleFullscreenMode(<%= $fullscreen %>);
+    autoRefresh(<%= $fullscreen %>, <%= $interval %>);
+    alignBuildLabels();
+% end
+
+%= include 'layouts/limit_warning'
+
+% if (is_admin) {
+    <form action="<%= url_for('admin_job_templates', groupid => $group->{id}) %>" class="corner-buttons">
+        <button type="submit" class="btn btn-light" title="Edit media, description, and other properties">
+            <i class="fa-solid fa-pencil"></i> Edit job group
+        </button>
+    </form>
+% }
+<div class="corner-buttons">
+    <a id="rss-feed-link" class="btn btn-light" title="Subscribe to the RSS feed of this job group"
+       href="<%= url_for('group_overview', groupid => $group->{id}, format => 'rss') %>">
+        <i class="fa-solid fa-rss"></i> RSS
+    </a>
+</div>
+<h2>
+    Last Builds for
+    % if ($group->{parent_id}) {
+        %= link_to $group->{parent_name} => url_for('parent_group_overview', groupid => $group->{parent_id})
+        /
+    % }
+    %= $group->{name}
+</h2>
+
+% if (my $description = $group->{rendered_description}) {
+    <div class="well well-lg" id="group_description">
+        %= $description
+    </div>
+% }
+%= include 'main/pinned_comments'
+
+<div id="build-results">
+    %= include 'main/group_builds', build_results => $build_results, group => $group, children => undef, default_expanded => 1
+</div>
+%= include 'main/more_builds', limit_builds => $limit_builds
+<div id="comment-area"></div>

@@ -1,0 +1,60 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+=head1 modify_needle
+
+modify_needle - manipulate needle (tags) on command line
+
+=head1 SYNOPSIS
+
+modify_needle [OPTIONS] FILE.json [FILEs...]
+
+You can pass multiple files to e.g. 
+
+modify_needle --add-tags COOLTHING *the-cool-needle*.json
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--add-tags>
+
+check the needle and add the given tags (comma separated) if not yet present
+
+=item B<--help, -h>
+
+print help
+
+=back
+
+=cut
+
+use Mojo::Base -strict, -signatures;
+use Mojo::File qw(path);
+use Cpanel::JSON::XS ();
+use Getopt::Long;
+
+sub usage ($r) { require Pod::Usage; Pod::Usage::pod2usage($r) }
+
+my %options;
+GetOptions(\%options, 'add-tags=s', 'help|h',) or usage(1);
+
+usage(0) if $options{help};
+
+my @add_tags = split /,/, $options{'add-tags'};
+
+for my $needle (@ARGV) {
+    my $info = Cpanel::JSON::XS->new->relaxed->decode(path($needle)->slurp);
+
+    my $changed = 0;
+    my %tags = map { $_ => 1 } @{$info->{tags}};
+    for my $at (@add_tags) {
+        $changed = 1 unless $tags{$at};
+        $tags{$at} = 1;
+    }
+    $info->{tags} = [sort keys %tags];
+    next unless $changed;
+    path($needle)->spew(Cpanel::JSON::XS->new->pretty->encode($info));
+}

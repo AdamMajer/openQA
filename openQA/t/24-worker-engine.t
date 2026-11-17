@@ -1,0 +1,754 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use FindBin;
+use lib "$FindBin::Bin/lib", "$FindBin::Bin/../external/os-autoinst-common/lib";
+use OpenQA::Test::TimeLimit '10';
+use Mojo::Base -signatures;
+
+BEGIN {
+    $ENV{OPENQA_CACHE_SERVICE_POLL_DELAY} = 0;
+    delete @ENV{qw(OPENQA_CACHE_MAX_INACTIVE_JOBS OPENQA_CACHE_MAX_INACTIVE_JOBS_HARD_LIMIT OPENQA_CGROUP_SLICE)};
+}
+
+use File::Spec::Functions qw(abs2rel catdir);
+use OpenQA::Constants 'WORKER_EC_ASSET_FAILURE';
+use Test::Warnings ':report_warnings';
+use OpenQA::Worker;
+use Test::MockModule;
+use Test::MockObject;
+use Test::Output qw(combined_like combined_unlike combined_from);
+use OpenQA::Worker::Engines::isotovideo;
+use OpenQA::Test::FakeWorker;
+use Mojo::File qw(path tempdir);
+use Mojo::JSON 'decode_json';
+use OpenQA::Utils qw(testcasedir productdir needledir locate_asset base_host prjdir);
+use Cwd qw(getcwd);
+use Mojo::Util 'scope_guard';
+use File::Copy::Recursive qw(dircopy);
+
+my $workdir = tempdir("$FindBin::Script-XXXX", TMPDIR => 1);
+$ENV{OPENQA_CACHE_DIR} = $workdir;
+chdir $workdir;
+my $guard = scope_guard sub { chdir $FindBin::Bin };
+dircopy "$FindBin::Bin/$_", "$workdir/t/$_" or BAIL_OUT($!) for qw(data);
+
+# define fake packages for testing asset caching
+package Test::FakeJob {
+    use Mojo::Base -base;
+    has id => 42;
+    has worker => undef;
+    has client => sub { Test::FakeClient->new };
+    sub post_setup_status { 1 }
+    sub is_stopped_or_stopping { 0 }
+}    # uncoverable statement
+
+package Test::FakeRequest {
+    use Mojo::Base -base;
+    has minion_id => 13;
+}    # uncoverable statement
+
+# Fake client
+# uncoverable statement count:1
+package Test::FakeClient {
+    use Mojo::Base -base;
+    has worker_id => 1;
+    has webui_host => 'localhost';
+    has service_port_delta => 2;
+    has testpool_server => 'fake-testpool-server';
+}    # uncoverable statement
+
+$ENV{OPENQA_CONFIG} = "$FindBin::Bin/data/24-worker-overall";
+$ENV{OPENQA_HOSTNAME} = 'localhost';
+
+sub get_job_json_data ($pool_dir) {
+    my $vars_json = path($pool_dir)->child('vars.json')->slurp;
+    return decode_json $vars_json;
+}
+
+sub _run_engine ($job) {
+    my $result;
+    my $cb = sub ($res) { $result = $res; Mojo::IOLoop->stop };
+    OpenQA::Worker::Engines::isotovideo::engine_workit($job, $cb);
+    Mojo::IOLoop->start;
+    return $result;
+}
+
+subtest 'isotovideo version' => sub {
+    throws_ok {
+        OpenQA::Worker::Engines::isotovideo::set_engine_exec('/bogus/location');
+    }
+    qr{Path to isotovideo invalid}, 'isotovideo version path invalid';
+
+    my $not_isotovideo = path($FindBin::Bin)->child('../script/openqa-cli');
+    combined_like {
+        my $version = OpenQA::Worker::Engines::isotovideo::set_engine_exec($not_isotovideo);
+        is $version, 0, 'zero returned if printed output does not match version pattern';
+    }
+    qr/invalid command/i, 'specified executable invoked';
+
+    my $isotovideo = path($FindBin::Bin)->child('fake-isotovideo.pl');
+    my $worker = OpenQA::Worker->new({apikey => 'foo', apisecret => 'bar', instance => 1, isotovideo => $isotovideo});
+    is $worker->isotovideo_interface_version, 15, 'isotovideo version set from os-autoinst';
+
+    lives_ok { OpenQA::Worker->new({apikey => 'foo', apisecret => 'bar', instance => 1}) }
+    'init does not fail without isotovideo parameter';
+};
+
+subtest 'asset settings' => sub {
+    my $settings = {
+        DISTRI => 'Unicorn',
+        FLAVOR => 'pink',
+        VERSION => '42',
+        BUILD => '666',
+        ISO => 'whatever.iso',
+        ISO_1 => 'another.iso',
+        ISO_2_URL => 'http://example.net/third.iso',
+        ISO_2 => 'third.iso',
+        KERNEL => 'linux',
+        INITRD => 'initrd',
+        ASSET_1 => 'data.tar.gz',
+        ASSET_2_URL => 'https://example.net/file.dat',
+        ASSET_2 => 'renamed.dat',
+        ASSET_3_DECOMPRESS_URL => 'https://example.net/packed.dat.gz',
+        ASSET_3 => 'unpacked.dat',
+        DESKTOP => 'DESKTOP',
+        KVM => 'KVM',
+        ISO_MAXSIZE => 1,
+        MACHINE => 'RainbowPC',
+        ARCH => 'x86_64',
+        TEST => 'testA',
+        NUMDISKS => 3,
+        WORKER_CLASS => 'testAworker',
+        UEFI_PFLASH_VARS => 'however.qcow2'
+    };
+
+    my $expected = {
+        'ISO' => 'iso',
+        'ISO_1' => 'iso',
+        'ISO_2' => 'iso',
+        'UEFI_PFLASH_VARS' => 'hdd',
+        'KERNEL' => 'other',
+        'INITRD' => 'other',
+        'ASSET_1' => 'other',
+        'ASSET_2' => 'other',
+        'ASSET_3' => 'other',
+    };
+
+    my $got = OpenQA::Worker::Engines::isotovideo::detect_asset_keys($settings);
+    is_deeply $got, $expected, 'Asset settings are correct (relative PFLASH)' or always_explain $got;
+
+    # if UEFI_PFLASH_VARS is an absolute path, we should not treat it as an asset
+    $settings->{UEFI_PFLASH_VARS} = '/absolute/path/OVMF_VARS.fd';
+    delete($expected->{UEFI_PFLASH_VARS});
+
+    $got = OpenQA::Worker::Engines::isotovideo::detect_asset_keys($settings);
+    is_deeply $got, $expected, 'Asset settings are correct (absolute PFLASH)' or always_explain $got;
+
+    delete($settings->{UEFI_PFLASH_VARS});
+    delete($settings->{NUMDISKS});
+
+    $got = OpenQA::Worker::Engines::isotovideo::detect_asset_keys($settings);
+    is_deeply $got, $expected, 'Asset settings are correct (no UEFI or NUMDISKS)' or always_explain $got;
+
+    subtest 'absolute path on KERNEL and INITRD' => sub {
+        my $test_settings = {
+            KERNEL => '/usr/share/qemu/vmlinuz',
+            INITRD => '/usr/share/qemu/initrd',
+            ISO => 'test.iso',
+        };
+
+        my $test_expected = {'ISO' => 'iso'};
+
+        my $test_got = OpenQA::Worker::Engines::isotovideo::detect_asset_keys($test_settings);
+        is_deeply $test_got, $test_expected, 'KERNEL and INITRD with absolute paths are skipped from caching'
+          or always_explain $test_got;
+    }
+};
+
+subtest 'caching' => sub {
+    my $error = 'not called';
+    my $cb = sub ($err) { $error = $err };
+    OpenQA::Worker::Engines::isotovideo::cache_assets(undef, undef, undef, [], undef, undef, undef, $cb);
+    is $error, undef, 'cache_assets has nothing to do without assets';
+
+    my %assets = (ISO => 'foo.iso');
+    $error = 'not called';
+    OpenQA::Worker::Engines::isotovideo::cache_assets(undef, undef, undef, [keys %assets], \%assets, undef, undef, $cb);
+    is $error, undef, 'cache_assets can not pick up supplied assets when not found';
+};
+
+subtest 'asset caching' => sub {
+    my $asset_mock = Test::MockModule->new('OpenQA::Worker::Engines::isotovideo');
+    $asset_mock->redefine(
+        cache_assets =>
+          sub ($cache_client, $job, $vars, $assets_to_cache, $assetkeys, $webui_host, $pooldir, $callback) {
+            $callback->(undef);
+          });
+    my $job = Test::MockObject->new;
+    my $testpool_server;
+    $job->mock(client => sub { Test::MockObject->new->set_bound(testpool_server => \$testpool_server) });
+    my $error = 'not called';
+    my $cb = sub ($err) { $error = $err; Mojo::IOLoop->stop };
+    OpenQA::Worker::Engines::isotovideo::do_asset_caching($job, undef, undef, undef, undef, undef, $cb);
+    Mojo::IOLoop->start;
+    ok $job->called('client'), 'client has been asked for parameters when accessing job for caching';
+    is $error, undef, 'Assets cached but not tests';
+    $testpool_server = 'host1';
+    my $prj_dir = "FOO/$testpool_server";
+    my $test_dir = "$prj_dir/tests";
+    $asset_mock->redefine(
+        sync_tests => sub ($cache_client, $job, $vars, $shared_cache, $rsync_source, $remaining_tries, $callback) {
+            $callback->($test_dir);
+        });
+    OpenQA::Worker::Engines::isotovideo::do_asset_caching($job, undef, 'foo', undef, 'bar', undef, $cb);
+    Mojo::IOLoop->start;
+    is $error, $test_dir, 'Cache directory updated';
+};
+
+sub _mock_cache_service_client ($status_data, $info_data = undef, $error = undef) {
+    my $cache_client_mock = Test::MockModule->new('OpenQA::CacheService::Client');
+    $info_data //= {active_workers => 1};
+    $cache_client_mock->redefine(enqueue => 'some enqueue error');
+    $cache_client_mock->redefine(info => OpenQA::CacheService::Response::Info->new(data => $info_data, error => undef));
+    $cache_client_mock->redefine(
+        status => OpenQA::CacheService::Response::Status->new(data => $status_data, error => $error));
+    return $cache_client_mock;
+}
+
+subtest 'handling availability error' => sub {
+    my %fake_status = (active_workers => 1, inactive_jobs => 46);
+    my $cache_client_mock = _mock_cache_service_client {}, \%fake_status;
+    my $cache_client = OpenQA::CacheService::Client->new;
+    my $cb_res;
+    my $cb = sub ($res) { $cb_res = $res };
+    my @args = ($cache_client, Test::FakeJob->new, {a => 1}, [('a') x 2], {}, 'webuihost', undef, $cb);
+    OpenQA::Worker::Engines::isotovideo::cache_assets @args;
+    like $cb_res->{error}, qr/Cache service queue already full/, 'error when hard-limit exceeded';
+
+    $fake_status{inactive_jobs} = 45;
+    OpenQA::Worker::Engines::isotovideo::cache_assets @args;
+    like $cb_res->{error}, qr/Failed to send asset request/, 'attempt to cache when below hard-limit';
+};
+
+subtest 'problems and special cases when caching assets' => sub {
+    my %fake_status = (status => 'processed', output => 'Download of "FOO" failed: 404 Not Found');
+    my $cache_client_mock = _mock_cache_service_client \%fake_status;
+    $cache_client_mock->redefine(asset_path => 'some/path');
+    $cache_client_mock->redefine(asset_request => Test::FakeRequest->new);
+
+    my $error = 'not called';
+    my $cb = sub ($err) { $error = $err; Mojo::IOLoop->stop };
+    my $job = Test::FakeJob->new;
+    my %vars = (ISO_1 => 'FOO', CASEDIR => 'https://foo.git', NEEDLES_DIR => 'https://bar.git');
+    my @assets = ('ISO_1');
+    my @args = ($job, \%vars, \@assets, {ISO_1 => 'iso'}, 'webuihost', undef, $cb);
+    OpenQA::Worker::Engines::isotovideo::cache_assets(OpenQA::CacheService::Client->new, @args);
+    Mojo::IOLoop->start;
+    is $error->{error}, 'Failed to send asset request for FOO: some enqueue error',
+      'failed to enqueue request for asset download';
+    is $error->{category}, undef, 'no category set so problem is treated as cache service failure';
+
+    $cache_client_mock->redefine(enqueue => 0);
+    @assets = ('ISO_1');
+    OpenQA::Worker::Engines::isotovideo::cache_assets(OpenQA::CacheService::Client->new, @args);
+    Mojo::IOLoop->start;
+    is $error->{error}, 'Failed to download FOO to some/path', 'asset not found';
+    is $error->{category}, WORKER_EC_ASSET_FAILURE, 'category set so problem is treated as asset failure';
+
+    $cache_client_mock = _mock_cache_service_client {}, undef, 'some severe error';
+    $cache_client_mock->redefine(asset_request => Test::FakeRequest->new);
+    $cache_client_mock->redefine(enqueue => 0);
+    @assets = ('ISO_1');
+    OpenQA::Worker::Engines::isotovideo::cache_assets(OpenQA::CacheService::Client->new, @args);
+    Mojo::IOLoop->start;
+    is $error->{error}, 'some severe error', 'job not "processed" due to some error';
+
+    subtest 'test sync skipped for Git-only jobs' => sub {
+        my $isotovideo_mock = Test::MockModule->new('OpenQA::Worker::Engines::isotovideo');
+        my $sync_tests_called;
+        $isotovideo_mock->redefine(cache_assets => sub (@args) { $args[-1]->(undef) });
+        $isotovideo_mock->redefine(sync_tests => sub (@) { $sync_tests_called = 1 });
+
+        OpenQA::Worker::Engines::isotovideo::do_asset_caching(@args);
+        is $error, undef, 'callback called without error (1)';
+        is $sync_tests_called, undef, 'sync tests was not called for Git-only job (separate needles repo)';
+
+        delete $vars{NEEDLES_DIR};    # no NEEDLES_DIR means needles are within CASEDIR or separate
+        OpenQA::Worker::Engines::isotovideo::do_asset_caching(@args);
+        is $error, undef, 'callback called without error (2)';
+        is $sync_tests_called, 1, 'sync tests was called for job where needles might be separate';
+
+        $vars{NEEDLES_DIR} = 'relative/path';    # considered relative to default needles, relying on sync
+        $sync_tests_called = undef;
+        OpenQA::Worker::Engines::isotovideo::do_asset_caching(@args);
+        is $error, undef, 'callback called without error (3)';
+        is $sync_tests_called, 1, 'sync tests called with relative NEEDLES_DIR (relative to default needles)';
+
+        delete $vars{CASEDIR};    # no CASEDIR means using default checkout, relying on sync
+        undef $sync_tests_called;
+        OpenQA::Worker::Engines::isotovideo::do_asset_caching(@args);
+        is $error, undef, 'callback called without error (4)';
+        is $sync_tests_called, 1, 'sync tests was called for job not using Git at all';
+    };
+};
+
+subtest '_handle_asset_processed' => sub {
+    my %fake_status = (status => 'processed', output => 'Download of "FOO" failed: 404 Not Found');
+    my $module = Test::MockModule->new('OpenQA::Worker::Engines::isotovideo');
+    $module->mock(
+        '_link_asset',
+        sub ($asset, $pooldir) {
+            return {basename => 'path2', absolute_path => 'some/path2'};
+        });
+    my $cache_client_mock = _mock_cache_service_client \%fake_status;
+    $cache_client_mock->redefine(asset_exists => 1);
+    $cache_client_mock->redefine(asset_path => 'some/path2');
+    $cache_client_mock->redefine(asset_request => Test::FakeRequest->new);
+
+    my $error = 'not called';
+    my $cb = sub ($err) { $error = $err; Mojo::IOLoop->stop };
+    my $job = Test::FakeJob->new;
+    my @assets = ('ISO_1');
+    my $vars = {ISO_1 => 'FOO'};
+    my @args = ($job, $vars, \@assets, {ISO_1 => 'iso'}, 'webuihost', undef, $cb);
+
+    $cache_client_mock->redefine(enqueue => 0);
+
+    OpenQA::Worker::Engines::isotovideo::cache_assets(OpenQA::CacheService::Client->new, @args);
+    Mojo::IOLoop->start;
+    is $vars->{ISO_1}, 'path2', 'path was correctly set';
+
+    my $asset_uri = 'path2';
+    $vars = {};
+    my $status = OpenQA::CacheService::Response::Status->new(data => {});
+    @args = (OpenQA::CacheService::Client->new, 'UEFI_PFLASH_VARS', $asset_uri, $status, $vars, undef, undef);
+    is OpenQA::Worker::Engines::isotovideo::_handle_asset_processed(@args), undef, 'no error for UEFI_PFLASH_VARS';
+    is $vars->{UEFI_PFLASH_VARS}, $asset_uri, 'specified asset URI set to vars';
+
+    $args[1] = 'HDD_1';    # assume a normal asset (to not run into the special case of UEFI_PFLASH_VARS)
+    $status->data->{has_download_error} = 1;    # assume download error
+    $error = OpenQA::Worker::Engines::isotovideo::_handle_asset_processed(@args);
+    is ref $error, 'HASH', 'error when download failed although asset is still existing'
+      and is $error->{error}, 'Failed to download path2 to some/path2', 'expected error message returned';
+
+    $status = OpenQA::CacheService::Response::Status->new(error => 'error');
+    $args[1] = 'UEFI_PFLASH_VARS';
+    delete $vars->{UEFI_PFLASH_VARS};
+    is OpenQA::Worker::Engines::isotovideo::_handle_asset_processed(@args), undef, 'no error for UEFI_PFLASH_VARS';
+    is $vars->{UEFI_PFLASH_VARS}, undef, 'asset URI not set because asset does not exist';
+};
+
+subtest 'syncing tests' => sub {
+    my %fake_status = (status => 'processed', output => 'Fake rsync output', result => 'exit code 10');
+    my $cache_client_mock = _mock_cache_service_client \%fake_status;
+    $cache_client_mock->redefine(rsync_request => Test::FakeRequest->new(result => 'exit code 10'));
+
+    my $worker = OpenQA::Test::FakeWorker->new;
+    my $result = 'not called';
+    my $cb = sub ($res) { $result = $res; Mojo::IOLoop->stop };
+    my @args = (Test::FakeJob->new(worker => $worker), {ISO_1 => 'iso'}, 'cache-dir/webuihost', 'rsync-source', 2, $cb);
+    OpenQA::Worker::Engines::isotovideo::sync_tests(OpenQA::CacheService::Client->new, @args);
+    is $result->{error},
+      "Failed to send rsync from 'rsync-source' to 'cache-dir/webuihost': some enqueue error",
+      'failed to enqueue request for rsync';
+    is $result->{category}, undef, 'no category set so problem is treated as cache service failure (1)';
+
+    $cache_client_mock->redefine(enqueue => 0);
+    OpenQA::Worker::Engines::isotovideo::sync_tests(OpenQA::CacheService::Client->new, @args);
+    Mojo::IOLoop->start;
+    is $result->{error}, 'Failed to rsync tests: exit code 10';
+    is $result->{category}, undef, 'no category set so problem is treated as cache service failure (2)';
+
+    my $status_response = OpenQA::CacheService::Response::Status->new(data => {output => 'foo', status => 'processed'});
+    $cache_client_mock->redefine(status => $status_response);
+    OpenQA::Worker::Engines::isotovideo::sync_tests(OpenQA::CacheService::Client->new, @args);
+    Mojo::IOLoop->start;
+    is $result, 'cache-dir/webuihost/tests', 'returns synced test directory on success' or always_explain $result;
+
+    is $worker->job_guard_expiration_updated, 0, 'job guard not updated while just syncing tests';
+};
+
+subtest 'symlink testrepo, logging behavior, variable expansion' => sub {
+    my $pool_directory = tempdir('poolXXXX', TMPDIR => 1);
+    my $worker = OpenQA::Test::FakeWorker->new(pool_directory => $pool_directory);
+    my $client = Test::FakeClient->new;
+
+    subtest 'error case: CASEDIR missing' => sub {
+        my $job = OpenQA::Worker::Job->new($worker, $client, {id => 12, settings => {DISTRI => 'foo'}});
+        my $result = _run_engine($job);
+        my $casedir = testcasedir('foo', undef, undef);
+        like $result->{error}, qr/The source directory $casedir does not exist/,
+          'symlink failed because the source directory does not exist';
+    };
+
+    subtest 'error case: permission denied' => sub {
+        chmod 0444, $pool_directory;
+        my $job = OpenQA::Worker::Job->new($worker, $client, {id => 12, settings => {DISTRI => 'opensuse'}});
+        my $result = _run_engine($job);
+        my $casedir = testcasedir('opensuse', undef, undef);
+        like $result->{error},
+          qr/Cannot create symlink from "$casedir" to "$pool_directory\/opensuse": Permission denied/,
+          'symlink failed because permission denied';
+
+    };
+    chmod 0755, $pool_directory;
+
+    subtest 'error case: NEEDLES_DIR missing' => sub {
+        my $job = OpenQA::Worker::Job->new($worker, $client, {id => 12, settings => {NEEDLES_DIR => 'needles'}});
+        my $result = _run_engine($job);
+        my $casedir = testcasedir(undef, undef, undef);
+        like $result->{error}, qr/The source directory $casedir\/needles does not exist/,
+          'symlink needles directory failed because source directory does not exist';
+    };
+    subtest 'good case: direct invocation of helper function for symlinking' => sub {
+        my $casedir = testcasedir('opensuse', undef, undef);
+        my $result = OpenQA::Worker::Engines::isotovideo::_link_repo($casedir, $pool_directory, 'opensuse');
+        is $result, undef, 'create symlink successfully';
+    };
+
+    is $worker->job_guard_expiration_updated, 0, 'job guard not updated';
+
+    my @custom_casedir_settings = (
+        CASEDIR_DOMAIN => 'github.com',
+        CASEDIR => 'https://%CASEDIR_DOMAIN%/foo/os-autoinst-distri-example.git#master',
+        NEEDLES_DIR => 'fedora/needles',
+        DISTRI => 'fedora',
+        JOBTOKEN => 'token99916',
+        _SECRET_TEST => 'secret-value',
+        THE_PASSWORD => 'some-password',
+    );
+
+    subtest 'good case: custom CASEDIR and custom NEEDLES_DIR specified' => sub {
+        my %job_settings = (id => 12, settings => {@custom_casedir_settings, NEEDLES_DIR => 'fedora/needles'});
+        my ($job, $result) = OpenQA::Worker::Job->new($worker, $client, \%job_settings);
+        my $log = combined_from { $result = _run_engine($job) };
+        like $log,
+          qr{Job settings.*Symlinked from "t/data/openqa/share/tests/fedora/needles" to "$pool_directory/needles"}s,
+          'symlink for needles dir created, points to default dir despite custom CASEDIR';
+        unlike $log, qr{secret-value.*some-password}s, 'no secrets logged';
+        my $vars_data = get_job_json_data($pool_directory);
+        my $casedir = testcasedir('fedora', undef, undef);
+        is $vars_data->{PRODUCTDIR}, abs2rel(productdir('fedora', undef, undef), $casedir),
+          'PRODUCTDIR still defaults to a relative path when CASEDIR is a URL to main.pm from custom test repo is used';
+        is $vars_data->{NEEDLES_DIR}, 'needles', 'relative NEEDLES_DIR is set to its basename';
+        is $result->{error}, undef, 'no error occurred (1)';
+        is $worker->job_guard_expiration_updated, 1, 'job guard updated as the engine was started';
+    };
+
+    subtest 'good case: custom CASEDIR and custom NEEDLES_DIR specified and both are Git repos' => sub {
+        my @needles_dir_settings = (NEEDLES_DIR => 'https://github.com/foo/os-autoinst-needles-example.git');
+        my %job_settings = (id => 12, settings => {@custom_casedir_settings, @needles_dir_settings});
+        my ($job, $result) = OpenQA::Worker::Job->new($worker, $client, \%job_settings);
+        my $log = combined_from { $result = _run_engine($job) };
+        unlike $log, qr/symlink/, 'no symlinks created';
+        my $vars_data = get_job_json_data($pool_directory);
+        is $vars_data->{CASEDIR}, 'https://github.com/foo/os-autoinst-distri-example.git#master',
+          'Git repo for casedir not changed';
+        is $vars_data->{PRODUCTDIR}, undef, 'no default for PRODUCTDIR assigned';
+        is $vars_data->{NEEDLES_DIR}, 'https://github.com/foo/os-autoinst-needles-example.git',
+          'Git repo for needles not changed';
+        is $result->{error}, undef, 'no error occurred (2)';
+    };
+
+    subtest 'good case: custom CASEDIR and NEEDLES_DIR where NEEDLES_DIR starts with %CASEDIR%' => sub {
+        my %vars = (@custom_casedir_settings, NEEDLES_DIR => '%CASEDIR%/fedora/needles');
+        my %job_settings = (id => 12, settings => \%vars);
+        my ($job, $result) = OpenQA::Worker::Job->new($worker, $client, \%job_settings);
+        my $log = combined_from { $result = _run_engine($job) };
+        like $log,
+          qr{Job settings.*Symlinked from "os-autoinst-distri-example/fedora/needles" to "$pool_directory/needles"}s,
+          'symlink for needles dir created, %CASEDIR% replaced with checkout folder of custom CASEDIR';
+        my $vars_data = get_job_json_data($pool_directory);
+        is $vars_data->{NEEDLES_DIR}, 'needles', 'relative NEEDLES_DIR is set to its basename';
+        is $result->{error}, undef, 'no error occurred (3)';
+    };
+
+    subtest 'good case: custom CASEDIR specified but no custom NEEDLES_DIR' => sub {
+        my %job_settings = (id => 12, settings => {@custom_casedir_settings});
+        my ($job, $result) = OpenQA::Worker::Job->new($worker, $client, \%job_settings);
+        combined_like { $result = _run_engine($job) }
+        qr {Symlinked from "t/data/openqa/share/tests/fedora/needles" to "$pool_directory/needles"},
+          'symlink for needles dir also created without NEEDLES_DIR, points to default dir despite custom CASEDIR';
+        my $vars_data = get_job_json_data($pool_directory);
+        is $vars_data->{NEEDLES_DIR}, 'needles', 'relative NEEDLES_DIR is set to name of symlink';
+        is $result->{error}, undef, 'no error occurred (4)';
+    };
+
+    subtest 'good case: custom "default" CASEDIR specified overriding DISTRI' => sub {
+        my %settings = (DISTRI => 'opensuse', CASEDIR => 'fedora', NEEDLES_DIR => 'https://foo', JOBTOKEN => 'token');
+        my ($job, $result) = OpenQA::Worker::Job->new($worker, $client, {id => 12, settings => \%settings});
+        combined_like { $result = _run_engine($job) }
+        qr {Symlinked from "t/data/openqa/share/tests/fedora" to "$pool_directory/fedora"},
+          'symlink for CASEDIR=fedora created, taking precedence over DISTRI=opensuse';
+        my $vars_data = get_job_json_data($pool_directory);
+        is $vars_data->{CASEDIR}, 'fedora', 'relative CASEDIR is set to name of symlink';
+        is $vars_data->{NEEDLES_DIR}, 'https://foo', 'NEEDLES_DIR from Git not affected';
+        is $result->{error}, undef, 'no error occurred (5)';
+        is readlink path($pool_directory, $vars_data->{CASEDIR}), testcasedir('fedora', undef, undef),
+          'tests symlink points to fedora tests as per CASEDIR=fedora';
+    };
+
+    subtest 'error case: custom CASEDIR specified, fail to symlink needles because cache directory does not exist' =>
+      sub {
+        my $isotovideo_mock = Test::MockModule->new('OpenQA::Worker::Engines::isotovideo');
+        $isotovideo_mock->redefine(
+            do_asset_caching => sub ($job, $vars, $cache_dir, $assetkeys, $webui_host, $pooldir, $callback) {
+                my $shared_cache = catdir($cache_dir, base_host($webui_host));
+                $callback->($shared_cache);
+            });
+        my %job_settings = (id => 16, settings => {@custom_casedir_settings});
+        my $cache_dir = '/var/lib/openqa/cache/';
+        $worker->settings->global_settings->{CACHEDIRECTORY} = $cache_dir;
+        my $check_dir = $cache_dir . $client->webui_host . "/$job_settings{settings}->{DISTRI}" . '/needles';
+        my ($job, $result) = OpenQA::Worker::Job->new($worker, $client, \%job_settings);
+        $result = _run_engine($job);
+        like $result->{error}, qr/The source directory $check_dir does not exist/,
+          'the needledir is under the cache directory';
+      };
+};
+
+subtest 'behavior with ABSOLUTE_TEST_CONFIG_PATHS=1' => sub {
+    my $pool_directory = tempdir('poolXXXX', TMPDIR => 1);
+    my $worker = OpenQA::Test::FakeWorker->new(pool_directory => $pool_directory);
+    my $client = Test::FakeClient->new;
+    my @settings = (DISTRI => 'fedora', JOBTOKEN => 'token000', ABSOLUTE_TEST_CONFIG_PATHS => 1);
+
+    subtest 'don\'t do symlink when job settings include ABSOLUTE_TEST_CONFIG_PATHS=1' => sub {
+        my %settings = (@settings, HDD_1 => 'foo.qcow2');
+        my $job = OpenQA::Worker::Job->new($worker, $client, {id => 16, settings => \%settings});
+        combined_unlike { _run_engine($job) }
+        qr/Symlinked from/, 'don\'t do symlink when jobs have the ABSOLUTE_TEST_CONFIG_PATHS=1';
+        my $vars_data = get_job_json_data($pool_directory);
+        is $vars_data->{PRODUCTDIR}, productdir('fedora', undef, undef), 'default PRODUCTDIR assigned';
+        is $vars_data->{CASEDIR}, testcasedir('fedora', undef, undef), 'default CASEDIR assigned';
+        is $vars_data->{HDD_1}, locate_asset('hdd', 'foo.qcow2'),
+          'don\'t symlink asset when using ABSOLUTE_TEST_CONFIG_PATHS=>1';
+        is $vars_data->{NEEDLES_DIR}, undef, 'no NEEDLES_DIR assigned';
+    };
+
+    subtest 'absolute default NEEDLES_DIR with ABSOLUTE_TEST_CONFIG_PATHS=1 and custom CASEDIR' => sub {
+        my %settings = (@settings, CASEDIR => 'git:foo/bar');
+        my $job = OpenQA::Worker::Job->new($worker, $client, {id => 16, settings => \%settings});
+        combined_unlike { _run_engine($job) }
+        qr/Symlinked from/, 'don\'t do symlink when jobs have the ABSOLUTE_TEST_CONFIG_PATHS=1';
+        my $vars_data = get_job_json_data($pool_directory);
+        my $expected_productdir = abs2rel(productdir('fedora', undef, undef), testcasedir('fedora', undef, undef));
+        is $vars_data->{NEEDLES_DIR}, needledir('fedora', undef, undef), 'default NEEDLES_DIR assigned';
+        is $vars_data->{CASEDIR}, $settings{CASEDIR}, 'custom CASEDIR not touched';
+        is $vars_data->{PRODUCTDIR}, $expected_productdir,
+          'nevertheless relative PRODUCTDIR assigned to load main.pm from custom CASEDIR';
+    };
+};
+
+subtest 'link asset' => sub {
+    my $cwd = getcwd;
+    my $pool_directory = tempdir('poolXXXX', TMPDIR => 1);
+    my $worker = OpenQA::Test::FakeWorker->new(pool_directory => $pool_directory);
+    my $client = Test::FakeClient->new;
+    # just in case cleanup the symlink to really check if it gets re-created
+    unlink 't/data/openqa/share/factory/hdd/symlink.qcow2' if -e 't/data/openqa/share/factory/hdd/symlink.qcow2';
+    my $settings = {
+        JOBTOKEN => 'token000',
+        ISO => 'openSUSE-13.1-DVD-x86_64-Build0091-Media.iso',
+        HDD_1 => 'foo.qcow2',
+        HDD_2 => 'symlink.qcow2',
+        SYNC_ASSETS_HOOK => "ln -s foo.qcow2 $cwd/t/data/openqa/share/factory/hdd/symlink.qcow2"
+    };
+    my $job = OpenQA::Worker::Job->new($worker, $client, {id => 16, settings => $settings});
+    combined_like { my $result = _run_engine($job) }
+    qr/Linked asset/, 'linked asset';
+    my $vars_data = get_job_json_data($pool_directory);
+    my $orig_hdd = locate_asset('hdd', 'foo.qcow2');
+    my $orig_iso = locate_asset('iso', 'openSUSE-13.1-DVD-x86_64-Build0091-Media.iso');
+    my $linked_iso = "$pool_directory/openSUSE-13.1-DVD-x86_64-Build0091-Media.iso";
+    my $linked_hdd = "$pool_directory/foo.qcow2";
+    my $linked_hdd2 = "$pool_directory/symlink.qcow2";
+    ok -e $linked_iso, 'the iso is linked to pool directory';
+    ok -e $linked_hdd, 'the hdd is linked to pool directory';
+    ok -l $linked_hdd2, 'the hdd 2 is symlinked to pool directory';
+    is +(stat $linked_hdd)[1], (stat $orig_hdd)[1], 'hdd is hardlinked';
+    is +(stat $linked_iso)[1], (stat $orig_iso)[1], 'iso is hardlinked';
+    is $vars_data->{ISO}, 'openSUSE-13.1-DVD-x86_64-Build0091-Media.iso',
+      'the value of ISO is basename when doing link';
+    is $vars_data->{HDD_1}, 'foo.qcow2', 'the value of HDD_1 is basename when doing link';
+    unlink 't/data/openqa/share/factory/hdd/symlink.qcow2';
+};
+
+subtest 'using cgroupv2' => sub {
+    my $file_mock = Test::MockModule->new('Mojo::File');
+    $file_mock->noop('make_path');
+    combined_like { OpenQA::Worker::Engines::isotovideo::_configure_cgroupv2({id => 42}) }
+    qr|Using cgroup /sys/fs/cgroup/.*/42|, 'use of cgroup logged';
+};
+
+subtest 'cgroup slice detection on pure cgroup v2 hosts (poo#205902)' => sub {
+    # On hosts using the pure cgroup v2 unified hierarchy /proc/$pid/cgroup contains a single
+    # "0::/…" line and no "name=systemd:" line (that only appears when systemd hasn't switched to
+    # the unified hierarchy). The slice detection must therefore also understand the "0::" format,
+    # otherwise it silently disables cgroup usage entirely (see GH#7475 which attempted a fix but
+    # was reverted as GH#7493 because it broke cgroup cleanup on aarch64 workers).
+    # each case below creates and mocks its own Test::MockModule object entirely within its own
+    # leaf subtest. Sharing one mock object across sibling subtests (created in the outer scope,
+    # redefined inside nested ones) looks equivalent but under Devel::Cover instrumentation (as
+    # used by CI) breaks Test::MockModule's DESTROY-based auto-restore, leaving make_path/slurp
+    # mocked for the rest of the test file (it silently passed locally without coverage).
+    subtest 'pure cgroup v2 unified hierarchy' => sub {
+        my $file_mock = Test::MockModule->new('Mojo::File');
+        $file_mock->noop('make_path');
+        my $orig_slurp = $file_mock->original('slurp');
+        $file_mock->redefine(
+            slurp => sub ($self, @args) {
+                return $self =~ m{/cgroup$}
+                  ? qq{0::/system.slice/openqa-worker-auto-restart\@16.service\n}
+                  : $orig_slurp->($self, @args);
+            });
+        combined_like { OpenQA::Worker::Engines::isotovideo::_configure_cgroupv2({id => 42}) }
+        qr|Using cgroup /sys/fs/cgroup/system\.slice/openqa-worker-auto-restart\@16\.service/42|,
+          'slice parsed from the "0::" unified hierarchy line and used for the cgroup path';
+    };
+
+    subtest 'named "systemd" hierarchy line format (systemd not on the unified hierarchy)' => sub {
+        my $file_mock = Test::MockModule->new('Mojo::File');
+        $file_mock->noop('make_path');
+        my $orig_slurp = $file_mock->original('slurp');
+        $file_mock->redefine(
+            slurp => sub ($self, @args) {
+                return $self =~ m{/cgroup$}
+                  ? "12:name=systemd:/user.slice/user-1000.slice/session-1.scope\n11:pids:/user.slice\n"
+                  : $orig_slurp->($self, @args);
+            });
+        combined_like { OpenQA::Worker::Engines::isotovideo::_configure_cgroupv2({id => 42}) }
+        qr|Using cgroup /sys/fs/cgroup/systemd/user\.slice/user-1000\.slice/session-1\.scope/42|,
+          'slice parsed from the legacy "name=systemd:" line and used for the cgroup path';
+    };
+};
+
+subtest '_construct_isotovideo_cmd' => sub {
+    local $OpenQA::Worker::Engines::isotovideo::CA_DIRS = [];
+
+    my $isotovideo = '/usr/bin/isotovideo';
+
+    subtest 'default command' => sub {
+        my $settings = {};
+        my @cmd = OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+        is_deeply \@cmd, ['perl', '/usr/bin/isotovideo', '-d'], 'returns default execution array';
+    };
+
+    subtest 'custom ISOTOVIDEO override' => sub {
+        my $settings = {ISOTOVIDEO => 'some custom command'};
+        my @cmd = OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+        is_deeply \@cmd, ['some custom command'], 'returns custom command string';
+    };
+
+    subtest 'containerized with OS_AUTOINST_GIT_REPO' => sub {
+        my $settings = {OS_AUTOINST_GIT_REPO => 'https://github.com/foo/os-autoinst.git'};
+        my @cmd = OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+        is scalar(@cmd), 29, 'returns a list of execution arguments';
+        my $podman_dir = prjdir() . '/cache/podman';
+        my $podman_runroot = "$podman_dir/run";
+        my $podman_tmp_dir = getcwd() . '/podman_tmp';
+        is $cmd[0], 'env', 'uses env';
+        is $cmd[1], "HOME=$podman_tmp_dir", 'sets correct home directory under openqa cache';
+        is $cmd[2], "XDG_RUNTIME_DIR=$podman_runroot", 'sets XDG_RUNTIME_DIR environment variable';
+        is $cmd[3], 'podman', 'runs podman';
+        is $cmd[4], '--root', 'uses --root';
+        is $cmd[5], "$podman_dir/data/containers/storage", 'sets correct root directory';
+        is $cmd[6], '--runroot', 'uses --runroot';
+        is $cmd[7], "$podman_runroot/containers", 'sets correct run root directory';
+        is $cmd[8], '--storage-opt', 'sets storage-opt';
+        is $cmd[9], 'ignore_chown_errors=true', 'ignores chown errors';
+        is $cmd[10], '--cgroup-manager=cgroupfs', 'uses cgroupfs manager';
+        is $cmd[11], '--events-backend=file', 'uses file events backend';
+        is $cmd[12], 'run', 'runs the container';
+        is $cmd[13], '--init', 'runs with --init for signal handling';
+        is $cmd[14], '--rm', 'runs with --rm for auto-cleanup';
+        is $cmd[15], '--entrypoint', 'specifies entrypoint';
+        is $cmd[16], '', 'clears entrypoint';
+        is $cmd[17], '--device', 'adds device';
+        is $cmd[18], '/dev/kvm', 'passes kvm';
+        is $cmd[19], '-v', 'mounts a volume';
+        is $cmd[20], getcwd() . ':/pool', 'mounts getcwd() to pool';
+        is $cmd[21], '-w', 'sets working dir flag';
+        is $cmd[22], '/pool', 'sets working dir';
+        is $cmd[23], '-v', 'mounts share volume';
+        my $share = prjdir() . '/share';
+        is $cmd[24], "$share:$share:ro", 'mounts share dir ro';
+        is $cmd[25], 'registry.opensuse.org/devel/openqa/containers/os-autoinst_dev:latest', 'uses default image';
+        is $cmd[26], 'sh', 'executes sh';
+        is $cmd[27], '-c', 'runs shell command';
+        like $cmd[28], qr/git clone --branch=master --depth=1 https:\/\/github.com\/foo\/os-autoinst\.git/,
+          'clones master branch by default';
+    };
+
+    subtest 'containerized with OS_AUTOINST_GIT_BRANCH and custom image' => sub {
+        my $settings = {
+            OS_AUTOINST_GIT_REPO => 'https://github.com/foo/os-autoinst.git',
+            OS_AUTOINST_GIT_BRANCH => 'my_feature',
+            OS_AUTOINST_CONTAINER_IMAGE => 'my_custom_image:latest'
+        };
+        my @cmd = OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+        is scalar(@cmd), 29, 'returns a list of execution arguments';
+        is $cmd[25], 'my_custom_image:latest', 'uses custom image';
+        like $cmd[28], qr/git clone --branch=my_feature --depth=1 https:\/\/github.com\/foo\/os-autoinst\.git/,
+          'clones custom branch';
+    };
+
+    subtest 'containerized without OS_AUTOINST_GIT_REPO' => sub {
+        my $settings = {OS_AUTOINST_CONTAINER_IMAGE => 'my_custom_image:latest'};
+        throws_ok {
+            OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+        }
+        qr/OS_AUTOINST_CONTAINER_IMAGE requires OS_AUTOINST_GIT_REPO/, 'dies with helpful error message';
+    };
+
+    subtest 'containerized with mounted CA certificates' => sub {
+        my $settings = {OS_AUTOINST_GIT_REPO => 'https://github.com/foo/os-autoinst.git'};
+        my $tmp_dir = path(Mojo::File->new($ENV{OPENQA_BASEDIR} || '.')->child('tmp', 'ca-certs')->to_string);
+        $tmp_dir->make_path;
+        local $OpenQA::Worker::Engines::isotovideo::CA_DIRS = [$tmp_dir->to_string, '/nonexistent/dir'];
+
+        my @cmd = OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+
+        my $ca_mount = $tmp_dir->to_string;
+        is scalar(grep { $_ eq "$ca_mount:$ca_mount:ro" } @cmd), 1, 'mounts existing CA directory';
+        is scalar(grep { $_ eq '/nonexistent/dir:/nonexistent/dir:ro' } @cmd), 0, 'ignores non-existent CA directory';
+        is scalar(@cmd), 31, 'adds exactly 2 elements for the single CA mount';
+    };
+
+    subtest 'clears stale runroot on boot id change' => sub {
+        my $settings = {OS_AUTOINST_GIT_REPO => 'https://github.com/foo/os-autoinst.git'};
+        my $podman_dir = prjdir() . '/cache/podman';
+        my $podman_runroot = "$podman_dir/run";
+        my $alive_file = path("$podman_runroot/libpod/tmp/alive");
+        $alive_file->dirname->make_path;
+        $alive_file->spurt("old-boot-id\n");
+        my $stale_file = path("$podman_runroot/containers/stale.lock");
+        $stale_file->dirname->make_path;
+        $stale_file->spurt('lock');
+
+        my $temp_dir = tempdir;
+        my $boot_id_tmp = $temp_dir->child('boot_id');
+        $boot_id_tmp->spurt("new-boot-id\n");
+        local $OpenQA::Worker::Engines::isotovideo::BOOT_ID_FILE = $boot_id_tmp->to_string;
+
+        OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+
+        ok !-e $stale_file, 'stale file removed on boot id mismatch';
+        ok -d $podman_runroot, 'runroot recreated';
+
+        $alive_file->dirname->make_path;
+        $alive_file->spurt("new-boot-id\n");
+        my $valid_file = path("$podman_runroot/containers/valid.lock");
+        $valid_file->dirname->make_path;
+        $valid_file->spurt('lock');
+
+        OpenQA::Worker::Engines::isotovideo::_construct_isotovideo_cmd($settings, $isotovideo);
+
+        ok -e $valid_file, 'valid runtime file preserved when boot id matches';
+    };
+};
+
+done_testing();

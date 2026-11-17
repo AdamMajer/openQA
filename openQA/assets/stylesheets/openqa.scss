@@ -1,0 +1,27 @@
+// include themes: these set variables for common values
+@import 'openqa_theme';
+
+// include Roboto font
+@import url($web-font-path);
+
+// prevent bom from disturbing rest of the CSS
+dummy {
+  font-size: 42px;
+}
+
+// include Bootstrap
+@import '../node_modules/bootstrap/scss/bootstrap';
+
+// include custom css for various aspects of the pages
+@import 'overall';
+@import 'navigation';
+@import 'forms';
+@import 'tables';
+@import 'dashboard';
+@import 'test-details';
+@import 'result_preview';
+@import 'admin-pages';
+@import 'comments';
+@import 'overview';
+@import 'parent_group_overview';
+@import 'halloween';

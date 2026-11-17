@@ -1,0 +1,368 @@
+/* jshint esversion: 6 */
+
+function overviewRowDisplay(expand) {
+  return expand ? 'table-row' : 'none';
+}
+
+function toggleParallelChildren(expand, parentJobID) {
+  const display = overviewRowDisplay(expand);
+  Array.from(document.getElementsByClassName('parallel-child-of-' + parentJobID)).forEach(childRow => {
+    childRow.style.display = display;
+  });
+}
+
+function considerChildrenChanged(expanded, parentElement) {
+  Array.from(parentElement.getElementsByClassName('toggle-parallel-children')).forEach(toggleLink => {
+    toggleLink.dataset.expanded = expanded ? '1' : '';
+  });
+}
+
+function toggleAllParallelChildren(expand, table) {
+  const display = overviewRowDisplay(expand);
+  Array.from(table.getElementsByClassName('parallel-child')).forEach(childRow => {
+    childRow.style.display = display;
+  });
+  considerChildrenChanged(expand, table);
+}
+
+function hasOnlyOkChildren(table, parentID) {
+  const sel = '.parallel-child-of-' + parentID + window.overviewParallelChildrenCollapsableResultsSel;
+  return table.querySelector(sel) === null;
+}
+
+function collapseOkParallelChildren() {
+  Array.from(document.getElementsByClassName('parallel-parent')).forEach(parentRow => {
+    const parentIDs = parentRow.dataset.parallelParents.split(',');
+    if (parentIDs.find(hasOnlyOkChildren.bind(this, parentRow.parentElement))) {
+      parentIDs.forEach(toggleParallelChildren.bind(this, false));
+      considerChildrenChanged(false, parentRow);
+    }
+  });
+}
+
+function appendParallelChildren(parentRow, parentJobID) {
+  Array.from(document.getElementsByClassName('parallel-child-of-' + parentJobID)).forEach(childRow => {
+    parentRow.insertAdjacentElement('afterend', childRow);
+  });
+}
+
+function ensureParallelParentsComeFirst() {
+  Array.from(document.getElementsByClassName('parallel-parent')).forEach(parentRow => {
+    parentRow.dataset.parallelParents.split(',').forEach(appendParallelChildren.bind(undefined, parentRow));
+  });
+}
+
+function showToggleLinkForParallelParents(relatedRow, relatedTable, resElement, parallelChildren) {
+  if (!Array.isArray(parallelChildren)) {
+    return false;
+  }
+  const jobIDMatch = (resElement.id || '').match(/\d+/);
+  if (!jobIDMatch) {
+    return false;
+  }
+  const jobID = jobIDMatch[0];
+  if (!parallelChildren.find(childID => relatedTable.querySelector('tr:not(.parallel-parent) #res-' + childID))) {
+    return false; // no children present in same table which aren't already parents as well
+  }
+  const testNameCell = relatedRow.firstElementChild;
+  const existingToggleLink = testNameCell.getElementsByClassName('toggle-parallel-children');
+  if (existingToggleLink.length) {
+    relatedRow.dataset.parallelParents += ',' + jobID;
+    existingToggleLink[0].dataset.ids += ',' + jobID;
+    return true;
+  }
+  const toggleLink = document.createElement('a');
+  toggleLink.className = 'toggle-parallel-children btn btn-outline-primary fa-solid fa-clone';
+  relatedRow.classList.add('parallel-parent');
+  relatedRow.dataset.parallelParents = jobID;
+  toggleLink.title = 'Show/hide parallel children';
+  toggleLink.dataset.ids = jobID;
+  toggleLink.dataset.expanded = '1';
+  toggleLink.onclick = function () {
+    const dataset = this.dataset;
+    const expand = (dataset.expanded = dataset.expanded ? '' : '1');
+    dataset.ids.split(',').forEach(toggleParallelChildren.bind(this, expand));
+    return false;
+  };
+  testNameCell.appendChild(toggleLink);
+  const heading = relatedTable.parentElement.previousElementSibling;
+  if (heading.previousElementSibling.classList.contains('btn')) {
+    return true;
+  }
+  const collapseAllButton = document.createElement('a');
+  collapseAllButton.className = 'collapse-all-button btn btn-outline-primary btn-sm fa-solid fa-compress';
+  collapseAllButton.title = 'Collapse all parallel children';
+  collapseAllButton.onclick = toggleAllParallelChildren.bind(this, false, relatedTable);
+  heading.insertAdjacentElement('beforebegin', collapseAllButton);
+  const expandAllButton = document.createElement('a');
+  expandAllButton.className = 'expand-all-button btn btn-outline-primary btn-sm fa-solid fa-expand';
+  expandAllButton.title = 'Expand all parallel children';
+  expandAllButton.onclick = toggleAllParallelChildren.bind(this, true, relatedTable);
+  heading.insertAdjacentElement('beforebegin', expandAllButton);
+  return true;
+}
+
+function initCollapsedParallelChildren(relatedRow, relatedTable, parallelParents) {
+  if (!Array.isArray(parallelParents) || parallelParents.length !== 1) {
+    return false;
+  }
+  if (relatedTable.querySelector('#res-' + parallelParents[0])) {
+    relatedRow.classList.add('parallel-child');
+    parallelParents.forEach(parentID => relatedRow.classList.add('parallel-child-of-' + parentID));
+  }
+}
+
+function stackParallelChildren(depElement, dependencyInfo) {
+  const relatedRow = depElement.parentElement.parentElement;
+  const relatedTable = relatedRow.parentElement;
+  const resElement = depElement.previousElementSibling;
+  showToggleLinkForParallelParents(relatedRow, relatedTable, resElement, dependencyInfo.children.Parallel) ||
+    initCollapsedParallelChildren(relatedRow, relatedTable, dependencyInfo.parents.Parallel);
+}
+
+function setupOverview(options) {
+  setupLazyLoadingFailedSteps();
+  updateTimeago();
+  $('.cancel').on('ajax:success', function (event, xhr, status) {
+    this.textContent = ''; // hide the icon
+    const icon = this.closest('td').querySelector('.status');
+    if (icon) {
+      icon.classList.remove('state_scheduled', 'state_running');
+      icon.classList.add('state_cancelled');
+      icon.title = 'Cancelled';
+      icon.style.opacity = 0.5;
+      setTimeout(() => (icon.style.opacity = 1.0), 500);
+    }
+  });
+  $('.restart').on('ajax:success', function (event, xhr, status) {
+    if (typeof xhr !== 'object' || !Array.isArray(xhr.result)) {
+      addFlash('danger', '<strong>Unable to restart job.</strong>');
+      return;
+    }
+    let newJobUrl;
+    try {
+      const jobId = event.currentTarget.dataset.jobid;
+      newJobUrl = xhr.test_url?.[0]?.[jobId];
+      if (!newJobUrl && Array.isArray(xhr.test_url) && xhr.test_url[0]) {
+        newJobUrl = Object.values(xhr.test_url[0])[0];
+      }
+    } catch {
+      // Intentionally ignore all errors
+    }
+    const hasRestartResults = showJobRestartResults(
+      xhr,
+      newJobUrl,
+      forceJobRestartViaRestartLink.bind(undefined, event.currentTarget)
+    );
+    const newIdMap = xhr.result[0];
+    if (newIdMap) {
+      updateOverviewRestartedJobs(newIdMap);
+      if (!hasRestartResults && event.currentTarget.href.includes('force=1')) {
+        if (newJobUrl) {
+          addFlash('info', `The job has been restarted. Go to <a href="${newJobUrl}">new job</a>.`);
+        } else {
+          addFlash('info', 'The job has been restarted.');
+        }
+      }
+    }
+  });
+  const dependencies = document.getElementsByClassName('dependency');
+  for (let i = 0; i < dependencies.length; i++) {
+    const depElement = dependencies[i];
+    const depInfo = depElement.dataset;
+    const deps = JSON.parse(depInfo.deps);
+    const dependencyResult = showJobDependency(deps);
+    if (dependencyResult.title === undefined) {
+      continue;
+    }
+    let elementIClass = 'fa-solid fa-code-fork';
+    let elementATitle = dependencyResult.title;
+    if (deps.has_parents) {
+      const str = parseInt(deps.parents_ok) ? 'passed' : 'failed';
+      elementIClass += ' result_' + str;
+      elementATitle += '\ndependency ' + str;
+    }
+    const elementA = document.createElement('a');
+    elementA.href = urlWithBase('/tests/' + depInfo.jobid + '#dependencies');
+    elementA.title = elementATitle;
+    elementA.className = 'parents_children';
+    elementA.dataset.childrenDeps = '[' + dependencyResult['data-children'].toString() + ']';
+    elementA.dataset.parentsDeps = '[' + dependencyResult['data-parents'].toString() + ']';
+    const elementI = document.createElement('i');
+    elementI.setAttribute('class', elementIClass);
+    elementA.appendChild(elementI);
+    depElement.appendChild(elementA);
+    stackParallelChildren(depElement, deps);
+  }
+  ensureParallelParentsComeFirst();
+  collapseOkParallelChildren();
+
+  setupFilterForm(options);
+  const form = document.getElementById('filter-form');
+  form.todo = false;
+
+  // initialize filter for modules results
+  const modulesResultFilter = document.getElementById('modules_result');
+  if (modulesResultFilter && typeof jQuery !== 'undefined' && typeof jQuery.fn.chosen === 'function') {
+    $(modulesResultFilter).chosen({width: '100%'});
+    modulesResultFilter.addEventListener('change', function (event) {
+      // update query params
+      const params = parseQueryParams();
+      params.modules_results = Array.from(modulesResultFilter.selectedOptions).map(opt => opt.value);
+    });
+  }
+
+  // find specified results
+  const flags = {result: {}, state: {}};
+  const modulesResults = [];
+  const formatFilter = filter => {
+    return filter.replace(/_/g, ' ');
+  };
+  const filterLabels = parseFilterArguments((key, val) => {
+    if (key === 'result' || key === 'state') {
+      flags[key][val] = true;
+      return formatFilter(val);
+    } else if (key === 'result__not' || key === 'state__not') {
+      const baseKey = key.slice(0, -5);
+      const isFirst = !flags[baseKey].__inverted;
+      flags[baseKey].__inverted = true;
+      document.querySelectorAll(`#filter-${baseKey}s input[name="${baseKey}"]`).forEach(cb => {
+        if (isFirst) {
+          flags[baseKey][cb.value] = cb.value !== val;
+        } else if (cb.value === val) {
+          flags[baseKey][cb.value] = false;
+        }
+      });
+      return 'NOT ' + formatFilter(val);
+    } else if (key === 'todo') {
+      const todoCheck = document.getElementById('filter-todo');
+      if (todoCheck) todoCheck.checked = val !== '0';
+      return 'TODO';
+    } else if (key === 'modules_result') {
+      modulesResults.push(val);
+      if (modulesResultFilter) {
+        Array.from(modulesResultFilter.options).forEach(opt => {
+          if (opt.value === val) opt.selected = true;
+        });
+        if (typeof jQuery !== 'undefined' && typeof jQuery.fn.chosen === 'function') {
+          $(modulesResultFilter).trigger('chosen:updated');
+        }
+        modulesResultFilter.dispatchEvent(new Event('change'));
+      }
+      return formatFilter(val);
+    } else {
+      const input = form.elements[key] || document.getElementById('filter-' + key.replace(/_/g, '-'));
+      if (input && input.value !== undefined) {
+        input.value += input.value.length > 0 ? `,${val}` : val;
+        return val;
+      }
+    }
+  });
+
+  // set enabled/disabled state of checkboxes (according to current filter)
+  if (filterLabels.length > 0) {
+    setCheckboxStatesForFlags('filter-results', flags.result);
+    setCheckboxStatesForFlags('filter-states', flags.state);
+  }
+
+  const parentChild = document.getElementsByClassName('parents_children');
+  for (let i = 0; i < parentChild.length; i++) {
+    parentChild[i].addEventListener('mouseover', highlightDeps);
+    parentChild[i].addEventListener('mouseout', unhighlightDeps);
+  }
+
+  const cookies = new URLSearchParams(document.cookie);
+  const flash = cookies.get('flash');
+  if (flash) {
+    addFlash(...flash.split(':', 2));
+    document.cookie = 'flash=; expires=Thu, 01 Jan 1970 00:00:00 UTC;';
+  }
+}
+
+function setCheckboxStatesForFlags(containerId, flags) {
+  Array.from(document.getElementById(containerId).getElementsByTagName('input')).forEach(e => {
+    e.checked = flags[e.id.substr(7)];
+  });
+}
+
+function highlightDeps() {
+  const parentData = JSON.parse(this.dataset.parentsDeps);
+  const childData = JSON.parse(this.dataset.childrenDeps);
+  changeClassOfDependencyJob(parentData, 'highlight_parent', true);
+  changeClassOfDependencyJob(childData, 'highlight_child', true);
+}
+
+function unhighlightDeps() {
+  const parentData = JSON.parse(this.dataset.parentsDeps);
+  const childData = JSON.parse(this.dataset.childrenDeps);
+  changeClassOfDependencyJob(parentData, 'highlight_parent', false);
+  changeClassOfDependencyJob(childData, 'highlight_child', false);
+}
+
+function changeClassOfDependencyJob(array, className, add) {
+  for (let i = 0; i < array.length; i++) {
+    const ele = document.getElementsByName('jobid_td_' + array[i])[0];
+    if (ele === undefined) {
+      continue;
+    }
+    const classList = ele.parentNode.classList;
+    add ? classList.add(className) : classList.remove(className);
+  }
+}
+
+function showAddCommentsDialog() {
+  const modal = (window.addCommentsModal = new bootstrap.Modal('#add-comments-modal'));
+  modal.show();
+}
+
+function restartJobsWithComment(btn) {
+  const form = btn.form;
+  const text = form.elements.text.value;
+  const jobs = btn.dataset.jobs
+    .split(',')
+    .map(Number)
+    .filter(n => !isNaN(n));
+  const apiUrl = btn.dataset.url;
+  if (!text.length) {
+    return window.alert("The comment text mustn't be empty.");
+  }
+
+  const progressIndication = document.getElementById('add-comments-progress-indication');
+  const controls = document.getElementById('add-comments-controls');
+  progressIndication.style.display = 'flex';
+  controls.style.display = 'none';
+  restartJob(apiUrl, jobs, text).finally(() => {
+    progressIndication.style.display = 'none';
+    controls.style.display = 'inline';
+    window.addCommentsModal.hide();
+  });
+}
+
+function addComments(btn) {
+  const form = btn.form;
+  const text = form.elements.text.value;
+  const apiUrl = btn.dataset.url;
+  if (!text.length) {
+    return window.alert("The comment text mustn't be empty.");
+  }
+  const progressIndication = document.getElementById('add-comments-progress-indication');
+  const controls = document.getElementById('add-comments-controls');
+  progressIndication.style.display = 'flex';
+  controls.style.display = 'none';
+  const done = () => {
+    progressIndication.style.display = 'none';
+    controls.style.display = 'inline';
+    window.addCommentsModal.hide();
+  };
+  fetchWithCSRF(apiUrl, {method: 'POST', body: new FormData(form)})
+    .then(response => {
+      if (!response.ok) throw `Server returned ${response.status}: ${response.statusText}`;
+      document.cookie = 'flash=info:The comments have been created.';
+      done();
+      location.reload();
+    })
+    .catch(error => {
+      addFlash('danger', `The comments could not be added: ${error}`);
+      done();
+    });
+}

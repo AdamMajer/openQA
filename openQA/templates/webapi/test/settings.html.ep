@@ -1,0 +1,19 @@
+<table class="infotbl table table-striped" id="settings_box">
+    <thead>
+        <tr><th colspan="2">Settings</th></tr>
+    </thead>
+    <tbody>
+        % my $s = $job->redacted_settings_hash;
+        % for my $k (sort keys %$s) {
+          % my $v = $s->{$k};
+          <tr>
+            <td><%= $k %></td>
+            % if (link_key_exists $k) {
+              <td><%= setting_link $v, $job->id %></td>
+            % } else {
+              <td class="settings-value"><%= $v %></td>
+            % }
+          </tr>
+        % }
+    </tbody>
+</table>

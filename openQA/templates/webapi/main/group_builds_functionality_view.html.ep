@@ -1,0 +1,54 @@
+% for my $child (@{$children}) {
+  % my $has_jobs = 0;
+  % my $title_class_mod = "text-body-secondary";
+
+  % for my $build_res (@$build_results) {
+    % if ($build_res->{children}->{$child->{id}}->{total}) {
+      % $has_jobs = 1;
+      % $title_class_mod = "";
+    % }
+  % }
+
+  <div class="mb-2">
+    <div class="h4 <%= $title_class_mod %> mb-2">
+      %= link_to $child->{name} => url_for('group_overview', groupid => $child->{id})
+    </div>
+
+    % for my $build_res (@$build_results) {
+      % my $child_res = $build_res->{children}->{$child->{id}};
+      % next unless $child_res->{total};
+      % my $group_build_id = $group->{id} . '-' . $build_res->{escaped_id};
+      % my %child_progress_bar_params = (url => url_for('tests_overview'), query_params => [(distri  => [sort keys %{$child_res->{distris}}], version => $child_res->{version}, build => $build_res->{build}), groupid => $child->{id}]);
+
+        <div class="d-xl-flex flex-row build-row">
+            <div class="px-2 build-label text-nowrap">
+                <span class="h4 m-0 d-inline">
+                    % my $build = $build_res->{build};
+                    %= link_to $build => url_for('tests_overview')->query(distri => [sort keys %{$child_res->{distris}}], version => $child_res->{version}, build => $build, groupid => $child->{id})
+                </span>
+
+                %= include 'main/review_badge', group_build_id => $group_build_id, build_res => $child_res, id_prefix => 'child-byGroup-'
+
+                % if (my $tag = $build_res->{tag}) {
+                    <span id="tag-byGroup-<%= $group_build_id %>">
+                        <span class="tag-byGroup" title="<%= $tag->{type}; %>"><i class="fa-solid fa-tag"></i><%= $tag->{description} %></span>
+                    </span>
+                % }
+            </div>
+            <div class="px-2 text-nowrap smaller-font ps-4">
+                <abbr class="timeago" title="<%= $build_res->{date}->datetime() %>Z">
+                    %= $build_res->{date}
+                </abbr>
+            </div>
+            <div class="px-2 align-self-stretch flex-grow-1">
+                %= include 'main/build_progressbar', max_jobs => $child_res->{total}, params => \%child_progress_bar_params, result => $child_res, class => "mt-0"
+            </div>
+        </div>
+    % }
+    % if ($has_jobs eq 0) {
+      <div class="ml-3 text-body-secondary">
+        The last <%= $limit_builds %> builds do not include this group. Increase the limit of the number of builds to potentially see more.
+      </div>
+    % }
+  </div>
+% }

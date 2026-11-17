@@ -1,0 +1,18 @@
+% layout 'bootstrap';
+% title 'Personal Activity View';
+
+% content_for ready_function => begin
+  renderActivityView("<%= url_for('activity_view_ajax') %>");
+% end
+
+<div>
+    <h2 id="results-heading">Current activities</h2>
+    <p>The activity view includes <b>your current jobs</b>.</p>
+    <div id="flash-messages"></div>
+    <p id="progress-indication" style="display: none">
+        <i class="fa-solid fa-gear fa-spin fa-3x fa-fw"></i>
+        <span class="visually-hidden">Loading…</span>
+    </p>
+    <div id="results" class="list-group">
+    </div>
+</div>

@@ -1,0 +1,221 @@
+#!/usr/bin/env perl
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Test::Most;
+
+use Module::Load::Conditional qw(can_load);
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../../external/os-autoinst-common/lib";
+use Test::Mojo;
+use Test::Warnings ':report_warnings';
+use Mojo::File qw(tempdir);
+use OpenQA::Log 'log_debug';
+use OpenQA::Test::TimeLimit '30';
+use OpenQA::Test::Case;
+use OpenQA::SeleniumTest;
+
+my $test_case = OpenQA::Test::Case->new;
+my $schema = $test_case->init_data(fixtures_glob => '01-jobs.pl 02-workers.pl 03-users.pl');
+
+$ENV{OPENQA_CONFIG} = my $config_dir = tempdir("$FindBin::Script-XXXX");
+my $cfg = "[misc_limits]\njob_group_overview_max_unauth_builds_limit = 300";
+$config_dir->child('openqa.ini')->spew($cfg);
+
+driver_missing unless my $driver = call_driver;
+
+# DO NOT MOVE THIS INTO A 'use' FUNCTION CALL! It will cause the tests
+# to crash if the module is unavailable
+plan skip_all => 'Install Selenium::Remote::WDKeys to run this test'
+  unless can_load(modules => {'Selenium::Remote::WDKeys' => undef,});
+
+#
+# List with no parameters
+#
+$driver->title_is('openQA', 'on main page');
+my @build_headings = $driver->find_elements('.h4', 'css');
+is scalar @build_headings, 4, '4 builds shown';
+
+subtest 'Back to top button' => sub {
+    my $check_visibility
+      = sub { $driver->execute_script('return getComputedStyle(document.getElementById("back-to-top")).display') };
+    is $check_visibility->(), 'none', 'button is not visible';
+    # scroll down resizing the jumbotron to ensure there's enough content for scrolling down
+    $driver->execute_script(
+        'document.getElementsByClassName("jumbotron")[0].style.height = "10000px";
+         window.scrollTo(0, document.body.scrollHeight);'
+    );
+    wait_until sub { $check_visibility->() ne 'none' }, 'button is visible after scrolling down', 10;
+    $driver->find_element('#back-to-top')->click;
+    wait_until sub { $check_visibility->() eq 'none' }, 'button is not visible anymore after using it', 10;
+    # note: Using `wait_until` because even with disabled animations the button might now show up or hide
+    #       instantly, see poo#95839.
+};
+
+# click on last build which should be Build0091
+$driver->find_child_element($build_headings[-1], 'a', 'css')->click();
+like $driver->find_element_by_id('summary')->get_text(),
+  qr/Overall Summary of opensuse test build 0091/,
+  'we are on build 91';
+
+is $driver->get('/?limit_builds=1'), 1, 'index page accepts limit_builds parameter';
+wait_for_ajax;
+is scalar @{$driver->find_elements('.h4', 'css')}, 2, 'only one build per group shown';
+is $driver->get('/?time_limit_days=0.02&limit_builds=100000'), 1, 'index page accepts time_limit_days parameter';
+wait_for_ajax;
+is scalar @{$driver->find_elements('.h4', 'css')}, 0, 'no builds shown';
+is $driver->get('/?time_limit_days=0.05&limit_builds=100000'), 1, 'index page accepts time_limit_days parameter';
+wait_for_ajax;
+is scalar @{$driver->find_elements('.h4', 'css')}, 2, 'only the one hour old builds are shown';
+
+# group overview
+$driver->find_element_by_link_text('opensuse')->click();
+my $build_url = $driver->get_current_url();
+$build_url =~ s/\?.*//;
+log_debug('build_url: ' . $build_url);
+is scalar @{$driver->find_elements('.h4', 'css')}, 5, 'number of builds for opensuse';
+is $driver->find_element_by_id('group_description')->get_text(),
+  "Test description\nwith bugref  bsc#1234",    # second space comes from using non-breaking space in bugref span
+  'description shown';
+is $driver->find_element('#group_description a')->get_attribute('href'),
+  'https://bugzilla.suse.com/show_bug.cgi?id=1234',
+  'bugref in description rendered as link';
+$driver->get('/group_overview/1002');
+is scalar @{$driver->find_elements('#group_description', 'css')},
+  0, 'group description frame is not shown if none present';
+is scalar @{$driver->find_elements('option[value*="400"]', 'css')}, 0,
+  'job_limit 400 below job_group_overview_max_unauth_builds_limit not shown';
+is scalar @{$driver->find_elements('option[value*="300"]', 'css')}, 1,
+  'job_limit 300 = job_group_overview_max_unauth_builds_limit is shown';
+is $driver->get($build_url . '?limit_builds=2'), 1, 'group overview page accepts query parameter, too';
+$driver->get($build_url . '?limit_builds=4711');
+like $driver->find_element('body')->get_text(), qr/limit_builds invalid/,
+  'custom limit_builds value invalid when logged out';
+$driver->get($build_url . '?fullscreen=1&interval=4711');
+like $driver->find_element('body')->get_text(), qr/interval invalid/, 'custom interval value invalid when logged out';
+$driver->get($build_url . '?limit_builds=400');
+like $driver->find_element('body')->get_text(), qr/limit_builds invalid/, 'too high limit_builds value when logged out';
+$driver->get('/login');
+$driver->get($build_url . '?fullscreen=1&interval=4711');
+is $driver->find_element('select[name=interval] option[value*="4711"][selected]')->get_text(), 4711,
+  'select has custom interval 4711';
+$driver->get($build_url . '?limit_builds=0');
+is scalar @{$driver->find_elements('div.build-row .h4', 'css')}, 0, 'all builds filtered out';
+is $driver->find_element('h2')->get_text(), 'Last Builds for opensuse',
+  'group name shown correctly when all builds filtered out';
+
+$driver->find_element('select[name=limit_builds]')->click();
+$driver->find_element('option[value*="400"]')->click();
+is $driver->find_element('option[value*="400"][selected]')->get_text(), 400, 'limited to the selected number';
+like $driver->get_current_url(), qr/1001\?limit_builds=400/, 'url shows the selected build_limits';
+$driver->find_element('select[name=limit_builds]')->click();
+$driver->find_element('option[value*="50"]')->click();
+my $actual_url = $driver->get_current_url();
+unlike $actual_url, qr/limit_builds=400/, 'url query does not show previous limit_builds';
+like $actual_url, qr/1001\?limit_builds=50/, 'url query has unique limit_builds entry';
+$driver->find_element('label[for=cb_only_tagged]')->click();
+is scalar @{$driver->find_elements('.h4', 'css')}, 0, 'no tagged builds exist';
+$driver->find_element('select[name=limit_builds]')->click();
+$driver->find_element('option[value*="400"]')->click();
+$actual_url = $driver->get_current_url();
+unlike $actual_url, qr/limit_builds=50/, 'url query updates only limit_builds entry and old selection is removed';
+like $actual_url, qr/limit_builds=400/, 'url query updates only limit_builds entry and shows new selection';
+like $actual_url, qr/only_tagged=1/, 'url query contains tag settings';
+$driver->find_element('label[for=cb_fullscreen]')->click();
+is scalar @{$driver->find_elements('#cb_fullscreen[checked]', 'css')}, 1, 'fullscreen on';
+$actual_url = $driver->get_current_url();
+like $actual_url, qr/fullscreen=1/, 'url query contains fullscreen';
+$driver->find_element('select[name=interval]')->click();
+$driver->find_element('option[value*="120"]')->click();
+$actual_url = $driver->get_current_url();
+like $actual_url, qr/interval=120/, 'url query contains interval=120';
+is $driver->find_element('select[name=interval] option[value*="120"][selected]')->get_text(), 120,
+  'select has correct interval';
+
+$driver->get('/group_overview/1001');
+my $res = OpenQA::Test::Case::trim_whitespace($driver->find_element_by_id('more_builds')->get_text);
+is $res, q{Limit to 10 20 50 100 400 builds Only show tagged builds}, 'more builds can be requested';
+is $driver->get('/?group=opensuse'), 1, 'group parameter is not exact by default';
+wait_for_ajax;
+is scalar @{$driver->find_elements('h2', 'css')}, 2, 'both job groups shown';
+is $driver->get('/?group=test'), 1, 'group parameter filters as expected';
+wait_for_ajax;
+is scalar @{$driver->find_elements('h2', 'css')}, 1, 'only one job group shown';
+is $driver->find_element_by_link_text('opensuse test')->get_text, 'opensuse test';
+is $driver->get('/?group=opensuse$'), 1, 'group parameter can be used for exact matching, though';
+wait_for_ajax;
+is scalar @{$driver->find_elements('h2', 'css')}, 1, 'only one job group shown';
+is $driver->find_element_by_link_text('opensuse')->get_text, 'opensuse';
+is $driver->get('/?group=opensuse$&group=test'), 1, 'multiple group parameter can be used to ease building queries';
+wait_for_ajax;
+is scalar @{$driver->find_elements('h2', 'css')}, 2, 'both job groups shown';
+$driver->get('/?group=');
+wait_for_ajax;
+is scalar @{$driver->find_elements('h2', 'css')}, 2, 'a single, empty group parameter has no affect';
+
+subtest 'filter form' => sub {
+    $driver->get('/');
+    like $driver->find_element('#filter-panel .help_popover')->get_attribute('data-bs-title'),
+      qr/Help/, 'help popover is shown';
+    wait_for_ajax_and_animations;
+    my $url = $driver->get_current_url;
+    $driver->find_element('#filter-panel .card-header')->click();
+    $driver->find_element_by_id('filter-group')->send_keys('SLE 12 SP2');
+    my $ele = $driver->find_element_by_id('filter-limit-builds');
+    $ele->click();
+    $ele->send_keys(Selenium::Remote::WDKeys->KEYS->{end}, '8');    # appended to default '3'
+    $ele = $driver->find_element_by_id('filter-time-limit-days');
+    $ele->click();
+    $ele->send_keys(Selenium::Remote::WDKeys->KEYS->{end}, '2');    # appended to default '14'
+    $driver->find_element('#filter-apply-button')->click();
+    wait_for_ajax;
+    $url .= '?group=SLE%2012%20SP2&limit_builds=38&time_limit_days=142&interval=';
+    is $driver->get_current_url, $url, 'URL parameters for filter are correct';
+};
+
+subtest 'clear filter button on index page' => sub {
+    $driver->get('/?group=opensuse');
+    wait_for_ajax;
+    (my $base_url = $driver->get_current_url) =~ s/\?.*//;
+    $driver->find_element('#filter-panel .card-header')->click();
+    $driver->find_element_by_id('filter-reset-button')->click();
+    wait_until sub { $driver->get_current_url !~ /group=opensuse/ },
+      'clear filter button removes group parameter from URL', 10;
+    like $driver->get_current_url, qr{^\Q$base_url\E\??}, 'clear filter button leaves a URL without query parameters';
+};
+
+subtest 'Ignore job groups on dashboard' => sub {
+    my $job_groups = $schema->resultset('JobGroups');
+    my $parent_groups = $schema->resultset('JobGroupParents');
+    my $group1 = $job_groups->find(1001);
+    my $group2 = $job_groups->find(1002);
+
+    $driver->get('/');
+    wait_for_ajax;
+    is scalar @{$driver->find_elements('h2', 'css')}, 2, 'initially both job groups shown';
+
+    subtest 'Ignore via job group property' => sub {
+        $group2->update({ignore_on_dashboard => 1});
+        $driver->get('/');
+        wait_for_ajax;
+        is scalar @{$driver->find_elements('h2', 'css')}, 1, 'opensuse test ignored via property';
+        is $driver->find_element('h2')->get_text(), 'opensuse', 'only opensuse shown';
+        $group2->update({ignore_on_dashboard => 0});
+    };
+
+    subtest 'Ignore via parent group property' => sub {
+        my $parent = $parent_groups->create({name => 'Test Parent'});
+        $group1->update({parent_id => $parent->id});
+        $parent->update({ignore_on_dashboard => 1});
+        $driver->get('/');
+        wait_for_ajax;
+        is scalar @{$driver->find_elements('h2', 'css')}, 1, 'parent group and its children ignored via property';
+        is $driver->find_element('h2')->get_text(), 'opensuse test', 'only opensuse test (no parent) shown';
+
+        $parent->update({ignore_on_dashboard => 0});
+        $group1->update({parent_id => undef});
+    };
+};
+
+kill_driver();
+done_testing();

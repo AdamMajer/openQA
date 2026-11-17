@@ -1,0 +1,249 @@
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+package OpenQA::Worker::CommandHandler;
+use Mojo::Base 'Mojo::EventEmitter', -signatures;
+
+use OpenQA::Constants qw(WORKER_STOP_COMMANDS WORKER_LIVE_COMMANDS);
+use OpenQA::Log qw(log_error log_debug log_warning log_info);
+
+use POSIX ':sys_wait_h';
+use Data::Dump 'pp';
+
+has 'client';
+
+my %STOP_COMMANDS = map { ($_ => 1) } WORKER_STOP_COMMANDS;
+my %COMMANDS_SPECIFIC_TO_CURRENT_JOB = map { ($_ => 1) } WORKER_LIVE_COMMANDS;
+
+sub new ($class, $client) {
+    return $class->SUPER::new(client => $client);
+}
+
+sub handle_command ($self, $tx, $json) {
+    my $client = $self->client;
+    my $worker = $client->worker;
+    my $current_job = $worker->current_job;
+    my $webui_host = $client->webui_host;
+    my $current_webui_host = $worker->current_webui_host // 'unknown web UI host';
+
+    return log_warning("Ignoring invalid json sent by $current_webui_host") unless ref($json) eq 'HASH';
+
+    # ignore responses to our own messages which are indicated by 'result'
+    return undef if defined $json->{result};
+
+    # handle commands of certain types regarding a specific job (which is supposed to be the job we're working on)
+    my $type = $json->{type};
+    return log_warning("Ignoring WS message without type from $webui_host:\n" . pp($json)) unless defined $type;
+
+    # match the specified job
+    my $job_id = $json->{jobid};
+    my $is_stop_type = exists $STOP_COMMANDS{$type};
+    my $relevant_job;
+    if ($is_stop_type) {
+        if ($webui_host ne $current_webui_host) {
+            log_warning("Ignoring job cancel from $webui_host (currently working for $current_webui_host).");
+            return undef;
+        }
+        # require a job ID and ensure it matches one of the current jobs
+        if (!$job_id) {
+            log_warning("Ignoring job cancel from $webui_host because no job ID was given.");
+            return undef;
+        }
+        if (!($relevant_job = $worker->find_current_or_pending_job($job_id))) {
+            log_warning("Ignoring job cancel from $webui_host because there's no job with ID $job_id.");
+            return undef;
+        }
+    }
+    elsif (exists $COMMANDS_SPECIFIC_TO_CURRENT_JOB{$type}) {
+        # require a job ID and ensure it matches the current job if we're already executing one
+        if ($current_job) {
+            # ignore messages which do not belong to the current job
+            my $current_job_id = $current_job->id // 'another job';
+            if (!defined $job_id) {
+                log_warning("Ignoring WS message from $webui_host with type $type but no job ID "
+                      . "(currently running $current_job_id for $current_webui_host):\n"
+                      . pp($json));
+                return undef;
+            }
+            if ($job_id ne $current_job_id) {
+                log_warning("Ignoring WS message from $webui_host for job $job_id because that job is "
+                      . "not running (running $current_job_id for $current_webui_host instead):\n"
+                      . pp($json));
+                return undef;
+            }
+        }
+        elsif (defined $job_id) {
+            # ignore messages which belong to a job
+            log_warning("Ignoring WS message from $webui_host with type $type and job ID $job_id "
+                  . "(currently not executing a job):\n"
+                  . pp($json));
+            return undef;
+        }
+        # verify that the web UI host for the job ID matches as well
+        if ($job_id && $webui_host ne $current_webui_host) {
+            log_warning(
+                "Ignoring job-specific WS message from $webui_host; currently occupied by $current_webui_host:\n"
+                  . pp($json));
+            return undef;
+        }
+    }
+
+    if (my $handler = $self->can('_handle_command_' . $type)) {
+        return $handler->($json, $client, $worker, $webui_host, $current_job);
+    }
+    if ($is_stop_type) {
+        return log_warning("Ignoring command $type without job ID.") unless $job_id;
+
+        my $current_job = $worker->current_job;
+        if ($current_job && $current_job == $relevant_job) {
+            return $current_job->stop($type);
+        }
+        else {
+            log_info("Will $type job $job_id later as requested by the web UI");
+            return $worker->skip_job($job_id, $type);
+        }
+    }
+
+    # WS messages of type "info" can be sent for debugging
+    log_warning("Ignoring WS message with unknown type $type from $webui_host:\n" . pp($json)) if $type ne 'info';
+}
+
+sub _handle_command_info ($json, $client, $worker, $webui_host, $current_job) {
+    $client->send_status_delayed if $json->{seen};
+}
+
+sub _handle_command_livelog_start ($json, $client, $worker, $webui_host, $current_job) {
+    $current_job->start_livelog();
+}
+
+sub _handle_command_livelog_stop ($json, $client, $worker, $webui_host, $current_job) {
+    $current_job->stop_livelog();
+}
+
+sub _handle_command_developer_session_start ($json, $client, $worker, $webui_host, $current_job) {
+    $current_job->developer_session_running(1);
+}
+
+sub _reevaluate_and_return_current_error ($client, $worker) {
+    # invoke send_status which will re-evaluate the availability updating $worker->current_error
+    # note: This will not work if there's currently a job but then we will not accept a new job anyway.
+    $client->send_status(on_error => 1) unless $worker->current_job;
+    return $worker->current_error;
+}
+
+sub _can_grab_job ($client, $worker, $webui_host, $current_job, $job_ids_to_grab) {
+    my $reason_to_reject_job;
+
+    # refuse new job(s) if the worker is in an error state or stopping
+    if ($worker->is_stopping) {
+        $reason_to_reject_job = 'currently stopping';
+    }
+    elsif (my $current_error = _reevaluate_and_return_current_error($client, $worker)) {
+        $reason_to_reject_job = $current_error;
+    }
+    if (defined $reason_to_reject_job) {
+        $client->reject_jobs($job_ids_to_grab, $reason_to_reject_job);
+        log_debug("Refusing to grab job from $webui_host: $reason_to_reject_job");
+        return 0;
+    }
+
+    # no reason to reject the job(s) if idling
+    return 1 unless $worker->is_busy;
+
+    # set reason to reject the job(s) if the worker is already busy with *different* jobs
+    my $current_webui_host = $worker->current_webui_host;
+    if (defined $current_webui_host && $current_webui_host ne $webui_host) {
+        $reason_to_reject_job = "already busy with a job from $current_webui_host";
+    }
+    else {
+        for my $job_id_to_grab (@$job_ids_to_grab) {
+            next if $worker->find_current_or_pending_job($job_id_to_grab);
+            $reason_to_reject_job = 'already busy with job(s) ' . join ', ', @{$worker->current_job_ids};
+            last;
+        }
+    }
+
+    # ignore grab job message if the worker is already busy with these job(s)
+    # note: Likely the web socket server sent the grab_job message twice because the worker
+    #       sent an "idle" status before processing the initial grab_job message.
+    return 0 unless defined $reason_to_reject_job;
+
+    # reject jobs otherwise
+    $client->reject_jobs($job_ids_to_grab, $reason_to_reject_job);
+    log_warning("Refusing to grab job from $webui_host: $reason_to_reject_job");
+    return 0;
+}
+
+sub _can_accept_job ($client, $webui_host, $job_info, $job_ids_to_grab = undef) {
+    my $job_id_missing = ref($job_info) ne 'HASH' || !defined $job_info->{id};
+    if ($job_id_missing || !$job_info->{settings}) {
+        $client->reject_jobs($job_ids_to_grab // [$job_info->{id}], 'the provided job is invalid')
+          if defined $job_ids_to_grab || !$job_id_missing;
+        log_error("Refusing to grab job from $webui_host: the provided job is invalid: " . pp($job_info));
+        return undef;
+    }
+
+    return $job_info->{id};
+}
+
+sub _can_accept_sequence ($client, $webui_host, $job_sequence, $job_data, $job_ids_to_grab = undef) {
+    for my $job_id_or_sub_sequence (@$job_sequence) {
+        $job_id_or_sub_sequence //= '?';
+        if (ref($job_id_or_sub_sequence) eq 'ARRAY') {
+            return 0 unless _can_accept_sequence($client, $webui_host, $job_id_or_sub_sequence, $job_data);
+        }
+        elsif (!exists $job_data->{$job_id_or_sub_sequence}) {
+            my $reason_to_reject_job = "job data for job $job_id_or_sub_sequence is missing";
+            $client->reject_jobs($job_ids_to_grab, $reason_to_reject_job);
+            log_error("Refusing to grab job from $webui_host: $reason_to_reject_job");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+sub _handle_command_grab_job ($json, $client, $worker, $webui_host, $current_job) {
+    my $job_info = $json->{job};
+    my $job_id = _can_accept_job($client, $webui_host, $job_info);
+    return undef unless defined $job_id;
+    return undef unless _can_grab_job($client, $worker, $webui_host, $current_job, [$job_id]);
+
+    $worker->accept_job($client, $job_info);
+}
+
+sub _handle_command_grab_jobs ($json, $client, $worker, $webui_host, $current_job) {
+    # validate input (log error and ignore job on failure)
+    my $job_info = $json->{job_info} // {};
+    my $job_data = $job_info->{data};
+    my $job_sequence = $job_info->{sequence};
+    if (ref($job_data) ne 'HASH') {
+        log_error(
+            "Refusing to grab jobs from $webui_host: the provided job info lacks job data or execution sequence: "
+              . pp($job_info));
+        return undef;
+    }
+    my @job_ids_to_grab = keys %$job_data;
+    if (ref($job_sequence) ne 'ARRAY') {
+        log_error(
+            "Refusing to grab jobs from $webui_host: the provided job info lacks execution sequence: " . pp($job_info));
+        $client->reject_jobs(\@job_ids_to_grab, 'job info lacks execution sequence');
+        return undef;
+    }
+    for my $job_id (@job_ids_to_grab) {
+        my $acceptable_id = _can_accept_job($client, $webui_host, $job_data->{$job_id}, \@job_ids_to_grab);
+        return undef unless defined $acceptable_id && $acceptable_id eq $job_id;
+    }
+    return undef unless _can_accept_sequence($client, $webui_host, $job_sequence, $job_data, \@job_ids_to_grab);
+    return undef unless _can_grab_job($client, $worker, $webui_host, $current_job, \@job_ids_to_grab);
+
+    $worker->enqueue_jobs_and_accept_first($client, $job_info);
+}
+
+sub _handle_command_incompatible ($json, $client, $worker, $webui_host, $current_job) {
+    # FIXME: It would make more sense to disable only the particular web UI host which is incompatible instead of
+    #        just stopping everything.
+    log_error("The worker is running a version incompatible with web UI host $webui_host and therefore stopped");
+    $worker->stop;
+}
+
+1;

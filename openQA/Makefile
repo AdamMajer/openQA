@@ -1,0 +1,564 @@
+RETRY ?= 0
+# STABILITY_TEST: Set to 1 to fail as soon as any of the RETRY fails rather
+# than succeed if any of the RETRY succeed
+STABILITY_TEST ?= 0
+# KEEP_DB: Set to 1 to keep the test database process spawned for tests. This
+# can help with faster re-runs of tests but might yield inconsistent results
+KEEP_DB ?= 0
+# CONTAINER_TEST: Set to 0 to exclude container tests needing a container
+# runtime environment
+CONTAINER_TEST ?= 1
+# HELM_TEST: Set to 0 to exclude helm tests needing a kubernetes cluster
+HELM_TEST ?= 1
+# TESTS: Specify individual test files in a space separated lists. As the user
+# most likely wants only the mentioned tests to be executed and no other
+# checks this implicitly disables CHECKSTYLE
+TESTS ?=
+# EXTRA_PROVE_ARGS: Additional prove arguments to pass
+EXTRA_PROVE_ARGS ?=
+# PROVE: Test application for Perl tests
+PROVE ?= tools/prove_wrapper
+# Number of parallel jobs for prove
+PROVE_JOBS ?= $(shell nproc 2>/dev/null || echo 1)
+PROVE_JOBS_ARGS ?= -j$(PROVE_JOBS)
+ifeq ($(TESTS),)
+PROVE_ARGS ?= --trap -r ${EXTRA_PROVE_ARGS} t
+else
+CHECKSTYLE ?= 0
+COMPILE_TEST ?= 0
+PROVE_ARGS ?= --trap ${EXTRA_PROVE_ARGS} $(TESTS)
+endif
+PROVE_LIB_ARGS ?= -l
+TEST_PG_PATH ?= /dev/shm/tpg
+# TIMEOUT_M: Timeout for one retry of tests in minutes
+TIMEOUT_M ?= 60
+ifeq ($(CI),)
+SCALE_FACTOR ?= 1
+HEAVY ?= 1
+FULLSTACK ?= 1
+else
+SCALE_FACTOR ?= 2
+HEAVY ?= 0
+FULLSTACK ?= 0
+endif
+TIMEOUT_RETRIES ?= $$((${TIMEOUT_M} * ${SCALE_FACTOR} * (${RETRY} + 1) ))m
+CRE ?= podman
+# avoid localized error messages (that are matched against in certain cases)
+LC_ALL = C.utf8
+LANGUAGE =
+LANG = C.utf8
+mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST)))
+current_dir := $(patsubst %/,%,$(dir $(mkfile_path)))
+unstables := $(shell cat tools/unstable_tests.txt | tr '\n' :)
+shellfiles := $$(file --mime-type script/* t/* container/worker/*.sh tools/* | sed -n 's/^\(.*\):.*text\/x-shellscript.*$$/\1/p')
+pyfiles ?= $(shell git ls-files | grep -v '\.md$$' | xargs file --mime-type 2>/dev/null | grep -E 'text/x-script\.python|text/x-python' | grep --invert-match -E '^(t/data|container/openqa_data/)' | cut -d: -f1)
+
+# tests need these environment variables to be unset
+OPENQA_BASEDIR =
+OPENQA_CONFIG =
+OPENQA_SCHEDULER_HOST =
+OPENQA_WEB_SOCKETS_HOST =
+OPENQA_SCHEDULER_STARVATION_PROTECTION_PRIORITY_OFFSET =
+
+# change if os-autoinst project root is different from '../os-autoinst'
+OS_AUTOINST_BASEDIR =
+
+.PHONY: help
+help: ## Display this help
+	@echo Call one of the available targets:
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+	@echo See docs/Contributing.md for more details
+
+man_names = openqa-cli openqa-client openqa-load-templates openqa-dump-templates openqa-clone-job openqa-validate-yaml openqa-label-all
+manpages = $(addprefix $(man_dir)/,$(addsuffix .1,$(man_names)))
+man_dir = build/man1
+
+$(man_dir):
+	mkdir -p $@
+
+define run-pod2man =
+pod2man --errors=stderr --section=1 \
+	--center "openQA Documentation" \
+	--name=$(notdir $(basename $@)) $< $@
+endef
+
+$(man_dir)/openqa-label-all.1: script/openqa-label-all
+	argparse-manpage --pyfile $< --function get_parser --author "various authors:" --author-email "https://progress.opensuse.org/projects/openqav3" --project-name openqa --url "https://github.com/os-autoinst/openQA" | grep -v '^\.br$$' >$@
+
+$(man_dir)/openqa-%.1 $(man_dir)/%.1: script/%
+	$(run-pod2man)
+
+$(man_dir)/openqa-%-templates.1: script/%_templates
+	$(run-pod2man)
+
+$(man_dir)/openqa-cli.1: lib/OpenQA/CLI.pm
+	$(run-pod2man)
+
+.PHONY: build-manpages
+build-manpages: $(man_dir) $(manpages) ## Build manpages for the scripts
+
+.PHONY: clean
+clean: ## Remove build artifacts
+	-rm -r build
+
+.PHONY: generate-manpages
+generate-manpages: ## Regenerate manpage from public/openqa-cli.yaml
+	mkdir -p contrib/manpages
+	@if perl -wE 'use App::Spec v0.17.0'; then \
+		appspec pod public/openqa-cli.yaml > contrib/manpages/openqa-cli.pod; \
+	else \
+		echo "=head1 No manpage available" > contrib/manpages/openqa-cli.pod; \
+	fi
+	pod2man contrib/manpages/openqa-cli.pod > contrib/manpages/openqa-cli.1
+
+.PHONY: generate-completions
+generate-completions: ## Regenerate shell completion scripts from public/openqa-cli.yaml
+	mkdir -p contrib/completions
+	(appspec completion public/openqa-cli.yaml --bash 2>/dev/null || echo "# No completion available") > contrib/completions/openqa-cli-completion.bash
+	(appspec completion public/openqa-cli.yaml --zsh 2>/dev/null || echo "# No completion available") > contrib/completions/openqa-cli-completion.zsh
+
+.PHONY: generate-assets
+generate-assets: ## Generate packed assets and copy to DESTDIR
+	./tools/generate-packed-assets
+	for i in lib public script templates assets; do \
+		mkdir -p "$(DESTDIR)"/usr/share/openqa/$$i ;\
+		cp -a $$i/* "$(DESTDIR)"/usr/share/openqa/$$i ;\
+	done
+
+.PHONY: install-nginx
+install-nginx: ## Install the NGINX configuration
+	install -d -m 755 "$(DESTDIR)"/etc/nginx/vhosts.d
+	for i in openqa-assets.inc openqa-endpoints.inc openqa-limiting.inc openqa-locations.inc openqa-upstreams.inc openqa.conf.template openqa-llm.conf.template; do \
+		install -m 644 etc/nginx/vhosts.d/$$i "$(DESTDIR)"/etc/nginx/vhosts.d ;\
+	done
+
+.PHONY: install-generic
+install-generic: generate-assets generate-completions generate-manpages install-nginx ## Install generic components
+	for f in $(shell perl -Ilib -mOpenQA::Assets -e OpenQA::Assets::list); do \
+		install -m 644 -D --target-directory="$(DESTDIR)/usr/share/openqa/$${f%/*}" "$$f";\
+	done
+
+	for i in db images testresults pool/1 cache cache/podman webui/cache backup; do \
+		mkdir -p "$(DESTDIR)"/var/lib/openqa/$$i ;\
+	done
+# shared dirs between openQA web and workers + compatibility links
+	for i in factory tests; do \
+		mkdir -p "$(DESTDIR)"/var/lib/openqa/share/$$i ;\
+		ln -sfn /var/lib/openqa/share/$$i "$(DESTDIR)"/var/lib/openqa/$$i ;\
+	done
+	for i in iso hdd repo other; do \
+		mkdir -p "$(DESTDIR)"/var/lib/openqa/share/factory/$$i ;\
+	done
+	for i in script; do \
+		ln -sfn /usr/share/openqa/$$i "$(DESTDIR)"/var/lib/openqa/$$i ;\
+	done
+#
+	install -d -m 755 "$(DESTDIR)"/etc/apache2/vhosts.d
+	for i in openqa-common.inc openqa.conf.template openqa-ssl.conf.template; do \
+		install -m 644 etc/apache2/vhosts.d/$$i "$(DESTDIR)"/etc/apache2/vhosts.d ;\
+	done
+
+	for prefix in etc; do \
+		install -d -m 755 "$(DESTDIR)"/$$prefix/openqa ;\
+		install -d -m 755 "$(DESTDIR)"/$$prefix/openqa/client.conf.d ;\
+		install -d -m 755 "$(DESTDIR)"/$$prefix/openqa/workers.ini.d ;\
+		install -d -m 755 "$(DESTDIR)"/$$prefix/openqa/openqa.ini.d ;\
+		install -d -m 755 "$(DESTDIR)"/$$prefix/openqa/database.ini.d ;\
+	done
+	install -D -m 644 etc/openqa/client.conf "$(DESTDIR)"/usr/share/doc/openqa/examples/client.conf
+	install -D -m 644 etc/openqa/workers.ini "$(DESTDIR)"/usr/share/doc/openqa/examples/workers.ini
+	install -D -m 644 etc/openqa/openqa.ini "$(DESTDIR)"/usr/share/doc/openqa/examples/openqa.ini
+	install -D -m 644 etc/openqa/database.ini "$(DESTDIR)"/usr/share/doc/openqa/examples/database.ini
+
+	install -D -m 644 etc/logrotate.d/openqa "$(DESTDIR)"/etc/logrotate.d/openqa
+#
+	install -d -m 755 "$(DESTDIR)"/usr/lib/systemd/system
+	install -d -m 755 "$(DESTDIR)"/usr/lib/systemd/system-generators
+	install -d -m 755 "$(DESTDIR)"/usr/lib/tmpfiles.d
+	install -d -m 755 "$(DESTDIR)"/usr/share/containers/systemd
+	eval "$$(perl -V:installvendorlib)" && sed -i -e "s^installvendorlib^$$installvendorlib^" systemd/openqa-minion-restart.path
+	for i in systemd/*.{service,slice,target,timer,path}; do \
+		install -m 644 $$i "$(DESTDIR)"/usr/lib/systemd/system ;\
+	done
+	ln -s openqa-worker-plain@.service "$(DESTDIR)"/usr/lib/systemd/system/openqa-worker@.service
+	sed \
+		-e 's_^\(ExecStart=/usr/share/openqa/script/worker\) \(--instance %i\)$$_\1 --no-cleanup \2_' \
+		-e '/^$$/N;/\[Service\]/iConflicts=openqa-worker-plain@.service' \
+		systemd/openqa-worker-plain@.service > "$(DESTDIR)"/usr/lib/systemd/system/openqa-worker-no-cleanup@.service
+	sed \
+		-e '/\[Service\]/aEnvironment=OPENQA_WORKER_TERMINATE_AFTER_JOBS_DONE=1' \
+		-e '/ExecStart=/aExecReload=\/bin\/kill -HUP $$MAINPID' \
+		-e 's/Restart=.*/Restart=always/' \
+		-e '/^$$/N;/\[Service\]/iConflicts=openqa-worker-plain@.service' \
+		systemd/openqa-worker-plain@.service > "$(DESTDIR)"/usr/lib/systemd/system/openqa-worker-auto-restart@.service
+	install -m 755 systemd/systemd-openqa-generator "$(DESTDIR)"/usr/lib/systemd/system-generators
+	install -m 644 systemd/tmpfiles-openqa.conf "$(DESTDIR)"/usr/lib/tmpfiles.d/openqa.conf
+	install -m 644 systemd/tmpfiles-openqa-webui.conf "$(DESTDIR)"/usr/lib/tmpfiles.d/openqa-webui.conf
+	install -m 644 container/systemd/openqa-llm-server.container "$(DESTDIR)"/usr/share/containers/systemd/openqa-llm-server.container
+	install -m 644 container/systemd/openqa-llm-decision-server.container "$(DESTDIR)"/usr/share/containers/systemd/openqa-llm-decision-server.container
+	install -d -m 755 "$(DESTDIR)"/opt/llm/models
+	install -d -m 755 "$(DESTDIR)"/usr/lib/systemd/system/openqa-gru.service.requires
+	ln -s ../postgresql.service "$(DESTDIR)"/usr/lib/systemd/system/openqa-gru.service.requires/postgresql.service
+	install -d -m 755 "$(DESTDIR)"/usr/lib/systemd/system/openqa-scheduler.service.requires
+	ln -s ../postgresql.service "$(DESTDIR)"/usr/lib/systemd/system/openqa-scheduler.service.requires/postgresql.service
+	install -d -m 755 "$(DESTDIR)"/usr/lib/systemd/system/openqa-websockets.service.requires
+	ln -s ../postgresql.service "$(DESTDIR)"/usr/lib/systemd/system/openqa-websockets.service.requires/postgresql.service
+	install -D -m 644 usr/lib/sysctl.d/01-openqa-reload-worker-auto-restart.conf "$(DESTDIR)"/usr/lib/sysctl.d/01-openqa-reload-worker-auto-restart.conf
+	install -D -m 644 contrib/completions/openqa-cli-completion.bash "$(DESTDIR)"/usr/share/bash-completion/completions/openqa-cli
+	install -D -m 644 contrib/completions/openqa-cli-completion.zsh "$(DESTDIR)"/usr/share/zsh/site-functions/_openqa-cli
+	install -D -m 644 contrib/manpages/openqa-cli.1 "$(DESTDIR)"/usr/share/man/man1/openqa-cli.1
+#
+# install openQA apparmor profile
+	install -d -m 755 "$(DESTDIR)"/etc/apparmor.d
+	install -m 644 profiles/apparmor.d/usr.share.openqa.script.openqa "$(DESTDIR)"/etc/apparmor.d
+	install -m 644 profiles/apparmor.d/usr.share.openqa.script.worker "$(DESTDIR)"/etc/apparmor.d
+	install -d -m 755 "$(DESTDIR)"/etc/apparmor.d/local
+	install -m 644 profiles/apparmor.d/local/usr.share.openqa.script.openqa "$(DESTDIR)"/etc/apparmor.d/local
+	install -m 644 profiles/apparmor.d/local/usr.share.openqa.script.worker "$(DESTDIR)"/etc/apparmor.d/local
+
+	cp -Ra dbicdh "$(DESTDIR)"/usr/share/openqa/dbicdh
+
+	install -d -m 755 "$(DESTDIR)"/usr/lib/sysusers.d/
+	install    -m 644 usr/lib/sysusers.d/openQA-worker.conf "$(DESTDIR)"/usr/lib/sysusers.d/
+	install    -m 644 usr/lib/sysusers.d/geekotest.conf "$(DESTDIR)"/usr/lib/sysusers.d/
+
+# Additional services which have a strong dependency on SUSE/openSUSE and do not
+# make sense for other distributions
+.PHONY: install-opensuse
+install-opensuse: install-generic ## Install SUSE-specific components
+	for i in systemd/opensuse/*.{service,timer}; do \
+		install -m 644 $$i "$(DESTDIR)"/usr/lib/systemd/system ;\
+	done
+
+# Match suse and opensuse
+os := $(shell grep suse /etc/os-release)
+.PHONY: install
+ifeq ($(os),)
+install: install-generic ## Install the application (auto-detects OS)
+else
+install: install-opensuse ## Install the application (auto-detects OS)
+endif
+
+# Ensure npm packages are installed and up-to-date (unless local-npm-registry is installed; in this case we can
+# assume installing npm packages is taken care of separately, e.g. in builds on OBS)
+# note: Excluding dev dependencies like `eslint` via `--omit=dev` to pull in only dependencies needed at runtime (and for
+#       regular tests). Development tests/tooling like `js-tidy` will invoke `npm clean-install …` to install missing
+#       dependencies on its own anyway.
+node_modules: package-lock.json ## Build web-related dependencies (NPM, JS, CSS)
+	@command -v local-npm-registry >/dev/null 2>&1 || npm clean-install --no-audit --no-fund --ignore-scripts --omit=dev
+	@touch node_modules
+
+.PHONY: prepare-node-env
+prepare-node-env: ## Install Node.js/NPM development dependencies locally (e.g. prettier, eslint)
+	@command -v npm >/dev/null 2>&1 || (echo "Command 'npm' not found, can not install node dependencies. Install Node.js and npm first (e.g. with 'zypper in nodejs-default' or your system package manager)" && false)
+	npm clean-install --no-audit --no-fund --ignore-scripts
+
+.PHONY: test
+ifeq ($(CHECKSTYLE),0)
+checkstyle_tests =
+else
+checkstyle_tests = test-checkstyle-standalone
+endif
+
+ifeq ($(COMPILE_TEST),0)
+compile_tests =
+else
+compile_tests = test-compile
+endif
+
+test: $(checkstyle_tests) $(compile_tests) test-with-database ## Run all tests (including checkstyle, compile test and database tests)
+ifeq ($(CONTAINER_TEST),1)
+ifeq ($(TESTS),)
+test: test-containers-compose
+endif
+endif
+ifeq ($(HELM_TEST),1)
+ifeq ($(TESTS),)
+test: test-helm-chart
+endif
+endif
+.PHONY: test-checkstyle
+test-checkstyle: test-checkstyle-standalone test-author ## Run checkstyle and author tests
+
+.PHONY: test-t
+test-t: node_modules ## Run standard Perl tests
+	$(MAKE) test-with-database TIMEOUT_M=25 PROVE_ARGS="$$HARNESS t/*.t" GLOBIGNORE="$(unstables)"
+
+.PHONY: test-heavy
+test-heavy: node_modules ## Run heavy tests
+	$(MAKE) test-with-database HEAVY=1 TIMEOUT_M=25 PROVE_ARGS="$$HARNESS $$(grep -l HEAVY=1 t/*.t | tr '\n' ' ')"
+
+.PHONY: test-ui
+test-ui: node_modules ## Run UI tests
+	$(MAKE) test-with-database TIMEOUT_M=25 PROVE_ARGS="$$HARNESS t/ui/*.t" GLOBIGNORE="$(unstables)"
+
+.PHONY: test-api
+test-api: node_modules ## Run API tests
+	$(MAKE) test-with-database TIMEOUT_M=20 PROVE_ARGS="$$HARNESS t/api/*.t" GLOBIGNORE="$(unstables)"
+
+
+# put unstable tests in tools/unstable_tests.txt and uncomment in circle CI config to handle unstables with retries
+.PHONY: test-unstable
+test-unstable: node_modules ## Run unstable tests with retries
+	for f in $$(cat tools/unstable_tests.txt); do $(MAKE) test-with-database COVERDB_SUFFIX=$$(echo $${COVERDB_SUFFIX}_$$f | tr '/' '_') TIMEOUT_M=10 PROVE_ARGS="$$HARNESS $$f" RETRY=5 || exit; done
+
+.PHONY: test-fullstack
+test-fullstack: node_modules ## Run fullstack tests
+	$(MAKE) test-with-database FULLSTACK=1 TIMEOUT_M=30 PROVE_ARGS="$$HARNESS t/full-stack.t t/33-developer_mode.t"
+
+.PHONY: test-fullstack-unstable
+test-fullstack-unstable: node_modules ## Run unstable fullstack tests with retries
+	$(MAKE) test-with-database FULLSTACK=1 TIMEOUT_M=15 PROVE_ARGS="$$HARNESS t/05-scheduler-full.t" RETRY=5
+
+# we have apparently-redundant -I args in PERL5OPT here because Docker
+# only works with one and Fedora's build system only works with the other
+.PHONY: test-with-database
+test-with-database: node_modules setup-database ## Set up the test database and run tests
+	$(MAKE) test-unit-and-integration TEST_PG="DBI:Pg:dbname=openqa_test;host=$(TEST_PG_PATH)"
+	-[ $(KEEP_DB) = 1 ] || pg_ctl -D $(TEST_PG_PATH) stop
+
+.PHONY: test-unit-and-integration
+test-unit-and-integration: node_modules ## Run unit and integration tests (low level)
+	export GLOBIGNORE="$(GLOBIGNORE)";\
+	export DEVEL_COVER_DB_FORMAT=JSON;\
+	export PERL5OPT="$(COVEROPT)$(PERL5OPT) -It/lib -I$(PWD)/t/lib -I$(PWD)/external/os-autoinst-common/lib $(CHECK_GIT_STATUS_OPT) -MOpenQA::Test::PatchDeparse";\
+	RETRY=${RETRY} HEAVY=${HEAVY} FULLSTACK=${FULLSTACK} HOOK=./tools/delete-coverdb-folder timeout --foreground -s SIGINT -k 5 -v ${TIMEOUT_RETRIES} tools/retry "${PROVE}" ${PROVE_LIB_ARGS} $(PROVE_JOBS_ARGS) ${PROVE_ARGS}
+
+.PHONY: setup-database
+setup-database: ## Set up the test database
+	test -d $(TEST_PG_PATH) && (pg_ctl -D $(TEST_PG_PATH) -s status >&/dev/null || pg_ctl -D $(TEST_PG_PATH) -s start) || ./t/test_postgresql $(TEST_PG_PATH)
+
+define RUN_SERVICE_TEST_ENV
+	OPENQA_BASEDIR="$(CURDIR)/t/data" \
+	OPENQA_CONFIG="$(CURDIR)/t/data" \
+	OPENQA_DATABASE=test \
+	OPENQA_WEBUI_MODE=test \
+	TEST_PG="DBI:Pg:dbname=openqa_test;host=$(TEST_PG_PATH)" \
+	$(1)
+endef
+
+.PHONY: run-test-env
+run-test-env: setup-database ## Run all local test services (webui, websockets, scheduler, worker, gru)
+	trap 'kill 0' SIGINT SIGTERM; \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-webui-daemon) & \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-websockets-daemon) & \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-scheduler-daemon) & \
+	$(call RUN_SERVICE_TEST_ENV,script/worker) & \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-gru) & \
+	wait
+
+.PHONY: load-test-fixtures
+load-test-fixtures: setup-database ## Load standard mock fixtures into the test database
+	$(call RUN_SERVICE_TEST_ENV,tools/init-test-fixtures)
+
+.PHONY: run-webui-mock-env
+run-webui-mock-env: load-test-fixtures ## Run a local web UI instance pre-loaded with mock fixtures
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-webui-daemon)
+
+.PHONY: run-mock-env
+run-mock-env: load-test-fixtures ## Run all local test services pre-loaded with mock fixtures
+	trap 'kill 0' SIGINT SIGTERM; \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-webui-daemon) & \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-websockets-daemon) & \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-scheduler-daemon) & \
+	$(call RUN_SERVICE_TEST_ENV,script/worker) & \
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-gru) & \
+	wait
+
+.PHONY: run-webui-test-env
+run-webui-test-env: setup-database ## Run a local web UI instance using a test environment
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-webui-daemon)
+
+.PHONY: run-gru-test-env
+run-gru-test-env: setup-database ## Run a local GRU instance using a test environment
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-gru)
+
+.PHONY: run-websockets-test-env
+run-websockets-test-env: setup-database ## Run a local websockets server instance using a test environment
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-websockets-daemon)
+
+.PHONY: run-scheduler-test-env
+run-scheduler-test-env: setup-database ## Run a local scheduler instance using a test environment
+	$(call RUN_SERVICE_TEST_ENV,script/openqa-scheduler-daemon)
+
+.PHONY: run-worker-test-env
+run-worker-test-env: setup-database ## Run a local worker instance using a test environment
+	$(call RUN_SERVICE_TEST_ENV,script/worker)
+
+# prepares running the tests within a container (eg. pulls os-autoinst) and then runs the tests considering
+# the test matrix environment variables
+# note: This is supposed to run within the container unlike `launch-container-to-run-tests-within`
+#       which launches the container.
+.PHONY: run-tests-within-container
+run-tests-within-container: ## Run tests inside a container
+	tools/run-tests-within-container
+
+ifeq ($(COVERAGE),1)
+COVERDB_SUFFIX ?=
+# We use JSON::PP because there is a bug producing a (harmless) 'redefined'
+# warning when using Devel::Cover and Cpanel::JSON::XS
+# https://progress.opensuse.org/issues/90371
+#
+# CoverageWorkaround: We use a workaround with Syntax::Keyword::Try::Deparse
+# because we would get warnings:
+#     unexpected OP_CUSTOM (catch) at .../B/Deparse.pm line 1667.
+# because Feature::Compat::Try uses OP_CUSTOM for perl < 5.40
+# https://metacpan.org/pod/Feature::Compat::Try#COMPATIBILITY-NOTES
+# https://rt.cpan.org/Transaction/Display.html?id=1992941
+COVEROPT ?= -mJSON::PP -It/lib -MCoverageWorkaround -MDevel::Cover=-select_re,'^/lib',+ignore_re,lib/perlcritic/Perl/Critic/Policy|t/lib/CoverageWorkaround,-coverage,statement,-db,cover_db$(COVERDB_SUFFIX),
+endif
+
+ifeq ($(CHECK_GIT_STATUS),1)
+CHECK_GIT_STATUS_OPT ?= -MTest::CheckGitStatus
+endif
+
+.PHONY: coverage
+coverage: ## Run tests and generate coverage report
+	export DEVEL_COVER_DB_FORMAT=JSON;\
+	COVERAGE=1 cover ${COVER_OPTS} -test
+
+COVER_REPORT_OPTS ?= -select_re '^(lib|script|t)/'
+
+.PHONY: coverage-report-codecov
+coverage-report-codecov: ## Generate codecov report
+	export DEVEL_COVER_DB_FORMAT=JSON;\
+	cover $(COVER_REPORT_OPTS) -report codecovbash
+
+.PHONY: check-line-coverage
+check-line-coverage: coverage-report-codecov ## Check for uncovered lines in current cover_db
+	./tools/check-line-coverage cover_db/codecov.json
+
+.PHONY: coverage-codecov
+coverage-codecov: coverage ## Run coverage and generate codecov report
+	$(MAKE) coverage-report-codecov
+
+.PHONY: coverage-report-html
+coverage-report-html: ## Generate HTML coverage report
+	cover $(COVER_REPORT_OPTS) -report html_minimal
+
+.PHONY: coverage-html
+coverage-html: coverage ## Run coverage and generate HTML coverage report
+	$(MAKE) coverage-report-html
+
+public/favicon.ico: $(wildcard assets/images/*.svg)
+	for w in 16 32 64 128; do \
+		(cd assets/images/ && for i in *.svg; do \
+			inkscape -o $${i%.svg}-$$w.png -w $$w $$i; \
+		done); \
+	done
+	convert assets/images/logo-16.png assets/images/logo-32.png assets/images/logo-64.png assets/images/logo-128.png -background white -alpha remove public/favicon.ico
+	rm assets/images/*-32.png assets/images/*-64.png assets/images/*-128.png
+
+.PHONY: setup-hooks
+setup-hooks: ## Install pre-commit git hooks
+	pre-commit install --install-hooks -t commit-msg -t pre-commit
+
+# all additional checks not called by prove
+.PHONY: test-checkstyle-standalone
+test-checkstyle-standalone: test-shellcheck test-yaml test-shfmt test-gitlint test-python-static-checks test-markdown ## Run all style and static analysis checks
+ifeq ($(CONTAINER_TEST),1)
+test-checkstyle-standalone: test-check-containers
+endif
+
+.PHONY: test-author
+test-author: ## Run author tests (tidy, style, critic, pod, etc.)
+	$(MAKE) test-unit-and-integration TIMEOUT_M=20 PROVE_ARGS="$$HARNESS xt/*.t" GLOBIGNORE="$(unstables)"
+
+.PHONY: test-compile
+test-compile: ## Run compile tests
+	$(MAKE) test-unit-and-integration TIMEOUT_M=20 PROVE_ARGS="$$HARNESS t/compile/*.t" GLOBIGNORE="$(unstables)"
+
+.PHONY: test-shellcheck
+test-shellcheck: ## Run shellcheck on scripts
+	@command -v shellcheck >/dev/null 2>&1 || (echo "Command 'shellcheck' not found, can not execute shell script checks" && false)
+	shellcheck -x $(shellfiles)
+
+.PHONY: test-yaml
+test-yaml: ## Run yamllint on YAML files
+	@command -v yamllint >/dev/null 2>&1 || (echo "Command 'yamllint' not found, can not execute YAML syntax checks" && false)
+	@# Fall back to find if there is no git, e.g. in package builds
+	yamllint --strict $$((git ls-files "*.yml" "*.yaml" 2>/dev/null || find -name '*.y*ml') | grep -v ^dbicdh)
+
+.PHONY: test-shfmt
+test-shfmt: ## Run shfmt on scripts
+	@command -v shfmt >/dev/null 2>&1 || (echo "Command 'shfmt' not found, can not execute bash script syntax checks" && false)
+	shfmt -d -i 4 -bn -ci -sr $(shellfiles)
+
+.PHONY: test-python-static-checks ## Run all static checks on Python scripts
+test-python-static-checks: test-ruff test-python-conventions
+
+.PHONY: test-markdown
+test-markdown: ## Check markdown files for style and consistency
+	@python3 tools/check-markdown.py
+
+.PHONY: test-ruff
+test-ruff: ## Run `ruff format --check` and `ruff check` on Python scripts
+	@command -v ruff >/dev/null 2>&1 || echo "Command 'ruff' not found, can not execute python style checks"
+	@if [ -n "$(pyfiles)" ]; then ruff format --check $(pyfiles) && ruff check $(pyfiles); fi
+
+.PHONY: test-python-conventions
+test-python-conventions: ## Checks whether Python scripts follow certain coding conventions
+	@if [[ -d tests/ ]] && git grep -nE '^\s*@(unittest\.mock\.|mock\.)?patch' tests/; then \
+		echo "Error: @patch decorator detected. Avoid to prevent argument ordering bugs."; \
+		echo "   Fix: Use the 'mocker' fixture (pytest-mock) or a 'with patch():' context manager."; \
+		exit 1; \
+	fi
+
+.PHONY: test-gitlint
+test-gitlint: ## Run commit message checks using gitlint
+	@command -v gitlint >/dev/null 2>&1 || (echo "Command 'gitlint' not found, can not execute commit message checks. Install with 'python3-gitlint' (openSUSE) or 'pip install gitlint-core'" && false)
+	@BASES=$$(for i in upstream/master upstream/main origin/master origin/main master main; do git rev-parse --verify $$i 2>/dev/null; done ||:); \
+	BASE=$$(git merge-base --independent $$BASES | head -n 1); \
+	gitlint --commits "$$BASE..HEAD"
+
+.PHONY: test-check-containers
+test-check-containers: ## Run static checks for containers
+	tools/static_check_containers
+
+.PHONY: tidy-js
+tidy-js: ## Format JavaScript code
+	tools/js-tidy
+
+.PHONY: tidy-perl
+tidy-perl: ## Format Perl code
+	tools/tidyall -a
+
+.PHONY: tidy-python
+tidy-python: ## Format Python code
+	@command -v ruff >/dev/null 2>&1 || echo "Command 'ruff' not found, can not format python code"
+	@if [ -n "$(pyfiles)" ]; then ruff format $(pyfiles); fi
+
+.PHONY: tidy-sh
+tidy-sh: ## Format shell scripts with shfmt
+	@command -v shfmt >/dev/null 2>&1 || echo "Command 'shfmt' not found, can not format shell code"
+	shfmt --write -i 4 -bn -ci -sr $(shellfiles)
+
+.PHONY: tidy
+tidy: tidy-js tidy-perl tidy-python tidy-sh ## Format JavaScript, Perl, Python and Shell code
+
+.PHONY: test-containers-compose
+test-containers-compose: ## Run docker-compose tests
+	tools/test_containers_compose
+
+.PHONY: test-helm-chart
+test-helm-chart: test-helm-lint test-helm-install ## Run helm chart tests (lint and install)
+
+.PHONY: test-helm-lint
+test-helm-lint: ## Lint helm chart
+	tools/test_helm_chart lint
+
+.PHONY: test-helm-install
+test-helm-install: test-helm-lint ## Install helm chart for testing
+	RETRY=${RETRY} timeout --foreground -s SIGINT -k 5 -v ${TIMEOUT_RETRIES} tools/retry tools/test_helm_chart install
+
+.PHONY: update-deps
+update-deps: ## Update dependencies in cpanfile and specfile
+	tools/update-deps --cpanfile cpanfile --specfile dist/rpm/openQA.spec
+
+.PHONY: generate-docs
+generate-docs: ## Generate documentation from Markdown
+	tools/generate-docs
+
+.PHONY: serve-docs
+serve-docs: generate-docs ## Serve documentation locally
+	(cd docs/build/; python3 -m http.server)

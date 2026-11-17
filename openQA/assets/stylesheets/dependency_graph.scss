@@ -1,0 +1,112 @@
+@import 'openqa_theme';
+#dependencygraph {
+  display: block;
+  margin: auto;
+  text {
+    font-weight: 300;
+    font-family: $default-font;
+    line-height: 1.428571429;
+    -webkit-font-smoothing: antialiased;
+    font-size: $font-size-base;
+    letter-spacing: 0.1px;
+    width: 300px;
+  }
+  .node rect {
+    stroke: #333;
+    fill: #fff;
+    stroke-width: 1.5px;
+  }
+  .cluster rect {
+    fill: #d0f0ff;
+  }
+  .edgePath path {
+    stroke: #333;
+    stroke-width: 1.5px;
+  }
+  table {
+    border-spacing: 0;
+    tr {
+      border: 1px solid #999;
+      &.current {
+        border: 3px solid #222;
+        td:first-child {
+          background-color: #f6ffb2;
+        }
+      }
+    }
+    td {
+      padding: 7px;
+      text-overflow: ellipsis;
+      overflow: hidden;
+      &:first-child {
+        width: 200px;
+        min-width: 200px;
+        max-width: 200px;
+      }
+      &:last-child {
+        background-color: #efefef;
+        width: 80px;
+        min-width: 80px;
+        max-width: 80px;
+        text-align: center;
+      }
+      &.passed {
+        background-color: $color-ok;
+      }
+      &.failed, &.parallel_failed {
+        background-color: $color-result-failed;
+      }
+      &.softfailed {
+        background-color: $color-softfailed;
+      }
+      &.incomplete, &.timeout_exceeded {
+        color: white;
+        background-color: $color-incomplete;
+      }
+      &.blocked {
+        background-color: $color-state-blocked;
+      }
+      &.scheduled {
+        color: white;
+        background-color: $color-state-scheduled;
+      }
+      &.cancelled, &.user_cancelled {
+        background-color: $color-state-cancelled;
+      }
+      &.assigned, &.running, &.uploading {
+        background-color: $color-state-running;
+      }
+    }
+  }
+}
+[data-bs-theme='dark'] #dependencygraph {
+  .node rect {
+    stroke: $default-font-color-dark;
+    fill: lighten($default-bg-color-dark, 8%);
+  }
+  .cluster rect {
+    fill: #0d2a38;
+  }
+  .edgePath path {
+    stroke: $default-font-color-dark;
+  }
+  marker path {
+    fill: $default-font-color-dark;
+    stroke: $default-font-color-dark;
+  }
+  table {
+    color: $default-font-color-dark;
+    tr {
+      border-color: $table-border-color-dark;
+      &.current {
+        border-color: $default-font-color-dark;
+        td:first-child {
+          background-color: #5c5a1a;
+        }
+      }
+    }
+    td:last-child {
+      background-color: lighten($default-bg-color-dark, 20%);
+    }
+  }
+}

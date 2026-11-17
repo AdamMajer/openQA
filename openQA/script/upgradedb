@@ -1,0 +1,85 @@
+#!/usr/bin/env perl
+
+# Copyright SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+use Mojo::Base -signatures;
+use FindBin qw($RealBin);
+use lib "$RealBin/../lib";
+
+use aliased 'DBIx::Class::DeploymentHandler' => 'DH';
+use OpenQA::Schema;
+use Getopt::Long;
+use IO::Dir;
+use Fcntl ':mode';
+
+my $prepare_upgrades = 0;
+my $upgrade_database = 0;
+my $help = 0;
+my $force = 0;
+my $user;
+my $default_script_directory = "$FindBin::RealBin/../dbicdh";
+my $script_directory = $default_script_directory;
+
+my $result = GetOptions(
+    'help' => \$help,
+    'prepare_upgrades' => \$prepare_upgrades,
+    'upgrade_database' => \$upgrade_database,
+    'user=s' => \$user,
+    'dir=s' => \$script_directory,
+    'force' => \$force
+);
+
+sub usage ($rc) {
+    print "Usage: $0 [flags]\n\n";
+    print "  --prepare_upgrades : Create the deployment files used to upgrade the database.\n";
+    print "                       Don't forget to increase the version before using this\n";
+    print "                       and note those files should be committed to the source repo.\n";
+    print "  --upgrade_database : Use the generated deployment files created with --prepare_upgrades\n";
+    print "                       to actually upgrade a database.\n";
+    print "  --force            : Force overwriting existing data.\n";
+    print "  --user=login       : Change uid before connecting the DB.\n";
+    print "  --dir=directory    : Create deployment and migration scripts in this directory.\n";
+    print "                       Default is '$default_script_directory'\n";
+    print "  --help             : This help message.\n";
+    exit $rc;
+}
+
+usage 0 if $help;
+usage 1 unless $result or $prepare_upgrades or $upgrade_database;
+
+my $schema = OpenQA::Schema::connect_db(deploy => 0, silent => 1, from_script => 1, user => $user);
+my @databases = qw(PostgreSQL);
+
+if ($prepare_upgrades) {
+    my $dh = DH->new(
+        {
+            schema => $schema,
+            script_directory => $script_directory,
+            databases => \@databases,
+            sql_translator_args => {add_drop_table => 0, quote_identifiers => 0},
+            force_overwrite => $force,
+        });
+
+
+    my $version = $dh->schema_version;
+
+    my $prev_version = $version - 1;
+    my $upgrade_directory = "$prev_version-$version";
+
+    my %upgrade_dir;
+    foreach my $db (@databases) {
+        tie %upgrade_dir, 'IO::Dir', "$script_directory/$db/upgrade";
+
+        if (exists $upgrade_dir{$upgrade_directory} and not $force) {
+            print "The upgrade directory already contains files to upgrade to the current version ($version)\n";
+            print 'Use the --force option if you want to overwrite the contents of the ';
+            print "$script_directory/$db/upgrade/$upgrade_directory directory\n";
+            exit 1;
+        }
+    }
+
+    $dh->prepare_upgrade({from_version => $prev_version, to_version => $version});
+}
+
+$schema->deploy($force) if $upgrade_database;
