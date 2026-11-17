@@ -110,10 +110,11 @@ Summary:        Framework for automated system-level testing (web-frontend, sche
 Group:          Development/Tools/Other
 License:        GPL-2.0-or-later
 Url:            http://os-autoinst.github.io/openQA/
-Source0:        %{name}-%{version}.tar.xz
+#!CreateArchive
+Source0:        openQA.tar.gz
 Source1:        openQA-rpmlintrc
-Source2:        node_modules.spec.inc
-%include        %{_sourcedir}/node_modules.spec.inc
+#!CreateArchive
+Source2:        node_modules.tar.gz
 BuildRequires:  fdupes
 # for install-opensuse in Makefile
 BuildRequires:  distribution-release
@@ -389,12 +390,9 @@ package provides the Podman Quadlet configuration to automatically manage
 the server.
 
 %prep
-%setup -q
+%setup -n %{name}
 sed -e 's,/bin/env python,/bin/python,' -i script/openqa-label-all
-# Depending on whether we run in OBS or from a gitea repo, there is a
-# node_modules directory or not
-TARGET="%{_sourcedir}"; [ -d "$TARGET/node_modules" ] && TARGET="$TARGET/node_modules"
-local-npm-registry "$TARGET" install --omit=dev --legacy-peer-deps --no-package-lock --ignore-scripts
+local-npm-registry %{_sourcedir}/node_modules install --omit=dev --legacy-peer-deps --no-package-lock --ignore-scripts
 
 %build
 %make_build

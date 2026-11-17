@@ -1,5 +1,5 @@
 <services>
-  <service name="obs_scm">
+  <service name="obs_scm" mode="disabled">
     <param name="extract">dist/rpm/openQA.spec</param>
     <param name="extract">dist/rpm/openQA-test.spec</param>
     <param name="extract">dist/rpm/openQA-worker-test.spec</param>
@@ -14,16 +14,5 @@
     <param name="changesauthor">okurz@suse.com</param>
     <param name="filename">openQA</param>
   </service>
-  <service name="set_version"/>
-  <service name="tar" mode="buildtime"/>
-  <service name="recompress" mode="buildtime">
-    <param name="compression">xz</param>
-    <param name="file">*.tar</param>
-  </service>
-  <service name="node_modules">
-    <param name="cpio">node_modules.obscpio</param>
-    <param name="legacy-container">true</param>
-    <param name="output">node_modules.spec.inc</param>
-    <param name="source-offset">1000</param>
-  </service>
+  <service name="node_modules" mode="manual"/>
 </services>
